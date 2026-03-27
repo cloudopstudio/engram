@@ -24,6 +24,22 @@ builds:
     ldflags:
       - -s -w -X main.version={{.Version}}
 
+  - id: engram-pg
+    main: ./cmd/engram
+    binary: engram-pg
+    env:
+      - CGO_ENABLED=0
+    tags:
+      - pgstore
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
 archives:
   - id: default
     builds:
@@ -35,6 +51,12 @@ archives:
       - goos: windows
         formats:
           - zip
+  - id: pgstore
+    builds:
+      - engram-pg
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}-pg_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
   name_template: "checksums.txt"

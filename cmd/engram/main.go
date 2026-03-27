@@ -204,8 +204,6 @@ func main() {
 		cmdLogin(cfg)
 	case "migrate":
 		cmdMigrate(cfg)
-	case "projects":
-		cmdProjects(cfg)
 	case "promote":
 		cmdPromote(cfg)
 	case "who":
