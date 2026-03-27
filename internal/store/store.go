@@ -1,3 +1,5 @@
+//go:build !pgstore
+
 // Package store implements the persistent memory engine for Engram.
 //
 // It uses SQLite with FTS5 full-text search to store and retrieve

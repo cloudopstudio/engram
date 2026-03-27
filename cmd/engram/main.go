@@ -144,6 +144,8 @@ func main() {
 		cmdSync(cfg)
 	case "setup":
 		cmdSetup()
+	case "migrate":
+		cmdMigrate(cfg)
 	case "version", "--version", "-v":
 		fmt.Printf("engram %s\n", version)
 	case "help", "--help", "-h":
