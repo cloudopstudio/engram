@@ -144,6 +144,12 @@ func main() {
 	// Parse --profile flag before command dispatch (applies to ALL commands).
 	cfg.Profile = parseGlobalProfile(cfg.DataDir)
 
+	// Warn if the resolved profile doesn't exist in config (stderr only —
+	// stdout is reserved for MCP/data output).
+	if cfg.Profile != "" && !config.ValidateProfile(cfg.DataDir, cfg.Profile) {
+		fmt.Fprintf(os.Stderr, "engram: warning: profile %q not found in config, using root config\n", cfg.Profile)
+	}
+
 	// Migrate orphaned databases that ended up in wrong locations
 	// (e.g. drive root on Windows due to previous bug).
 	migrateOrphanedDB(cfg.DataDir)
@@ -1708,15 +1714,22 @@ func migrateOrphanedDB(correctDir string) {
 	}
 }
 
-// parseGlobalProfile extracts --profile <name> from os.Args, removes it from
-// os.Args so downstream commands don't see it, and resolves against
-// default-profile from config. Returns the resolved profile name (may be "").
+// parseGlobalProfile extracts --profile <name> or --profile=<name> from
+// os.Args, removes it from os.Args so downstream commands don't see it,
+// and resolves against default-profile from config. Returns the resolved
+// profile name (may be "").
 func parseGlobalProfile(dataDir string) string {
 	for i := 1; i < len(os.Args); i++ {
 		if os.Args[i] == "--profile" && i+1 < len(os.Args) {
 			profile := os.Args[i+1]
 			// Remove --profile and its value from os.Args.
 			os.Args = append(os.Args[:i], os.Args[i+2:]...)
+			return profile
+		}
+		if strings.HasPrefix(os.Args[i], "--profile=") {
+			profile := strings.TrimPrefix(os.Args[i], "--profile=")
+			// Remove --profile=NAME from os.Args.
+			os.Args = append(os.Args[:i], os.Args[i+1:]...)
 			return profile
 		}
 	}

@@ -446,6 +446,19 @@ func TestParseGlobalProfile(t *testing.T) {
 		}
 	})
 
+	t.Run("extracts profile with equals sign", func(t *testing.T) {
+		dataDir := t.TempDir()
+		withArgs(t, "engram", "--profile=arquitectura", "mcp")
+		profile := parseGlobalProfile(dataDir)
+		if profile != "arquitectura" {
+			t.Fatalf("profile = %q, want %q", profile, "arquitectura")
+		}
+		// os.Args should have --profile=arquitectura removed
+		if len(os.Args) != 2 || os.Args[1] != "mcp" {
+			t.Fatalf("os.Args = %v, expected [engram mcp]", os.Args)
+		}
+	})
+
 	t.Run("uses default-profile when no flag", func(t *testing.T) {
 		dataDir := t.TempDir()
 		if err := config.Set(dataDir, "default-profile", "prod"); err != nil {
@@ -466,6 +479,137 @@ func TestParseGlobalProfile(t *testing.T) {
 			t.Fatalf("profile = %q, want empty", profile)
 		}
 	})
+}
+
+// ─── delete-profile CLI tests ────────────────────────────────────────────────
+
+func TestCmdConfigDeleteProfile(t *testing.T) {
+	t.Run("deletes existing profile", func(t *testing.T) {
+		cfg := testConfig(t)
+		stubExitWithPanic(t)
+
+		// Create a profile
+		if err := config.SetWithProfile(cfg.DataDir, "dev", "database-url", "postgres://dev/db"); err != nil {
+			t.Fatalf("SetWithProfile: %v", err)
+		}
+
+		withArgs(t, "engram", "config", "delete-profile", "dev")
+		stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdConfig(cfg) })
+		if recovered != nil || stderr != "" {
+			t.Fatalf("delete-profile failed: panic=%v stderr=%q", recovered, stderr)
+		}
+		if !strings.Contains(stdout, `deleted profile "dev"`) {
+			t.Fatalf("unexpected output: %q", stdout)
+		}
+
+		// Verify profile is gone
+		profiles, err := config.ListProfiles(cfg.DataDir)
+		if err != nil {
+			t.Fatalf("ListProfiles: %v", err)
+		}
+		if len(profiles) != 0 {
+			t.Fatalf("expected no profiles, got %v", profiles)
+		}
+	})
+
+	t.Run("errors on nonexistent profile", func(t *testing.T) {
+		cfg := testConfig(t)
+		stubExitWithPanic(t)
+
+		withArgs(t, "engram", "config", "delete-profile", "ghost")
+		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdConfig(cfg) })
+		if _, ok := recovered.(exitCode); !ok {
+			t.Fatalf("expected exit, got %v", recovered)
+		}
+		if !strings.Contains(stderr, "not found") {
+			t.Fatalf("expected not found error, got: %q", stderr)
+		}
+	})
+
+	t.Run("errors when no name given", func(t *testing.T) {
+		cfg := testConfig(t)
+		stubExitWithPanic(t)
+
+		withArgs(t, "engram", "config", "delete-profile")
+		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdConfig(cfg) })
+		if _, ok := recovered.(exitCode); !ok {
+			t.Fatalf("expected exit, got %v", recovered)
+		}
+		if !strings.Contains(stderr, "usage: engram config delete-profile") {
+			t.Fatalf("expected usage error, got: %q", stderr)
+		}
+	})
+}
+
+// ─── Non-existent profile warning test ───────────────────────────────────────
+
+func TestMainWarnsOnNonexistentProfile(t *testing.T) {
+	stubExitWithPanic(t)
+	stubCheckForUpdates(t, versionCheckUpToDate())
+
+	dataDir := t.TempDir()
+	t.Setenv("ENGRAM_DATA_DIR", dataDir)
+
+	// Use a profile that doesn't exist → should warn on stderr
+	withArgs(t, "engram", "--profile", "ghost", "version")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { main() })
+	if recovered != nil {
+		t.Fatalf("unexpected panic: %v", recovered)
+	}
+	if !strings.Contains(stderr, `warning: profile "ghost" not found`) {
+		t.Fatalf("expected warning on stderr, got: %q", stderr)
+	}
+	// stdout should still work (version command)
+	if !strings.Contains(stdout, "engram") {
+		t.Fatalf("expected version output on stdout, got: %q", stdout)
+	}
+}
+
+func TestMainNoWarningForExistingProfile(t *testing.T) {
+	stubExitWithPanic(t)
+	stubCheckForUpdates(t, versionCheckUpToDate())
+
+	dataDir := t.TempDir()
+	t.Setenv("ENGRAM_DATA_DIR", dataDir)
+
+	// Create the profile
+	if err := config.SetWithProfile(dataDir, "dev", "database-url", "postgres://dev/db"); err != nil {
+		t.Fatalf("SetWithProfile: %v", err)
+	}
+
+	withArgs(t, "engram", "--profile", "dev", "version")
+	_, stderr, recovered := captureOutputAndRecover(t, func() { main() })
+	if recovered != nil {
+		t.Fatalf("unexpected panic: %v", recovered)
+	}
+	if strings.Contains(stderr, "warning") {
+		t.Fatalf("expected no warning for existing profile, got: %q", stderr)
+	}
+}
+
+func TestMainDispatchWithEqualsProfile(t *testing.T) {
+	stubExitWithPanic(t)
+	stubCheckForUpdates(t, versionCheckUpToDate())
+
+	dataDir := t.TempDir()
+	t.Setenv("ENGRAM_DATA_DIR", dataDir)
+
+	// Set up a profile
+	if err := config.SetWithProfile(dataDir, "arquitectura", "database-url", "postgres://arq/db"); err != nil {
+		t.Fatalf("SetWithProfile: %v", err)
+	}
+
+	t.Setenv("ENGRAM_DATABASE_URL", "")
+
+	// Use --profile=arquitectura syntax
+	withArgs(t, "engram", "--profile=arquitectura", "config", "get", "database-url")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { main() })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("main --profile= dispatch failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "postgres://arq/db") {
+		t.Fatalf("expected profile value, got: %q", stdout)
+	}
 }
 
 func TestMainDispatchWithProfile(t *testing.T) {

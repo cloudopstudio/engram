@@ -23,6 +23,8 @@ func cmdConfig(cfg store.Config) {
 		cmdConfigList(cfg)
 	case "profiles":
 		cmdConfigProfiles(cfg)
+	case "delete-profile":
+		cmdConfigDeleteProfile(cfg)
 	case "path":
 		fmt.Println(config.Path(cfg.DataDir))
 	default:
@@ -224,6 +226,19 @@ func cmdConfigProfiles(cfg store.Config) {
 	}
 }
 
+func cmdConfigDeleteProfile(cfg store.Config) {
+	if len(os.Args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: engram config delete-profile <name>")
+		exitFunc(1)
+	}
+	name := os.Args[3]
+
+	if err := config.DeleteProfile(cfg.DataDir, name); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("deleted profile %q\n", name)
+}
+
 func printConfigUsage() {
 	fmt.Fprintln(os.Stderr, `usage: engram config <subcommand>
 
@@ -232,6 +247,7 @@ Subcommands:
   get [--profile NAME] <key>          Get a configuration value (shows source)
   list [--profile NAME]               List all configuration with sources
   profiles                            List all configured profiles
+  delete-profile <name>               Delete a profile from config
   path                                Print config file path
 
 Valid keys:`)

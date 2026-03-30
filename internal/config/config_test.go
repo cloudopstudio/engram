@@ -706,6 +706,129 @@ func TestNoProfilesSectionWhenEmpty(t *testing.T) {
 	}
 }
 
+// ─── DeleteProfile tests ─────────────────────────────────────────────────────
+
+func TestDeleteProfile(t *testing.T) {
+	t.Run("deletes existing profile", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := SetWithProfile(dir, "dev", "database-url", "postgres://dev/db"); err != nil {
+			t.Fatalf("SetWithProfile: %v", err)
+		}
+		if err := SetWithProfile(dir, "prod", "database-url", "postgres://prod/db"); err != nil {
+			t.Fatalf("SetWithProfile: %v", err)
+		}
+
+		if err := DeleteProfile(dir, "dev"); err != nil {
+			t.Fatalf("DeleteProfile: %v", err)
+		}
+
+		profiles, err := ListProfiles(dir)
+		if err != nil {
+			t.Fatalf("ListProfiles: %v", err)
+		}
+		if len(profiles) != 1 || profiles[0] != "prod" {
+			t.Fatalf("expected [prod], got %v", profiles)
+		}
+	})
+
+	t.Run("returns error for nonexistent profile", func(t *testing.T) {
+		dir := t.TempDir()
+		err := DeleteProfile(dir, "ghost")
+		if err == nil {
+			t.Fatal("expected error for nonexistent profile")
+		}
+		if !contains(err.Error(), "not found") {
+			t.Fatalf("error = %q, want containing 'not found'", err)
+		}
+	})
+
+	t.Run("returns error for empty name", func(t *testing.T) {
+		dir := t.TempDir()
+		err := DeleteProfile(dir, "")
+		if err == nil {
+			t.Fatal("expected error for empty profile name")
+		}
+		if !contains(err.Error(), "profile name cannot be empty") {
+			t.Fatalf("error = %q, want containing 'profile name cannot be empty'", err)
+		}
+	})
+
+	t.Run("clears default-profile when deleting the default", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := Set(dir, "default-profile", "staging"); err != nil {
+			t.Fatalf("Set default-profile: %v", err)
+		}
+		if err := SetWithProfile(dir, "staging", "database-url", "postgres://staging/db"); err != nil {
+			t.Fatalf("SetWithProfile: %v", err)
+		}
+
+		if err := DeleteProfile(dir, "staging"); err != nil {
+			t.Fatalf("DeleteProfile: %v", err)
+		}
+
+		val, err := Get(dir, "default-profile")
+		if err != nil {
+			t.Fatalf("Get default-profile: %v", err)
+		}
+		if val != "" {
+			t.Fatalf("default-profile = %q, want empty", val)
+		}
+	})
+
+	t.Run("preserves default-profile when deleting other profile", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := Set(dir, "default-profile", "prod"); err != nil {
+			t.Fatalf("Set default-profile: %v", err)
+		}
+		if err := SetWithProfile(dir, "prod", "database-url", "postgres://prod/db"); err != nil {
+			t.Fatalf("SetWithProfile: %v", err)
+		}
+		if err := SetWithProfile(dir, "dev", "database-url", "postgres://dev/db"); err != nil {
+			t.Fatalf("SetWithProfile: %v", err)
+		}
+
+		if err := DeleteProfile(dir, "dev"); err != nil {
+			t.Fatalf("DeleteProfile: %v", err)
+		}
+
+		val, err := Get(dir, "default-profile")
+		if err != nil {
+			t.Fatalf("Get default-profile: %v", err)
+		}
+		if val != "prod" {
+			t.Fatalf("default-profile = %q, want %q", val, "prod")
+		}
+	})
+}
+
+// ─── ValidateProfile tests ──────────────────────────────────────────────────
+
+func TestValidateProfile(t *testing.T) {
+	t.Run("returns true for existing profile", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := SetWithProfile(dir, "dev", "database-url", "postgres://dev/db"); err != nil {
+			t.Fatalf("SetWithProfile: %v", err)
+		}
+		if !ValidateProfile(dir, "dev") {
+			t.Fatal("expected true for existing profile")
+		}
+	})
+
+	t.Run("returns false for nonexistent profile", func(t *testing.T) {
+		dir := t.TempDir()
+		if ValidateProfile(dir, "ghost") {
+			t.Fatal("expected false for nonexistent profile")
+		}
+	})
+
+	t.Run("returns true for empty profile (no validation needed)", func(t *testing.T) {
+		dir := t.TempDir()
+		if !ValidateProfile(dir, "") {
+			t.Fatal("expected true for empty profile")
+		}
+	})
+}
+
 // contains checks if s contains substr (avoids importing strings in test).
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
