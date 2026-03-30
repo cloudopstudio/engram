@@ -242,6 +242,7 @@ type ExportData struct {
 
 type Config struct {
 	DataDir              string
+	Profile              string // Active profile name (from --profile flag or default-profile)
 	MaxObservationLength int
 	MaxContextResults    int
 	MaxSearchResults     int
