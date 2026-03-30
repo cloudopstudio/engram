@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache"
 	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -49,6 +50,78 @@ func NewTokenProvider() (*TokenProvider, error) {
 		cred:  cred,
 		scope: pgTokenScope,
 	}, nil
+}
+
+// NewDeviceCodeTokenProvider creates a TokenProvider that uses Azure Device Code
+// Flow with a persistent token cache. This is intended for non-dev users who
+// can't use 'az login' (e.g., running inside OpenCode/Claude/etc.).
+//
+// With the persistent cache, users authenticate once every ~90 days. Tokens are
+// stored in platform-native credential storage:
+//   - macOS: Keychain
+//   - Linux: libsecret / encrypted file fallback
+//   - Windows: Windows Credential Manager
+//
+// ALL output goes to stderr — stdout is reserved for the MCP stdio protocol.
+func NewDeviceCodeTokenProvider(tenantID, clientID string) (*TokenProvider, error) {
+	c, err := cache.New(&cache.Options{
+		Name: "engram",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("entra: create persistent token cache: %w", err)
+	}
+
+	cred, err := azidentity.NewDeviceCodeCredential(&azidentity.DeviceCodeCredentialOptions{
+		TenantID: tenantID,
+		ClientID: clientID,
+		Cache:    c,
+		UserPrompt: func(ctx context.Context, msg azidentity.DeviceCodeMessage) error {
+			fmt.Fprintf(os.Stderr, "\n")
+			fmt.Fprintf(os.Stderr, "  ┌─────────────────────────────────────────────────┐\n")
+			fmt.Fprintf(os.Stderr, "  │  engram: Azure authentication required           │\n")
+			fmt.Fprintf(os.Stderr, "  │                                                  │\n")
+			fmt.Fprintf(os.Stderr, "  │  %s\n", msg.Message)
+			fmt.Fprintf(os.Stderr, "  │                                                  │\n")
+			fmt.Fprintf(os.Stderr, "  │  Waiting for authentication...                   │\n")
+			fmt.Fprintf(os.Stderr, "  └─────────────────────────────────────────────────┘\n")
+			fmt.Fprintf(os.Stderr, "\n")
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("entra: create device code credential: %w", err)
+	}
+	return &TokenProvider{
+		cred:  cred,
+		scope: pgTokenScope,
+	}, nil
+}
+
+// resolveInteractiveAuth resolves tenant-id and client-id for device code flow
+// using the resolution chain: env vars → config (with profile) → error.
+func resolveInteractiveAuth(dataDir, profile string) (tenantID, clientID string, err error) {
+	// 1. Environment variables
+	tenantID = os.Getenv("AZURE_TENANT_ID")
+	clientID = os.Getenv("AZURE_CLIENT_ID")
+
+	// 2. Config file (with profile support)
+	if tenantID == "" && dataDir != "" {
+		if v, cfgErr := config.GetWithProfile(dataDir, profile, "tenant-id"); cfgErr == nil && v != "" {
+			tenantID = v
+		}
+	}
+	if clientID == "" && dataDir != "" {
+		if v, cfgErr := config.GetWithProfile(dataDir, profile, "client-id"); cfgErr == nil && v != "" {
+			clientID = v
+		}
+	}
+
+	// 3. Validate both are present
+	if tenantID == "" || clientID == "" {
+		return "", "", fmt.Errorf("device code auth requires tenant-id and client-id.\n  Run: engram config set tenant-id <your-tenant-id>\n       engram config set client-id <your-client-id>")
+	}
+
+	return tenantID, clientID, nil
 }
 
 // Token returns a valid access token, refreshing if within tokenRefreshBuffer

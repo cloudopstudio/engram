@@ -270,6 +270,7 @@ type PassiveCaptureResult struct {
 type Config struct {
 	DataDir              string
 	Profile              string // Active profile name (from --profile flag or default-profile)
+	AuthInteractive      bool   // Enable device code flow for Azure auth
 	MaxObservationLength int
 	MaxContextResults    int
 	MaxSearchResults     int
@@ -327,9 +328,21 @@ func New(cfg Config) (*Store, error) {
 	var identity string
 	if authMethod != "password" {
 		var err error
-		tp, err = NewTokenProvider()
-		if err != nil {
-			return nil, fmt.Errorf("engram: entra auth failed (set ENGRAM_AUTH_METHOD=password to use password): %w", err)
+		if cfg.AuthInteractive {
+			// Device code flow with persistent token cache.
+			tenantID, clientID, resolveErr := resolveInteractiveAuth(cfg.DataDir, cfg.Profile)
+			if resolveErr != nil {
+				return nil, fmt.Errorf("engram: %w", resolveErr)
+			}
+			tp, err = NewDeviceCodeTokenProvider(tenantID, clientID)
+			if err != nil {
+				return nil, fmt.Errorf("engram: device code auth failed: %w", err)
+			}
+		} else {
+			tp, err = NewTokenProvider()
+			if err != nil {
+				return nil, fmt.Errorf("engram: entra auth failed (set ENGRAM_AUTH_METHOD=password to use password): %w", err)
+			}
 		}
 		// Acquire an initial token to populate identity.
 		if _, err := tp.Token(context.Background()); err != nil {
@@ -2775,4 +2788,9 @@ func MigratePGExported(pool *pgxpool.Pool) error {
 // NewSyncIDExported exposes newSyncID for the migration CLI.
 func NewSyncIDExported(prefix string) string {
 	return newSyncID(prefix)
+}
+
+// ResolveInteractiveAuthExported exposes resolveInteractiveAuth for the login CLI command.
+func ResolveInteractiveAuthExported(dataDir, profile string) (tenantID, clientID string, err error) {
+	return resolveInteractiveAuth(dataDir, profile)
 }

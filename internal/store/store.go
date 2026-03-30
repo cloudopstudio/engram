@@ -243,6 +243,7 @@ type ExportData struct {
 type Config struct {
 	DataDir              string
 	Profile              string // Active profile name (from --profile flag or default-profile)
+	AuthInteractive      bool   // Enable device code flow for Azure auth
 	MaxObservationLength int
 	MaxContextResults    int
 	MaxSearchResults     int
