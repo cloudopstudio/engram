@@ -8,10 +8,8 @@ PostgreSQL-backed engram for team collaboration with shared persistent memory.
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Azure PostgreSQL Setup](#azure-postgresql-setup)
-- [Configuration Profiles](#configuration-profiles)
-- [Authentication Methods](#authentication-methods)
+- [Authentication Configuration](#authentication-configuration)
 - [MCP Client Configuration](#mcp-client-configuration)
-- [CLI Reference](#cli-reference)
 - [Migration from SQLite](#migration-from-sqlite)
 - [Entra ID Token Lifecycle](#entra-id-token-lifecycle)
 - [Troubleshooting](#troubleshooting)
@@ -21,7 +19,7 @@ PostgreSQL-backed engram for team collaboration with shared persistent memory.
 
 ## Overview
 
-**engram** ships with built-in PostgreSQL support. When configured with a `database-url`, it connects to PostgreSQL instead of using a local SQLite file. The entire team shares a single Azure Database for PostgreSQL — every `mem_save`, `mem_search`, and `mem_session_summary` reads and writes to the same database.
+**engram** ships with built-in PostgreSQL support. When configured with `ENGRAM_DATABASE_URL`, it connects to PostgreSQL instead of using a local SQLite file. The entire team shares a single Azure Database for PostgreSQL — every `mem_save`, `mem_search`, and `mem_session_summary` reads and writes to the same database.
 
 ### Why Use It
 
@@ -30,33 +28,34 @@ PostgreSQL-backed engram for team collaboration with shared persistent memory.
 | Storage | Local `~/.engram/engram.db` per machine | Shared Azure PG instance |
 | Collaboration | Git Sync (async, chunk-based) | Real-time shared memory |
 | Search | FTS5 (no stemming) | pg_tsvector (stemming, phrases, exclusion) |
-| Auth | None (local file) | Azure Entra ID (passwordless) or password |
+| Auth | None (local file) | Azure Entra ID (passwordless) |
 | Audit trail | None | `created_by` on every record |
 | Future | — | pgvector embeddings ready |
 
 ### Architecture
 
 ```
- ┌─────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
- │  Agent Arq              │  │  Agent DevOps            │  │  Agent Front             │
- │  (--profile arq)        │  │  (--profile devops)      │  │  (--profile front)       │
- │  engram                 │  │  engram                  │  │  engram                  │
- └───────────┬─────────────┘  └───────────┬──────────────┘  └───────────┬──────────────┘
-             │                            │                             │
-             │  Entra ID / Password       │  Entra ID / Password       │  Entra ID / Password
-             │                            │                            │
-             └────────────────────────────┼────────────────────────────┘
-                                          │
-                                   ┌──────▼──────┐
-                                   │  Azure DB   │
-                                   │  for PG     │
-                                   │  (Flex)     │
-                                   │             │
-                                   │  TLS + AAD  │
-                                   └─────────────┘
+ ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+ │  Dev A       │   │  Dev B       │   │  Dev C       │
+ │  (macOS)     │   │  (Linux)     │   │  (Windows)   │
+ │  engram      │   │  engram      │   │  engram      │
+ └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+        │                  │                   │
+        │    Entra ID      │    Entra ID       │    Entra ID
+        │    token auth    │    token auth     │    token auth
+        │                  │                   │
+        └──────────────────┼───────────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Azure DB   │
+                    │  for PG     │
+                    │  (Flex)     │
+                    │             │
+                    │  TLS + AAD  │
+                    └─────────────┘
 ```
 
-Each developer or agent runs `engram` locally with a **profile** that points to the right database. Profiles let you manage multiple databases (per-team, per-project, per-environment) from a single binary and config file.
+Each developer runs `engram` locally. When `ENGRAM_DATABASE_URL` is set, the binary connects to Azure Database for PostgreSQL using Entra ID tokens (acquired via `az login`). No passwords are stored — authentication is fully managed by Azure AD.
 
 ---
 
@@ -65,10 +64,10 @@ Each developer or agent runs `engram` locally with a **profile** that points to 
 | Requirement | Needed For | Install |
 |-------------|-----------|---------|
 | **Go 1.25+** | Building from source only | [go.dev/dl](https://go.dev/dl/) |
-| **Azure CLI** (`az`) | Entra ID authentication (developers) | See [Auth Methods](#authentication-methods) |
-| **Azure PG Flexible Server** | Database hosting | See [Azure PG Setup](#azure-postgresql-setup) |
-| **Entra ID auth enabled** | Passwordless login | See [Azure PG Setup](#azure-postgresql-setup) |
-| **Team members added as PG users** | Per-dev access | See [Azure PG Setup](#azure-postgresql-setup) |
+| **Azure CLI** (`az`) | Entra ID authentication | See [Section 5a](#5a-with-entra-id-recommended-for-teams) |
+| **Azure PG Flexible Server** | Database hosting | See [Section 4](#azure-postgresql-setup) |
+| **Entra ID auth enabled** | Passwordless login | See [Section 4](#azure-postgresql-setup) |
+| **Team members added as PG users** | Per-dev access | See [Section 4](#azure-postgresql-setup) |
 
 > **Note:** If you're just evaluating locally with `docker run postgres`, you only need Docker and a connection string. Skip the Azure sections entirely.
 
@@ -78,13 +77,13 @@ Each developer or agent runs `engram` locally with a **profile** that points to 
 
 ### From GitHub Release (recommended)
 
-Download the prebuilt `engram` binary for your platform from [GitHub Releases](https://github.com/White-Lion-Technology/engram/releases). PostgreSQL support is built-in — no build tags needed.
+Download the prebuilt `engram` binary for your platform from [GitHub Releases](https://github.com/Gentleman-Programming/engram/releases). PostgreSQL support is built-in.
 
 #### macOS (Apple Silicon)
 
 ```bash
 # Download the latest release
-curl -L https://github.com/White-Lion-Technology/engram/releases/latest/download/engram_darwin_arm64.tar.gz -o engram.tar.gz
+curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_darwin_arm64.tar.gz -o engram.tar.gz
 tar xzf engram.tar.gz
 chmod +x engram
 mv engram ~/.local/bin/
@@ -96,7 +95,7 @@ engram version
 #### macOS (Intel)
 
 ```bash
-curl -L https://github.com/White-Lion-Technology/engram/releases/latest/download/engram_darwin_amd64.tar.gz -o engram.tar.gz
+curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_darwin_amd64.tar.gz -o engram.tar.gz
 tar xzf engram.tar.gz
 chmod +x engram
 mv engram ~/.local/bin/
@@ -109,7 +108,7 @@ engram version
 #### Linux (amd64)
 
 ```bash
-curl -L https://github.com/White-Lion-Technology/engram/releases/latest/download/engram_linux_amd64.tar.gz -o engram.tar.gz
+curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_linux_amd64.tar.gz -o engram.tar.gz
 tar xzf engram.tar.gz
 chmod +x engram
 sudo mv engram /usr/local/bin/
@@ -120,7 +119,7 @@ engram version
 #### Linux (arm64)
 
 ```bash
-curl -L https://github.com/White-Lion-Technology/engram/releases/latest/download/engram_linux_arm64.tar.gz -o engram.tar.gz
+curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_linux_arm64.tar.gz -o engram.tar.gz
 tar xzf engram.tar.gz
 chmod +x engram
 sudo mv engram /usr/local/bin/
@@ -132,7 +131,7 @@ engram version
 
 ```powershell
 # Download the latest release
-Invoke-WebRequest -Uri "https://github.com/White-Lion-Technology/engram/releases/latest/download/engram_windows_amd64.zip" -OutFile engram.zip
+Invoke-WebRequest -Uri "https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_windows_amd64.zip" -OutFile engram.zip
 Expand-Archive engram.zip -DestinationPath .
 Move-Item engram.exe "$env:USERPROFILE\go\bin\"
 
@@ -143,7 +142,7 @@ engram.exe version
 #### Windows (arm64)
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/White-Lion-Technology/engram/releases/latest/download/engram_windows_arm64.zip" -OutFile engram.zip
+Invoke-WebRequest -Uri "https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_windows_arm64.zip" -OutFile engram.zip
 Expand-Archive engram.zip -DestinationPath .
 Move-Item engram.exe "$env:USERPROFILE\go\bin\"
 
@@ -163,12 +162,12 @@ brew install Gentleman-Programming/tap/engram
 Requires **Go 1.25+**.
 
 ```bash
-git clone https://github.com/White-Lion-Technology/engram.git
+git clone https://github.com/Gentleman-Programming/engram.git
 cd engram
 go build -tags pgstore -o engram ./cmd/engram/
 ```
 
-The `-tags pgstore` flag activates the PostgreSQL store backend in addition to SQLite. The resulting `engram` binary auto-selects the backend based on configuration.
+The `-tags pgstore` flag activates the PostgreSQL store backend in addition to SQLite. The resulting `engram` binary auto-selects the backend based on whether `ENGRAM_DATABASE_URL` is set.
 
 > **Version stamping** (optional):
 > ```bash
@@ -198,22 +197,6 @@ The `-tags pgstore` flag activates the PostgreSQL store backend in addition to S
 4. Save
 
 > **Full Azure docs:** [Configure Microsoft Entra authentication](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/how-to-configure-sign-in-azure-ad-authentication)
-
-### Create an Azure App Registration (for Device Code Flow)
-
-If your team includes non-developer users (PMs, designers, etc.) who can't use `az login`, create an App Registration to enable Device Code Flow:
-
-1. In [Azure Portal](https://portal.azure.com) → **Microsoft Entra ID** → **App registrations** → **New registration**
-2. Name: `engram-device-code` (or any name)
-3. Supported account types: **Accounts in this organizational directory only**
-4. Redirect URI: leave blank (device code flow doesn't need one)
-5. Click **Register**
-6. Note the **Application (client) ID** — this is your `client-id`
-7. Note the **Directory (tenant) ID** — this is your `tenant-id`
-8. Go to **Authentication** → enable **Allow public client flows** → Save
-9. Go to **API permissions** → **Add a permission** → **Azure OSSRDBMS Database** → **user_impersonation** → Grant admin consent
-
-Share the `tenant-id` and `client-id` values with your team — they'll set them in their profiles.
 
 ### Add Team Members as PG Users
 
@@ -249,216 +232,120 @@ Configure network access so team members can connect:
 
 ---
 
-## Configuration Profiles
+## Authentication Configuration
 
-Profiles let you manage multiple PostgreSQL databases from a single `engram` installation. Each profile stores its own `database-url`, `auth-method`, `tenant-id`, and `client-id`.
-
-Configuration is stored in `~/.engram/config.json` with the priority:
-
-```
-environment variable > profile value > root config value > default
-```
-
-### Create Profiles
-
-```bash
-# Create a profile for the architecture team
-engram config set --profile arquitectura database-url "postgres://<your-email>@<your-server>.postgres.database.azure.com:5432/engram_arq?sslmode=require"
-engram config set --profile arquitectura auth-method entra
-engram config set --profile arquitectura tenant-id "<your-tenant-id>"
-engram config set --profile arquitectura client-id "<your-client-id>"
-
-# Create a profile for the devops team
-engram config set --profile devops database-url "postgres://<your-email>@<your-server>.postgres.database.azure.com:5432/engram_devops?sslmode=require"
-engram config set --profile devops auth-method entra
-engram config set --profile devops tenant-id "<your-tenant-id>"
-engram config set --profile devops client-id "<your-client-id>"
-
-# Create a profile for local development (no Entra ID needed)
-engram config set --profile local database-url "postgres://engram:password@localhost:5432/engram?sslmode=disable"
-engram config set --profile local auth-method password
-```
-
-Both flag syntaxes work:
-
-```bash
-engram config set --profile=devops key value
-engram config set --profile devops key value
-```
-
-### Set a Default Profile
-
-```bash
-engram config set default-profile arquitectura
-```
-
-When `default-profile` is set, all commands use it automatically — no need for `--profile` on every call.
-
-### List Profiles
-
-```bash
-engram config profiles
-```
-
-Output:
-
-```
-Configured profiles:
-  arquitectura (default)
-  devops
-  local
-```
-
-### View Profile Config
-
-```bash
-engram config list --profile arquitectura
-```
-
-### Delete a Profile
-
-```bash
-engram config delete-profile devops
-```
-
-If the deleted profile was the default, `default-profile` is cleared automatically.
-
-### Config File Location
-
-```bash
-engram config path
-# → /Users/<you>/.engram/config.json
-```
-
-### All Config Keys
-
-| Key | Env Var | Default | Description |
-|-----|---------|---------|-------------|
-| `database-url` | `ENGRAM_DATABASE_URL` | — | PostgreSQL connection string |
-| `auth-method` | `ENGRAM_AUTH_METHOD` | Auto-detected | `entra` or `password` |
-| `server-port` | `ENGRAM_PORT` | `7437` | HTTP server port |
-| `default-project` | — | — | Default project name for commands |
-| `default-profile` | — | — | Default profile (used when `--profile` is omitted) |
-| `tenant-id` | `AZURE_TENANT_ID` | — | Azure Entra ID tenant ID (for device code flow) |
-| `client-id` | `AZURE_CLIENT_ID` | — | Azure app registration client ID (for device code flow) |
-
-Keys that can be set inside profiles: `database-url`, `auth-method`, `server-port`, `tenant-id`, `client-id`.
-
-Keys that are global-only (cannot be set inside profiles): `default-project`, `default-profile`.
-
----
-
-## Authentication Methods
-
-Engram supports three authentication methods for PostgreSQL:
-
-| Method | Config | For Whom | Requirements |
-|--------|--------|----------|-------------|
-| **Password** | `auth-method: password` | Local dev/testing | Just `database-url` with credentials |
-| **Azure CLI** | `auth-method: entra` | Developers (have `az login`) | Azure CLI installed + `az login` |
-| **Device Code** | `auth-method: entra` + `--auth-interactive` | Non-devs (PMs, designers, agents) | `tenant-id` + `client-id` in config |
-
-### Method 1: Password (local dev/testing)
-
-For local PostgreSQL instances (Docker, Homebrew postgres, etc.) where Entra ID is not needed.
-
-```bash
-# Start a local PG (if you don't have one):
-docker run -d --name engram-db -e POSTGRES_DB=engram -e POSTGRES_USER=engram -e POSTGRES_PASSWORD=password -p 5432:5432 postgres:16-alpine
-
-# Configure
-engram config set --profile local database-url "postgres://engram:password@localhost:5432/engram?sslmode=disable"
-engram config set --profile local auth-method password
-engram config set default-profile local
-
-# Test
-engram stats
-```
-
-### Method 2: Azure CLI (developers)
+### 5a. With Entra ID (recommended for teams)
 
 Entra ID provides passwordless authentication. Each developer authenticates via `az login` — engram acquires a token automatically and uses it as the PG password.
 
 #### macOS
 
 ```bash
+# Install Azure CLI
 brew install azure-cli
+
+# Login (one-time, or when session expires — tokens last ~1 hour)
 az login
+
+# Create a wrapper script for convenience
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/engram-cloud << 'EOF'
+#!/bin/bash
+export ENGRAM_DATABASE_URL="postgres://<your-email>@<server>.postgres.database.azure.com:5432/engram?sslmode=require"
+export ENGRAM_AUTH_METHOD=entra
+exec engram "$@"
+EOF
+chmod +x ~/.local/bin/engram-cloud
 ```
+
+Replace:
+- `<your-email>` — your Entra ID email (e.g., `dev-a@company.com`)
+- `<server>` — your Azure PG server name (e.g., `engram-db`)
 
 #### Linux
 
 ```bash
-# Debian/Ubuntu
+# Install Azure CLI (Debian/Ubuntu)
 curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 
-# RHEL/Fedora
+# Or for RHEL/CentOS/Fedora:
+# sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
 # sudo dnf install azure-cli
 
+# Login
 az login
+
+# Create wrapper script
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/engram-cloud << 'EOF'
+#!/bin/bash
+export ENGRAM_DATABASE_URL="postgres://<your-email>@<server>.postgres.database.azure.com:5432/engram?sslmode=require"
+export ENGRAM_AUTH_METHOD=entra
+exec engram "$@"
+EOF
+chmod +x ~/.local/bin/engram-cloud
+```
+
+> **Other Linux distros:** See [Install the Azure CLI on Linux](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli-linux) for apt, yum, zypper, and manual install options.
+
+#### Windows (PowerShell)
+
+```powershell
+# Install Azure CLI
+winget install Microsoft.AzureCLI
+
+# Login
+az login
+
+# Create wrapper script
+# Save as: C:\Users\<user>\go\bin\engram-cloud.cmd
+@echo off
+set ENGRAM_DATABASE_URL=postgres://<your-email>@<server>.postgres.database.azure.com:5432/engram?sslmode=require
+set ENGRAM_AUTH_METHOD=entra
+engram.exe %*
+```
+
+Save the file above as `engram-cloud.cmd` in a directory that's in your `PATH` (e.g., `%USERPROFILE%\go\bin\`).
+
+> **PowerShell alternative** — create `engram-cloud.ps1`:
+> ```powershell
+> $env:ENGRAM_DATABASE_URL = "postgres://<your-email>@<server>.postgres.database.azure.com:5432/engram?sslmode=require"
+> $env:ENGRAM_AUTH_METHOD = "entra"
+> & engram.exe @args
+> ```
+> Note: `.ps1` scripts require `pwsh -File engram-cloud.ps1` to invoke — `.cmd` is simpler for MCP config.
+
+### 5b. With Password (for local dev/testing)
+
+For local PostgreSQL instances (Docker, Homebrew postgres, etc.) where Entra ID is not needed.
+
+#### macOS / Linux
+
+```bash
+# Start a local PG (if you don't have one):
+# docker run -d --name engram-db -e POSTGRES_DB=engram -e POSTGRES_USER=engram -e POSTGRES_PASSWORD=password -p 5432:5432 postgres:16-alpine
+
+# Create wrapper script
+mkdir -p ~/.local/bin
+cat > ~/.local/bin/engram-local << 'EOF'
+#!/bin/bash
+export ENGRAM_DATABASE_URL="postgres://engram:password@localhost:5432/engram?sslmode=disable"
+export ENGRAM_AUTH_METHOD=password
+exec engram "$@"
+EOF
+chmod +x ~/.local/bin/engram-local
 ```
 
 #### Windows
 
-```powershell
-winget install Microsoft.AzureCLI
-az login
+Save as `engram-local.cmd` in a directory in your `PATH`:
+
+```cmd
+@echo off
+set ENGRAM_DATABASE_URL=postgres://engram:password@localhost:5432/engram?sslmode=disable
+set ENGRAM_AUTH_METHOD=password
+engram.exe %*
 ```
-
-#### Configure
-
-```bash
-engram config set --profile cloud database-url "postgres://<your-email>@<your-server>.postgres.database.azure.com:5432/engram?sslmode=require"
-engram config set --profile cloud auth-method entra
-engram config set default-profile cloud
-```
-
-That's it. Engram uses `DefaultAzureCredential` which picks up the `az login` session automatically.
-
-### Method 3: Device Code Flow (non-developers)
-
-For users who don't have (or can't have) the Azure CLI — product managers, designers, or AI agents running in restricted environments. Instead of `az login`, the user authenticates via a browser-based device code flow.
-
-#### How It Works
-
-1. Engram prints a URL and a one-time code to stderr
-2. The user opens the URL in any browser and enters the code
-3. Azure authenticates the user and returns a token
-4. The token is cached at `~/.engram/token-cache.json` (0600 permissions)
-5. Cached tokens persist for ~60-90 minutes; the `az login` refresh lasts ~90 days
-
-#### Prerequisites
-
-The profile must have `tenant-id` and `client-id` set (from the Azure App Registration):
-
-```bash
-engram config set --profile arquitectura tenant-id "<your-tenant-id>"
-engram config set --profile arquitectura client-id "<your-client-id>"
-```
-
-#### Pre-Authenticate (Interactive)
-
-```bash
-engram login --profile arquitectura
-```
-
-This triggers the device code flow immediately, caches the token, and exits. Useful to authenticate before starting an MCP session.
-
-#### Auto-Authenticate on MCP Start
-
-```bash
-engram --profile arquitectura --auth-interactive mcp
-```
-
-When `--auth-interactive` is set and the cached token is expired or missing, engram triggers the device code flow automatically when the MCP server starts. The device code prompt is printed to stderr (stdout is reserved for the MCP protocol).
-
-#### Token Cache
-
-- **Location:** `~/.engram/token-cache.json`
-- **Permissions:** `0600` (owner-only read/write)
-- **Token validity:** ~60-90 minutes (Azure AD token lifetime)
-- **Cache behavior:** If a valid (non-expired) cached token exists, it's used directly — no device code prompt
-- **Refresh:** When expired, a new device code flow is triggered automatically (if `--auth-interactive` is set)
 
 ### Environment Variables Reference
 
@@ -467,19 +354,15 @@ When `--auth-interactive` is set and the cached token is expired or missing, eng
 | `ENGRAM_DATABASE_URL` | PostgreSQL connection string (enables PG mode) | — |
 | `ENGRAM_AUTH_METHOD` | `entra` or `password` | Auto-detected: `entra` for `*.database.azure.com`, `password` otherwise |
 | `ENGRAM_MIGRATE_SOURCE` | Source SQLite DB for migration | `~/.engram/engram.db` |
-| `ENGRAM_DATA_DIR` | Data directory (config, token cache, SQLite DB) | `~/.engram` |
+| `ENGRAM_DATA_DIR` | Data directory (used for default migration source path) | `~/.engram` |
 | `ENGRAM_PORT` | HTTP server port | `7437` |
 | `ENGRAM_FTS_LANGUAGE` | PostgreSQL text search language config | `english` |
-| `AZURE_TENANT_ID` | Azure Entra ID tenant (overrides `tenant-id` config) | — |
-| `AZURE_CLIENT_ID` | Azure app registration client (overrides `client-id` config) | — |
-
-> **Note:** Environment variables override config values. Config profiles override root config values.
 
 ---
 
 ## MCP Client Configuration
 
-With profiles, you no longer need wrapper scripts. Use `engram --profile <name> mcp` directly in your agent's MCP config.
+Configure your AI agent to use `engram-cloud` (or `engram-local`) instead of plain `engram` to auto-set the database URL. Alternatively, set `ENGRAM_DATABASE_URL` in your environment and use `engram` directly.
 
 ### OpenCode
 
@@ -490,26 +373,7 @@ Edit `~/.config/opencode/opencode.json` (Windows: `%APPDATA%\opencode\opencode.j
   "mcp": {
     "engram": {
       "type": "local",
-      "command": ["engram", "--profile", "arquitectura", "mcp"],
-      "enabled": true
-    }
-  }
-}
-```
-
-#### Multiple Agents with Different Profiles
-
-```json
-{
-  "mcp": {
-    "engram-arq": {
-      "type": "local",
-      "command": ["engram", "--profile", "arquitectura", "mcp"],
-      "enabled": true
-    },
-    "engram-devops": {
-      "type": "local",
-      "command": ["engram", "--profile", "devops", "--auth-interactive", "mcp"],
+      "command": ["engram-cloud", "mcp"],
       "enabled": true
     }
   }
@@ -521,7 +385,7 @@ Edit `~/.config/opencode/opencode.json` (Windows: `%APPDATA%\opencode\opencode.j
 **Option A: Via `claude mcp add`:**
 
 ```bash
-claude mcp add engram -- engram --profile arquitectura mcp
+claude mcp add engram -- engram-cloud mcp
 ```
 
 **Option B: Manual config** — add to `.claude/settings.json` (project) or `~/.claude/settings.json` (global):
@@ -530,21 +394,8 @@ claude mcp add engram -- engram --profile arquitectura mcp
 {
   "mcpServers": {
     "engram": {
-      "command": "engram",
-      "args": ["--profile", "arquitectura", "mcp"]
-    }
-  }
-}
-```
-
-#### With Device Code Auth (non-dev users)
-
-```json
-{
-  "mcpServers": {
-    "engram": {
-      "command": "engram",
-      "args": ["--profile", "arquitectura", "--auth-interactive", "mcp"]
+      "command": "engram-cloud",
+      "args": ["mcp"]
     }
   }
 }
@@ -558,8 +409,8 @@ Edit `~/.gemini/settings.json` (Windows: `%APPDATA%\gemini\settings.json`):
 {
   "mcpServers": {
     "engram": {
-      "command": "engram",
-      "args": ["--profile", "arquitectura", "mcp"]
+      "command": "engram-cloud",
+      "args": ["mcp"]
     }
   }
 }
@@ -573,8 +424,8 @@ Add to `.vscode/mcp.json` (workspace) or user-level `mcp.json`:
 {
   "servers": {
     "engram": {
-      "command": "engram",
-      "args": ["--profile", "arquitectura", "mcp"]
+      "command": "engram-cloud",
+      "args": ["mcp"]
     }
   }
 }
@@ -586,82 +437,13 @@ Edit `~/.codex/config.toml` (Windows: `%APPDATA%\codex\config.toml`):
 
 ```toml
 [mcp_servers.engram]
-command = "engram"
-args = ["--profile", "arquitectura", "mcp"]
+command = "engram-cloud"
+args = ["mcp"]
 ```
 
-### MCP Tool Profiles
+### Any Other MCP Agent
 
-The `mcp` command supports a `--tools` flag to limit which MCP tools are exposed:
-
-```bash
-engram mcp --tools=agent    # 11 core tools (recommended for agents)
-engram mcp --tools=admin    # 3 admin tools only
-engram mcp --tools=all      # All 14 tools (default)
-```
-
-Combine with profiles:
-
-```bash
-engram --profile arquitectura mcp --tools=agent
-```
-
-### Without Profiles (Legacy Wrapper Scripts)
-
-If you prefer environment variables over profiles, you can still use wrapper scripts:
-
-```bash
-#!/bin/bash
-export ENGRAM_DATABASE_URL="postgres://<your-email>@<your-server>.postgres.database.azure.com:5432/engram?sslmode=require"
-export ENGRAM_AUTH_METHOD=entra
-exec engram "$@"
-```
-
-Then use the wrapper in your MCP config. However, **profiles are the recommended approach** — they're simpler, portable, and don't leak credentials in shell scripts.
-
----
-
-## CLI Reference
-
-### Global Flags
-
-```
-engram [--profile NAME] [--auth-interactive] <command> [arguments]
-
-Flags:
-  --profile NAME        Use a specific config profile (overrides default-profile)
-  --profile=NAME        Same, with equals syntax
-  --auth-interactive    Enable Azure device code login (for non-dev users)
-```
-
-### All Commands
-
-| Command | Description |
-|---------|-------------|
-| `serve [port]` | Start HTTP API server (default: 7437) |
-| `mcp [--tools=PROFILE]` | Start MCP server (stdio transport, for any AI agent) |
-| `tui` | Launch interactive terminal UI (Bubbletea-based) |
-| `search <query>` | Search memories `[--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]` |
-| `save <title> <msg>` | Save a memory `[--type TYPE] [--project PROJECT] [--scope SCOPE] [--topic TOPIC_KEY]` |
-| `timeline <obs_id>` | Show chronological context around an observation `[--before N] [--after N]` |
-| `context [project]` | Show recent context from previous sessions `[--scope SCOPE]` |
-| `stats` | Show memory system statistics |
-| `export [file]` | Export all memories to JSON (default: `engram-export.json`) |
-| `import <file>` | Import memories from a JSON export file |
-| `migrate` | Migrate data from SQLite to PostgreSQL |
-| `login` | Authenticate with Azure (device code flow), caches token |
-| `config set [--profile NAME] <key> <value>` | Set a configuration value |
-| `config get [--profile NAME] <key>` | Get a configuration value (shows source) |
-| `config list [--profile NAME]` | List all configuration with sources |
-| `config profiles` | List all configured profiles |
-| `config delete-profile <name>` | Delete a profile from config |
-| `config path` | Print config file path |
-| `setup [agent]` | Install agent integration (`opencode`, `claude-code`, `gemini-cli`, `codex`) |
-| `sync` | Export new memories as compressed chunk to `.engram/` |
-| `sync --import` | Import new chunks from `.engram/` into local DB |
-| `sync --status` | Show sync status (local vs remote chunks) |
-| `version` | Print version |
-| `help` | Show help |
+The pattern is always the same — use `engram-cloud` (or `engram-local`) in your agent's MCP config. These wrapper scripts just set `ENGRAM_DATABASE_URL` and call `engram`. The `mcp` subcommand starts the MCP server on stdio, identical to the SQLite version.
 
 ---
 
@@ -675,15 +457,18 @@ Migrate your existing local engram memories to the shared PostgreSQL database. T
 # Set source (your existing engram DB — defaults to ~/.engram/engram.db)
 export ENGRAM_MIGRATE_SOURCE="$HOME/.engram/engram.db"
 
-# Authenticate (pick one method)
-az login                                          # Method 2: Azure CLI
-engram login --profile cloud                      # Method 3: Device Code
+# Set target
+export ENGRAM_DATABASE_URL="postgres://<your-email>@<server>.postgres.database.azure.com:5432/engram?sslmode=require"
+export ENGRAM_AUTH_METHOD=entra
 
-# Run migration (uses database-url from your profile)
-engram --profile cloud migrate
+# Authenticate with Azure (if not already logged in)
+az login
+
+# Run migration
+engram migrate
 
 # Verify
-engram --profile cloud search --query "test" --project <your-project>
+engram search --query "test" --project <your-project>
 ```
 
 ### Windows
@@ -692,14 +477,18 @@ engram --profile cloud search --query "test" --project <your-project>
 # Set source
 $env:ENGRAM_MIGRATE_SOURCE = "$env:USERPROFILE\.engram\engram.db"
 
+# Set target
+$env:ENGRAM_DATABASE_URL = "postgres://<your-email>@<server>.postgres.database.azure.com:5432/engram?sslmode=require"
+$env:ENGRAM_AUTH_METHOD = "entra"
+
 # Authenticate
 az login
 
 # Run migration
-engram.exe --profile cloud migrate
+engram.exe migrate
 
 # Verify
-engram.exe --profile cloud search --query "test" --project <your-project>
+engram.exe search --query "test" --project <your-project>
 ```
 
 ### What Gets Migrated
@@ -727,7 +516,7 @@ engram.exe --profile cloud search --query "test" --project <your-project>
 
 Understanding how token refresh works prevents authentication surprises.
 
-### How It Works (Azure CLI — Method 2)
+### How It Works
 
 ```
   az login (one-time)
@@ -775,33 +564,6 @@ Understanding how token refresh works prevents authentication surprises.
             Connection established (TLS)
 ```
 
-### How It Works (Device Code — Method 3)
-
-```
-  engram --auth-interactive mcp
-       │
-       ▼
-  Check ~/.engram/token-cache.json
-       │
-       ├─── Valid token? ──► Use cached token (no prompt)
-       │
-       └─── Expired/missing?
-              │
-              ▼
-        Print device code to stderr:
-        "To sign in, visit https://microsoft.com/devicelogin
-         and enter code XXXXXXXX"
-              │
-              ▼
-        User completes browser flow
-              │
-              ▼
-        Token acquired + cached to token-cache.json
-              │
-              ▼
-        Normal BeforeConnect hook (same as above)
-```
-
 ### Key Details
 
 - **Token validity:** Azure AD tokens last ~60-90 minutes
@@ -809,18 +571,13 @@ Understanding how token refresh works prevents authentication surprises.
 - **Caching:** All connections in the pool share the same cached token — only one Azure AD request per refresh cycle
 - **Thread safety:** Multiple concurrent MCP tool calls safely share the token (protected by sync.RWMutex with double-check locking)
 - **Connection pool:** Max 5 connections, max lifetime 30 minutes (rotated before token expiry)
-- **File cache (device code):** Token persisted at `~/.engram/token-cache.json` — survives process restarts
-- **Credential chain (Azure CLI):** `DefaultAzureCredential` tries (in order): Azure CLI → Managed Identity → Environment Variables → Visual Studio Code
+- **Credential chain:** `DefaultAzureCredential` tries (in order): Azure CLI → Managed Identity → Environment Variables → Visual Studio Code
 
-### When Does Authentication Expire?
+### When Does `az login` Expire?
 
-| Method | Token Lifetime | Refresh |
-|--------|---------------|---------|
-| Azure CLI (`az login`) | Refresh token: ~90 days | Run `az login` again when expired |
-| Device Code | Access token: ~60-90 min | Auto-prompted if `--auth-interactive` is set |
-| Device Code (cached) | File cache: until token expires | New device code flow triggered |
-
+- Azure CLI refresh tokens last **90 days** (or until revoked)
 - If you use `az login` daily, you'll almost never be prompted again
+- If the refresh token expires, run `az login` again — one-time browser flow
 - CI/CD: Use managed identity or service principal instead of `az login`
 
 ---
@@ -850,49 +607,13 @@ engram: entra token for pg connection: no Azure credential available
 
 **Fix:**
 ```bash
-# Method 2: Azure CLI
 az login
-
-# Method 3: Device Code
-engram login --profile <your-profile>
+# Then retry your engram command
 ```
 
 If you're using password auth and see `password authentication failed`:
-- Verify the password in your `database-url` is correct
+- Verify the password in your `ENGRAM_DATABASE_URL` is correct
 - Check that the user exists on the PG server
-
-### Device Code Auth Fails
-
-```
-engram: device code auth requires tenant-id and client-id.
-```
-
-**Cause:** Missing `tenant-id` or `client-id` in your profile config.
-
-**Fix:**
-```bash
-engram config set --profile <name> tenant-id "<your-tenant-id>"
-engram config set --profile <name> client-id "<your-client-id>"
-```
-
-Get these values from the Azure App Registration (see [Create an Azure App Registration](#create-an-azure-app-registration-for-device-code-flow)).
-
-### Profile Not Found Warning
-
-```
-engram: warning: profile "xyz" not found in config, using root config
-```
-
-**Cause:** The profile name doesn't exist in `config.json`.
-
-**Fix:**
-```bash
-# List existing profiles
-engram config profiles
-
-# Create the missing profile
-engram config set --profile xyz database-url "postgres://..."
-```
 
 ### Permission Denied
 
@@ -919,7 +640,7 @@ engram: connect to PG: tls: ... certificate
 **Cause:** SSL/TLS configuration mismatch.
 
 **Fix:**
-- Azure PG **requires** TLS. Ensure `sslmode=require` is in your `database-url`:
+- Azure PG **requires** TLS. Ensure `sslmode=require` is in your `ENGRAM_DATABASE_URL`:
   ```
   postgres://user@server.postgres.database.azure.com:5432/engram?sslmode=require
   ```
@@ -946,15 +667,27 @@ go build -tags pgstore -o engram ./cmd/engram/
 
 ### Windows: PATH Issues
 
-**Symptom:** MCP client can't find `engram`.
+**Symptom:** MCP client can't find `engram-cloud`.
 
 **Fix:**
-- Ensure the directory containing `engram.exe` is in your system `PATH`
+- Ensure the directory containing `engram-cloud.cmd` is in your system `PATH`
 - In MCP configs, use the **full path** if PATH resolution fails:
   ```json
   {
-    "command": "C:\\Users\\<user>\\go\\bin\\engram.exe",
-    "args": ["--profile", "arquitectura", "mcp"]
+    "command": "C:\\Users\\<user>\\go\\bin\\engram-cloud.cmd",
+    "args": ["mcp"]
+  }
+  ```
+
+### Windows: .cmd vs .ps1 Wrapper
+
+- **`.cmd`** — works everywhere (CMD, PowerShell, MCP clients). Recommended.
+- **`.ps1`** — requires `pwsh -File wrapper.ps1` invocation. Some MCP clients don't support this.
+- If using `.ps1`, configure MCP as:
+  ```json
+  {
+    "command": "pwsh",
+    "args": ["-File", "C:\\Users\\<user>\\go\\bin\\engram-cloud.ps1", "mcp"]
   }
   ```
 
@@ -971,26 +704,45 @@ Different package managers install `az` to different paths. If `az login` gives 
 
 Ensure the installed path is in your `PATH`.
 
+### ENGRAM_DATABASE_URL Must Be Set
+
+```
+engram: ENGRAM_DATABASE_URL must be set for PostgreSQL mode
+```
+
+**Cause:** engram requires a connection string for PostgreSQL mode.
+
+**Fix:** Set the environment variable before running engram, or use a wrapper script (see [Section 5](#authentication-configuration)).
+
 ---
 
 ## Rollback to SQLite
 
 If you need to switch back to the standard SQLite-based engram:
 
-### 1. Remove Profile or Default
+### 1. Change MCP Config
 
-```bash
-# Option A: Delete the cloud profile entirely
-engram config delete-profile cloud
+Remove the `ENGRAM_DATABASE_URL` environment variable — use `engram` directly in your agent's MCP config:
 
-# Option B: Switch default profile to a local SQLite setup
-engram config set default-profile ""
+```json
+{
+  "command": "engram",
+  "args": ["mcp"]
+}
 ```
 
-Or simply unset the environment variable if you were using one:
+Or for OpenCode:
 
-```bash
-unset ENGRAM_DATABASE_URL
+```json
+{
+  "mcp": {
+    "engram": {
+      "type": "local",
+      "command": ["engram", "mcp"],
+      "enabled": true
+    }
+  }
+}
 ```
 
 ### 2. Your Local Data Is Untouched
@@ -1002,10 +754,10 @@ The SQLite database at `~/.engram/engram.db` (Windows: `%USERPROFILE%\.engram\en
 If you accumulated new data in PostgreSQL that you want to keep locally:
 
 ```bash
-# Export from PG to JSON (with profile that has database-url)
-engram --profile cloud export engram-backup.json
+# Export from PG to JSON (with ENGRAM_DATABASE_URL set)
+engram export engram-backup.json
 
-# Import into local SQLite (without any PG profile active)
+# Import into local SQLite (without ENGRAM_DATABASE_URL)
 engram import engram-backup.json
 ```
 

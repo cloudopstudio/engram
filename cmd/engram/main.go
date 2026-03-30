@@ -91,12 +91,6 @@ var (
 	storeExport        = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
 	jsonMarshalIndent  = json.MarshalIndent
 
-	storeListProjects     = func(s *store.Store) ([]store.ProjectStats, error) { return s.ListProjects() }
-	storePromote          = func(s *store.Store, id int64, identity string) error { return s.PromoteObservation(id, identity) }
-	storeListContributors = func(s *store.Store, project string) ([]store.ContributorStats, error) {
-		return s.ListContributors(project)
-	}
-
 	syncStatus = func(sy *engramsync.Syncer) (localChunks int, remoteChunks int, pendingImport int, err error) {
 		return sy.Status()
 	}
@@ -147,24 +141,6 @@ func main() {
 		cfg.DataDir = dir
 	}
 
-	// Parse --profile flag before command dispatch (applies to ALL commands).
-	cfg.Profile = parseGlobalProfile(cfg.DataDir)
-
-	// Parse --auth-interactive flag before command dispatch.
-	cfg.AuthInteractive = parseGlobalAuthInteractive()
-
-	// Warn if the resolved profile doesn't exist in config (stderr only —
-	// stdout is reserved for MCP/data output).
-	// Skip the warning for "config" commands because "config set --profile X"
-	// is expected to CREATE a profile that doesn't exist yet.
-	cmdName := ""
-	if len(os.Args) > 1 {
-		cmdName = os.Args[1]
-	}
-	if cfg.Profile != "" && cmdName != "config" && !config.ValidateProfile(cfg.DataDir, cfg.Profile) {
-		fmt.Fprintf(os.Stderr, "engram: warning: profile %q not found in config, using root config\n", cfg.Profile)
-	}
-
 	// Migrate orphaned databases that ended up in wrong locations
 	// (e.g. drive root on Windows due to previous bug).
 	migrateOrphanedDB(cfg.DataDir)
@@ -200,14 +176,8 @@ func main() {
 		cmdSetup()
 	case "config":
 		cmdConfig(cfg)
-	case "login":
-		cmdLogin(cfg)
 	case "migrate":
 		cmdMigrate(cfg)
-	case "promote":
-		cmdPromote(cfg)
-	case "who":
-		cmdWho(cfg)
 	case "version", "--version", "-v":
 		fmt.Printf("engram %s\n", version)
 	case "help", "--help", "-h":
@@ -227,7 +197,7 @@ func cmdServe(cfg store.Config) {
 		if n, err := strconv.Atoi(p); err == nil {
 			port = n
 		}
-	} else if v, err := config.GetWithProfile(cfg.DataDir, cfg.Profile, "server-port"); err == nil && v != "" {
+	} else if v, err := config.Get(cfg.DataDir, "server-port"); err == nil && v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			port = n
 		}
@@ -326,7 +296,7 @@ func cmdTUI(cfg store.Config) {
 
 func cmdSearch(cfg store.Config) {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: engram search <query> [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N] [--user USER] [--since today|yesterday|week|month|YYYY-MM-DD]")
+		fmt.Fprintln(os.Stderr, "usage: engram search <query> [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]")
 		exitFunc(1)
 	}
 
@@ -356,16 +326,6 @@ func cmdSearch(cfg store.Config) {
 		case "--scope":
 			if i+1 < len(os.Args) {
 				opts.Scope = os.Args[i+1]
-				i++
-			}
-		case "--user":
-			if i+1 < len(os.Args) {
-				opts.User = os.Args[i+1]
-				i++
-			}
-		case "--since":
-			if i+1 < len(os.Args) {
-				opts.Since = os.Args[i+1]
 				i++
 			}
 		default:
@@ -643,90 +603,6 @@ func cmdExport(cfg store.Config) {
 	fmt.Printf("  Sessions:     %d\n", len(data.Sessions))
 	fmt.Printf("  Observations: %d\n", len(data.Observations))
 	fmt.Printf("  Prompts:      %d\n", len(data.Prompts))
-}
-
-func cmdProjects(cfg store.Config) {
-	s, err := storeNew(cfg)
-	if err != nil {
-		fatal(err)
-	}
-	defer s.Close()
-
-	projects, err := storeListProjects(s)
-	if err != nil {
-		fatal(err)
-	}
-
-	if len(projects) == 0 {
-		fmt.Println("No projects found.")
-		return
-	}
-
-	fmt.Printf("%-40s  %12s  %12s  %s\n", "PROJECT", "OBSERVATIONS", "CONTRIBUTORS", "LAST ACTIVITY")
-	fmt.Printf("%-40s  %12s  %12s  %s\n", strings.Repeat("-", 40), strings.Repeat("-", 12), strings.Repeat("-", 12), strings.Repeat("-", 19))
-	for _, p := range projects {
-		fmt.Printf("%-40s  %12d  %12d  %s\n", p.Project, p.Observations, p.Contributors, p.LastActivity)
-	}
-}
-
-func cmdPromote(cfg store.Config) {
-	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: engram promote <observation_id>")
-		exitFunc(1)
-	}
-
-	id, err := strconv.ParseInt(os.Args[2], 10, 64)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: invalid observation id %q\n", os.Args[2])
-		exitFunc(1)
-	}
-
-	s, sErr := storeNew(cfg)
-	if sErr != nil {
-		fatal(sErr)
-	}
-	defer s.Close()
-
-	if err := storePromote(s, id, s.Identity()); err != nil {
-		fatal(err)
-	}
-
-	fmt.Printf("Observation #%d promoted to project scope.\n", id)
-}
-
-func cmdWho(cfg store.Config) {
-	project := ""
-	for i := 2; i < len(os.Args); i++ {
-		if !strings.HasPrefix(os.Args[i], "--") {
-			project = os.Args[i]
-		}
-	}
-
-	s, err := storeNew(cfg)
-	if err != nil {
-		fatal(err)
-	}
-	defer s.Close()
-
-	contributors, err := storeListContributors(s, project)
-	if err != nil {
-		fatal(err)
-	}
-
-	if len(contributors) == 0 {
-		fmt.Println("No contributors found.")
-		return
-	}
-
-	fmt.Printf("%-40s  %12s  %8s  %s\n", "IDENTITY", "OBSERVATIONS", "PROMPTS", "LAST ACTIVE")
-	fmt.Printf("%-40s  %12s  %8s  %s\n", strings.Repeat("-", 40), strings.Repeat("-", 12), strings.Repeat("-", 8), strings.Repeat("-", 19))
-	for _, c := range contributors {
-		topTypes := strings.Join(c.TopTypes, ", ")
-		if topTypes != "" {
-			topTypes = " [" + topTypes + "]"
-		}
-		fmt.Printf("%-40s  %12d  %8d  %s%s\n", c.Identity, c.Observations, c.Prompts, c.LastActive, topTypes)
-	}
 }
 
 func cmdImport(cfg store.Config) {
@@ -1613,9 +1489,8 @@ func printPostInstall(agent string) {
 	switch agent {
 	case "opencode":
 		fmt.Println("\nNext steps:")
-		fmt.Println("  1. Restart OpenCode — plugin + MCP server + /engram-login are ready")
-		fmt.Println("  2. For Azure auth: run /engram-login inside OpenCode")
-		fmt.Println("  3. Run 'engram serve &' for session tracking (HTTP API)")
+		fmt.Println("  1. Restart OpenCode — plugin + MCP server are ready")
+		fmt.Println("  2. Run 'engram serve &' for session tracking (HTTP API)")
 	case "claude-code":
 		// Offer to add engram tools to the permissions allowlist
 		fmt.Print("\nAdd engram tools to ~/.claude/settings.json allowlist?\n")
@@ -1659,11 +1534,7 @@ func printUsage() {
 	fmt.Printf(`engram v%s — Persistent memory for AI coding agents
 
 Usage:
-  engram [--profile NAME] [--auth-interactive] <command> [arguments]
-
-Global flags:
-  --profile NAME       Use a specific config profile (overrides default-profile)
-  --auth-interactive   Enable Azure device code login (for non-dev users)
+  engram <command> [arguments]
 
 Commands:
   serve [port]       Start HTTP API server (default: 7437)
@@ -1675,23 +1546,18 @@ Commands:
                        Example: engram mcp --tools=agent
   tui                Launch interactive terminal UI
   search <query>     Search memories [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]
-                       [--user USER] [--since today|yesterday|week|month|YYYY-MM-DD]
   save <title> <msg> Save a memory  [--type TYPE] [--project PROJECT] [--scope SCOPE]
   timeline <obs_id>  Show chronological context around an observation [--before N] [--after N]
   context [project]  Show recent context from previous sessions
   stats              Show memory system statistics
-  projects           List all projects with observation counts and last activity
-  promote <obs_id>   Promote a personal observation to project scope (irreversible)
-  who [project]      List contributors with activity stats
   export [file]      Export all memories to JSON (default: engram-export.json)
   import <file>      Import memories from a JSON export file
-  login              Authenticate with Azure (device code flow)
-  config <sub>       Manage persistent configuration (set, get, list, profiles, path)
   projects list      List all projects with observation, session, and prompt counts
   projects consolidate [--all] [--dry-run]
                      Merge similar project names into one canonical name
                        --all      Scan ALL projects for similar name groups
                        --dry-run  Preview what would be merged (no changes)
+  config <sub>       Manage persistent configuration (set, get, list, path)
   setup [agent]      Install/setup agent integration (opencode, claude-code, gemini-cli, codex)
   sync               Export new memories as compressed chunk to .engram/
                        --import   Import new chunks from .engram/ into local DB
@@ -1715,12 +1581,6 @@ Environment:
   ENGRAM_DATA_DIR    Override data directory (default: ~/.engram)
   ENGRAM_PORT        Override HTTP server port (default: 7437)
   ENGRAM_PROJECT     Override auto-detected project name for MCP server
-
-Profiles:
-  Use profiles to manage multiple databases (e.g., per-team or per-project):
-    engram config set --profile dev database-url postgres://.../engram_dev
-    engram config set default-profile dev
-    engram --profile dev mcp
 
 MCP Configuration (add to your agent's config):
   {
@@ -1834,58 +1694,6 @@ func migrateOrphanedDB(correctDir string) {
 		log.Printf("[engram] migration complete — memories recovered")
 		return
 	}
-}
-
-// parseGlobalProfile extracts --profile <name> or --profile=<name> from
-// os.Args, removes it from os.Args so downstream commands don't see it,
-// and resolves against default-profile from config. Returns the resolved
-// profile name (may be "").
-//
-// Only scans args that appear BEFORE the command word (the first non-flag
-// arg). This prevents stealing --profile flags from subcommands like
-// "engram config set --profile dev ..." where the config command handles
-// its own --profile parsing.
-func parseGlobalProfile(dataDir string) string {
-	for i := 1; i < len(os.Args); i++ {
-		// Stop at the first non-flag arg — that's the command word.
-		if !strings.HasPrefix(os.Args[i], "--") {
-			break
-		}
-		if os.Args[i] == "--profile" && i+1 < len(os.Args) {
-			profile := os.Args[i+1]
-			// Remove --profile and its value from os.Args.
-			os.Args = append(os.Args[:i], os.Args[i+2:]...)
-			return profile
-		}
-		if strings.HasPrefix(os.Args[i], "--profile=") {
-			profile := strings.TrimPrefix(os.Args[i], "--profile=")
-			// Remove --profile=NAME from os.Args.
-			os.Args = append(os.Args[:i], os.Args[i+1:]...)
-			return profile
-		}
-	}
-	// No explicit --profile flag: check config for default-profile.
-	return config.ResolveProfile(dataDir, "")
-}
-
-// parseGlobalAuthInteractive extracts --auth-interactive from os.Args,
-// removes it so downstream commands don't see it, and returns true/false.
-// Supports: --auth-interactive (bare = true), --auth-interactive=true,
-// --auth-interactive=false.
-func parseGlobalAuthInteractive() bool {
-	for i := 1; i < len(os.Args); i++ {
-		if os.Args[i] == "--auth-interactive" {
-			// Bare flag: --auth-interactive (no value = true).
-			os.Args = append(os.Args[:i], os.Args[i+1:]...)
-			return true
-		}
-		if strings.HasPrefix(os.Args[i], "--auth-interactive=") {
-			val := strings.TrimPrefix(os.Args[i], "--auth-interactive=")
-			os.Args = append(os.Args[:i], os.Args[i+1:]...)
-			return val == "true" || val == "1" || val == ""
-		}
-	}
-	return false
 }
 
 func truncate(s string, max int) string {

@@ -24,22 +24,6 @@ builds:
     ldflags:
       - -s -w -X main.version={{.Version}}
 
-  - id: engram-pg
-    main: ./cmd/engram
-    binary: engram-pg
-    env:
-      - CGO_ENABLED=0
-    tags:
-      - pgstore
-    goos:
-      - linux
-      - darwin
-    goarch:
-      - amd64
-      - arm64
-    ldflags:
-      - -s -w -X main.version={{.Version}}
-
 archives:
   - id: default
     builds:
@@ -51,12 +35,6 @@ archives:
       - goos: windows
         formats:
           - zip
-  - id: pgstore
-    builds:
-      - engram-pg
-    formats:
-      - tar.gz
-    name_template: "{{ .ProjectName }}-pg_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
   name_template: "checksums.txt"
@@ -69,3 +47,16 @@ changelog:
       - "^test:"
       - "^ci:"
 
+brews:
+  - ids:
+      - default
+    repository:
+      owner: Gentleman-Programming
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    name: engram
+    homepage: "https://github.com/Gentleman-Programming/engram"
+    description: "Persistent memory for AI coding agents. Agent-agnostic, single binary, zero dependencies."
+    license: "MIT"
+    commit_msg_template: "chore: update engram formula to {{ .Tag }}"
