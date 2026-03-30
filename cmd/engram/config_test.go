@@ -747,6 +747,133 @@ func TestMainDispatchWithProfile(t *testing.T) {
 	}
 }
 
+// ─── Profile creation via config set (regression tests) ─────────────────────
+
+func TestConfigSetCreatesNewProfileWithoutWarning(t *testing.T) {
+	// Regression: "config set --profile newprofile key value" on a fresh config
+	// (profile doesn't exist yet) should:
+	// 1. NOT print a "profile not found" warning
+	// 2. Store the value IN the profile, not in root
+	// 3. Be retrievable via "config get --profile newprofile key"
+	// 4. NOT leak the value into root config
+
+	stubExitWithPanic(t)
+	stubCheckForUpdates(t, versionCheckUpToDate())
+
+	dataDir := t.TempDir()
+	t.Setenv("ENGRAM_DATA_DIR", dataDir)
+	t.Setenv("ENGRAM_DATABASE_URL", "")
+
+	// Step 1: config set --profile newprofile database-url "postgres://new/db"
+	// Run via main() so the global --profile parsing + warning code path is exercised.
+	withArgs(t, "engram", "config", "set", "--profile", "newprofile", "database-url", "postgres://new/db")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { main() })
+	if recovered != nil {
+		t.Fatalf("config set --profile newprofile failed: panic=%v stderr=%q", recovered, stderr)
+	}
+
+	// No warning about profile not found
+	if strings.Contains(stderr, "warning") || strings.Contains(stderr, "not found") {
+		t.Fatalf("unexpected warning when creating a new profile via config set: stderr=%q", stderr)
+	}
+
+	// Output confirms profile write
+	if !strings.Contains(stdout, "set database-url = postgres://new/db") || !strings.Contains(stdout, "(profile: newprofile)") {
+		t.Fatalf("expected profile set confirmation, got stdout=%q", stdout)
+	}
+
+	// Step 2: config get --profile newprofile database-url → returns the value
+	withArgs(t, "engram", "config", "get", "--profile", "newprofile", "database-url")
+	stdout, stderr, recovered = captureOutputAndRecover(t, func() { main() })
+	if recovered != nil {
+		t.Fatalf("config get --profile newprofile failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "postgres://new/db") || !strings.Contains(stdout, "(profile: newprofile)") {
+		t.Fatalf("expected profile value, got stdout=%q", stdout)
+	}
+
+	// Step 3: config get database-url (root, no profile) → should NOT have the profile value
+	withArgs(t, "engram", "config", "get", "database-url")
+	stdout, stderr, recovered = captureOutputAndRecover(t, func() { main() })
+	if recovered != nil {
+		t.Fatalf("config get root failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if strings.Contains(stdout, "postgres://new/db") {
+		t.Fatalf("profile value leaked to root config: stdout=%q", stdout)
+	}
+	if !strings.Contains(stdout, "(not set)") {
+		t.Fatalf("expected root database-url to be (not set), got stdout=%q", stdout)
+	}
+}
+
+func TestConfigSetCreatesNewProfileEqualsSign(t *testing.T) {
+	// Same test but with --profile=name syntax
+	stubExitWithPanic(t)
+	stubCheckForUpdates(t, versionCheckUpToDate())
+
+	dataDir := t.TempDir()
+	t.Setenv("ENGRAM_DATA_DIR", dataDir)
+	t.Setenv("ENGRAM_DATABASE_URL", "")
+
+	withArgs(t, "engram", "config", "set", "--profile=arquitectura", "database-url", "postgres://arq/db")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { main() })
+	if recovered != nil {
+		t.Fatalf("config set --profile=arquitectura failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if strings.Contains(stderr, "warning") || strings.Contains(stderr, "not found") {
+		t.Fatalf("unexpected warning: stderr=%q", stderr)
+	}
+	if !strings.Contains(stdout, "(profile: arquitectura)") {
+		t.Fatalf("expected profile confirmation, got stdout=%q", stdout)
+	}
+
+	// Verify via get
+	withArgs(t, "engram", "config", "get", "--profile=arquitectura", "database-url")
+	stdout, stderr, recovered = captureOutputAndRecover(t, func() { main() })
+	if recovered != nil {
+		t.Fatalf("config get --profile=arquitectura failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "postgres://arq/db") {
+		t.Fatalf("expected profile value, got stdout=%q", stdout)
+	}
+
+	// Root should be empty
+	withArgs(t, "engram", "config", "get", "database-url")
+	stdout, stderr, recovered = captureOutputAndRecover(t, func() { main() })
+	if recovered != nil {
+		t.Fatalf("config get root failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "(not set)") {
+		t.Fatalf("expected root (not set), got stdout=%q", stdout)
+	}
+}
+
+func TestGlobalProfileNotStolenByConfigSubcommand(t *testing.T) {
+	// Verify that "engram --profile dev config get database-url" still works
+	// (global --profile BEFORE the command word is consumed by parseGlobalProfile).
+	stubExitWithPanic(t)
+	stubCheckForUpdates(t, versionCheckUpToDate())
+
+	dataDir := t.TempDir()
+	t.Setenv("ENGRAM_DATA_DIR", dataDir)
+	t.Setenv("ENGRAM_DATABASE_URL", "")
+
+	// Create the profile first
+	if err := config.SetWithProfile(dataDir, "dev", "database-url", "postgres://dev/db"); err != nil {
+		t.Fatalf("SetWithProfile: %v", err)
+	}
+
+	// Global --profile BEFORE command word
+	withArgs(t, "engram", "--profile", "dev", "config", "get", "database-url")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { main() })
+	if recovered != nil {
+		t.Fatalf("failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "postgres://dev/db") {
+		t.Fatalf("expected profile value, got stdout=%q", stdout)
+	}
+}
+
 func versionCheckUpToDate() versioncheck.CheckResult {
 	return versioncheck.CheckResult{Status: versioncheck.StatusUpToDate}
 }

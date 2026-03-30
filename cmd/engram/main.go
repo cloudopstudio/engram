@@ -134,7 +134,13 @@ func main() {
 
 	// Warn if the resolved profile doesn't exist in config (stderr only —
 	// stdout is reserved for MCP/data output).
-	if cfg.Profile != "" && !config.ValidateProfile(cfg.DataDir, cfg.Profile) {
+	// Skip the warning for "config" commands because "config set --profile X"
+	// is expected to CREATE a profile that doesn't exist yet.
+	cmdName := ""
+	if len(os.Args) > 1 {
+		cmdName = os.Args[1]
+	}
+	if cfg.Profile != "" && cmdName != "config" && !config.ValidateProfile(cfg.DataDir, cfg.Profile) {
 		fmt.Fprintf(os.Stderr, "engram: warning: profile %q not found in config, using root config\n", cfg.Profile)
 	}
 
@@ -981,8 +987,17 @@ func migrateOrphanedDB(correctDir string) {
 // os.Args, removes it from os.Args so downstream commands don't see it,
 // and resolves against default-profile from config. Returns the resolved
 // profile name (may be "").
+//
+// Only scans args that appear BEFORE the command word (the first non-flag
+// arg). This prevents stealing --profile flags from subcommands like
+// "engram config set --profile dev ..." where the config command handles
+// its own --profile parsing.
 func parseGlobalProfile(dataDir string) string {
 	for i := 1; i < len(os.Args); i++ {
+		// Stop at the first non-flag arg — that's the command word.
+		if !strings.HasPrefix(os.Args[i], "--") {
+			break
+		}
 		if os.Args[i] == "--profile" && i+1 < len(os.Args) {
 			profile := os.Args[i+1]
 			// Remove --profile and its value from os.Args.
