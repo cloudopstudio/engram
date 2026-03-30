@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -36,8 +37,17 @@ import (
 )
 
 // version is set via ldflags at build time by goreleaser.
-// Falls back to "dev" for local builds.
+// Falls back to "dev" for local builds; init() tries Go module info first.
 var version = "dev"
+
+func init() {
+	if version != "dev" {
+		return
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		version = strings.TrimPrefix(info.Main.Version, "v")
+	}
+}
 
 var (
 	storeNew      = store.New
