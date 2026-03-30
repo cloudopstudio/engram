@@ -25,7 +25,7 @@ func cmdLogin(cfg store.Config) {
 
 	fmt.Fprintf(os.Stderr, "engram: authenticating with Azure (device code flow)...\n")
 
-	tp, err := store.NewDeviceCodeTokenProvider(tenantID, clientID, cfg.DataDir)
+	tp, err := store.NewDeviceCodeTokenProvider(tenantID, clientID)
 	if err != nil {
 		fatal(err)
 	}

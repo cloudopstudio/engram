@@ -144,6 +144,9 @@ func main() {
 	// Parse --profile flag before command dispatch (applies to ALL commands).
 	cfg.Profile = parseGlobalProfile(cfg.DataDir)
 
+	// Parse --auth-interactive flag before command dispatch.
+	cfg.AuthInteractive = parseGlobalAuthInteractive()
+
 	// Warn if the resolved profile doesn't exist in config (stderr only —
 	// stdout is reserved for MCP/data output).
 	if cfg.Profile != "" && !config.ValidateProfile(cfg.DataDir, cfg.Profile) {
@@ -185,6 +188,8 @@ func main() {
 		cmdSetup()
 	case "config":
 		cmdConfig(cfg)
+	case "login":
+		cmdLogin(cfg)
 	case "migrate":
 		cmdMigrate(cfg)
 	case "version", "--version", "-v":
@@ -1543,10 +1548,11 @@ func printUsage() {
 	fmt.Printf(`engram v%s — Persistent memory for AI coding agents
 
 Usage:
-  engram [--profile NAME] <command> [arguments]
+  engram [--profile NAME] [--auth-interactive] <command> [arguments]
 
 Global flags:
-  --profile NAME     Use a specific config profile (overrides default-profile)
+  --profile NAME       Use a specific config profile (overrides default-profile)
+  --auth-interactive   Enable Azure device code login (for non-dev users)
 
 Commands:
   serve [port]       Start HTTP API server (default: 7437)
@@ -1569,6 +1575,7 @@ Commands:
                      Merge similar project names into one canonical name
                        --all      Scan ALL projects for similar name groups
                        --dry-run  Preview what would be merged (no changes)
+  login              Authenticate with Azure (device code flow)
   config <sub>       Manage persistent configuration (set, get, list, profiles, path)
   setup [agent]      Install/setup agent integration (opencode, claude-code, gemini-cli, codex)
   sync               Export new memories as compressed chunk to .engram/
@@ -1735,6 +1742,26 @@ func parseGlobalProfile(dataDir string) string {
 	}
 	// No explicit --profile flag: check config for default-profile.
 	return config.ResolveProfile(dataDir, "")
+}
+
+// parseGlobalAuthInteractive extracts --auth-interactive from os.Args,
+// removes it so downstream commands don't see it, and returns true/false.
+// Supports: --auth-interactive (bare = true), --auth-interactive=true,
+// --auth-interactive=false.
+func parseGlobalAuthInteractive() bool {
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "--auth-interactive" {
+			// Bare flag: --auth-interactive (no value = true).
+			os.Args = append(os.Args[:i], os.Args[i+1:]...)
+			return true
+		}
+		if strings.HasPrefix(os.Args[i], "--auth-interactive=") {
+			val := strings.TrimPrefix(os.Args[i], "--auth-interactive=")
+			os.Args = append(os.Args[:i], os.Args[i+1:]...)
+			return val == "true" || val == "1" || val == ""
+		}
+	}
+	return false
 }
 
 func truncate(s string, max int) string {
