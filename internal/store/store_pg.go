@@ -269,6 +269,7 @@ type PassiveCaptureResult struct {
 
 type Config struct {
 	DataDir              string
+	Profile              string // Active profile name (from --profile flag or default-profile)
 	MaxObservationLength int
 	MaxContextResults    int
 	MaxSearchResults     int
@@ -312,7 +313,7 @@ type Store struct {
 func New(cfg Config) (*Store, error) {
 	connStr := os.Getenv("ENGRAM_DATABASE_URL")
 	if connStr == "" {
-		if v, err := config.Get(cfg.DataDir, "database-url"); err == nil && v != "" {
+		if v, err := config.GetWithProfile(cfg.DataDir, cfg.Profile, "database-url"); err == nil && v != "" {
 			connStr = v
 		}
 	}
@@ -320,7 +321,7 @@ func New(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("engram: database-url not configured. Set ENGRAM_DATABASE_URL or run: engram config set database-url <url>")
 	}
 
-	authMethod := resolveAuthMethod(connStr, cfg.DataDir)
+	authMethod := resolveAuthMethod(connStr, cfg.DataDir, cfg.Profile)
 
 	var tp *TokenProvider
 	var identity string
@@ -2756,9 +2757,9 @@ func ClassifyTool(toolName string) string {
 // ─── Exported helpers for migrate command ────────────────────────────────────
 
 // ResolveAuthMethodExported exposes resolveAuthMethod for the migration CLI.
-// Passes empty dataDir so config file lookup is skipped (migration uses env vars only).
+// Passes empty dataDir and profile so config file lookup is skipped (migration uses env vars only).
 func ResolveAuthMethodExported(connStr string) string {
-	return resolveAuthMethod(connStr, "")
+	return resolveAuthMethod(connStr, "", "")
 }
 
 // ConfigurePGPoolExported exposes configurePGPool for the migration CLI.

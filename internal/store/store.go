@@ -122,25 +122,6 @@ type SearchOptions struct {
 	Project string `json:"project,omitempty"`
 	Scope   string `json:"scope,omitempty"`
 	Limit   int    `json:"limit,omitempty"`
-	User    string `json:"user,omitempty"`
-	Since   string `json:"since,omitempty"`
-}
-
-// ProjectStats holds aggregated stats for a single project.
-type ProjectStats struct {
-	Project      string `json:"project"`
-	Observations int    `json:"observations"`
-	Contributors int    `json:"contributors"`
-	LastActivity string `json:"last_activity"`
-}
-
-// ContributorStats holds activity stats for a single contributor.
-type ContributorStats struct {
-	Identity     string   `json:"identity"`
-	Observations int      `json:"observations"`
-	Prompts      int      `json:"prompts"`
-	LastActive   string   `json:"last_active"`
-	TopTypes     []string `json:"top_types,omitempty"`
 }
 
 type AddObservationParams struct {
@@ -275,7 +256,6 @@ type ExportData struct {
 type Config struct {
 	DataDir              string
 	Profile              string // Active profile name (from --profile flag or default-profile)
-	AuthInteractive      bool   // Enable device code flow for Azure auth
 	MaxObservationLength int
 	MaxContextResults    int
 	MaxSearchResults     int
@@ -468,12 +448,6 @@ func New(cfg Config) (*Store, error) {
 
 func (s *Store) Close() error {
 	return s.db.Close()
-}
-
-// Identity returns the identity associated with the store.
-// For the SQLite backend, this is empty unless explicitly set.
-func (s *Store) Identity() string {
-	return ""
 }
 
 // ─── Migrations ──────────────────────────────────────────────────────────────
@@ -1616,16 +1590,6 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			tkSQL += " AND scope = ?"
 			tkArgs = append(tkArgs, normalizeScope(opts.Scope))
 		}
-		if opts.User != "" {
-			tkSQL += " AND created_by = ?"
-			tkArgs = append(tkArgs, opts.User)
-		}
-		if opts.Since != "" {
-			if sinceTS := resolveSinceSQLite(opts.Since); sinceTS != "" {
-				tkSQL += " AND created_at >= ?"
-				tkArgs = append(tkArgs, sinceTS)
-			}
-		}
 
 		tkSQL += " ORDER BY updated_at DESC LIMIT ?"
 		tkArgs = append(tkArgs, limit)
@@ -1674,18 +1638,6 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	if opts.Scope != "" {
 		sqlQ += " AND o.scope = ?"
 		args = append(args, normalizeScope(opts.Scope))
-	}
-
-	if opts.User != "" {
-		sqlQ += " AND o.created_by = ?"
-		args = append(args, opts.User)
-	}
-
-	if opts.Since != "" {
-		if sinceTS := resolveSinceSQLite(opts.Since); sinceTS != "" {
-			sqlQ += " AND o.created_at >= ?"
-			args = append(args, sinceTS)
-		}
 	}
 
 	sqlQ += " ORDER BY fts.rank LIMIT ?"
@@ -3700,146 +3652,4 @@ func ClassifyTool(toolName string) string {
 // Now returns the current time formatted for SQLite.
 func Now() string {
 	return time.Now().UTC().Format("2006-01-02 15:04:05")
-}
-
-// resolveSinceSQLite converts a human-readable time filter to a UTC timestamp
-// string suitable for SQLite comparison.
-func resolveSinceSQLite(since string) string {
-	const tsFmt = "2006-01-02 15:04:05"
-	now := time.Now().UTC()
-	switch strings.TrimSpace(strings.ToLower(since)) {
-	case "today":
-		y, m, d := now.Date()
-		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Format(tsFmt)
-	case "yesterday":
-		y, m, d := now.AddDate(0, 0, -1).Date()
-		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Format(tsFmt)
-	case "week":
-		y, m, d := now.AddDate(0, 0, -7).Date()
-		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Format(tsFmt)
-	case "month":
-		y, m, d := now.AddDate(0, -1, 0).Date()
-		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Format(tsFmt)
-	default:
-		if t, err := time.Parse("2006-01-02", strings.TrimSpace(since)); err == nil {
-			return t.UTC().Format(tsFmt)
-		}
-		if t, err := time.Parse(tsFmt, strings.TrimSpace(since)); err == nil {
-			return t.UTC().Format(tsFmt)
-		}
-	}
-	return ""
-}
-
-// ListProjects returns all projects with observation counts, contributor counts,
-// and last activity date. SQLite stub — returns what is available.
-func (s *Store) ListProjects() ([]ProjectStats, error) {
-	rows, err := s.queryItHook(s.db, `
-		SELECT project,
-		       COUNT(*) AS observations,
-		       COUNT(DISTINCT COALESCE(created_by, '')) AS contributors,
-		       MAX(updated_at) AS last_activity
-		FROM observations
-		WHERE deleted_at IS NULL
-		  AND project IS NOT NULL
-		  AND project != ''
-		GROUP BY project
-		ORDER BY last_activity DESC`)
-	if err != nil {
-		return nil, fmt.Errorf("list projects: %w", err)
-	}
-	defer rows.Close()
-
-	var results []ProjectStats
-	for rows.Next() {
-		var ps ProjectStats
-		if err := rows.Scan(&ps.Project, &ps.Observations, &ps.Contributors, &ps.LastActivity); err != nil {
-			return nil, err
-		}
-		results = append(results, ps)
-	}
-	return results, rows.Err()
-}
-
-// PromoteObservation changes an observation's scope from 'personal' to 'project'.
-// It validates that the observation exists, is personal, and is owned by identity.
-func (s *Store) PromoteObservation(id int64, identity string) error {
-	result, err := s.db.Exec(
-		`UPDATE observations
-		 SET scope = 'project', updated_at = datetime('now'), revision_count = revision_count + 1
-		 WHERE id = ? AND scope = 'personal' AND created_by = ? AND deleted_at IS NULL`,
-		id, identity,
-	)
-	if err != nil {
-		return fmt.Errorf("promote observation: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return fmt.Errorf("observation not found, not personal scope, or not owned by you")
-	}
-	return nil
-}
-
-// ListContributors returns contributor activity stats from observations and prompts.
-// SQLite stub — does not have per-row created_by in all builds, returns empty.
-func (s *Store) ListContributors(project string) ([]ContributorStats, error) {
-	obsQuery := `
-		SELECT COALESCE(created_by, '') as identity,
-		       COUNT(*) AS obs_count,
-		       MAX(updated_at) AS last_obs
-		FROM observations
-		WHERE deleted_at IS NULL
-		  AND created_by IS NOT NULL
-		  AND created_by != ''`
-	obsArgs := []any{}
-	if project != "" {
-		obsQuery += " AND project = ?"
-		obsArgs = append(obsArgs, project)
-	}
-	obsQuery += " GROUP BY created_by"
-
-	rows, err := s.queryItHook(s.db, obsQuery, obsArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("list contributors: %w", err)
-	}
-	defer rows.Close()
-
-	type obsAgg struct {
-		obsCount   int
-		lastActive string
-	}
-	obsMap := make(map[string]obsAgg)
-	for rows.Next() {
-		var identity string
-		var count int
-		var lastObs string
-		if err := rows.Scan(&identity, &count, &lastObs); err != nil {
-			return nil, err
-		}
-		obsMap[identity] = obsAgg{obsCount: count, lastActive: lastObs}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	var results []ContributorStats
-	for identity, oa := range obsMap {
-		results = append(results, ContributorStats{
-			Identity:     identity,
-			Observations: oa.obsCount,
-			LastActive:   oa.lastActive,
-		})
-	}
-
-	// Sort by last active descending.
-	for i := 1; i < len(results); i++ {
-		for j := i; j > 0 && results[j].LastActive > results[j-1].LastActive; j-- {
-			results[j], results[j-1] = results[j-1], results[j]
-		}
-	}
-
-	return results, nil
 }

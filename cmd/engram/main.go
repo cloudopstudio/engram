@@ -141,6 +141,9 @@ func main() {
 		cfg.DataDir = dir
 	}
 
+	// Parse --profile flag before command dispatch (applies to ALL commands).
+	cfg.Profile = parseGlobalProfile(cfg.DataDir)
+
 	// Migrate orphaned databases that ended up in wrong locations
 	// (e.g. drive root on Windows due to previous bug).
 	migrateOrphanedDB(cfg.DataDir)
@@ -197,7 +200,7 @@ func cmdServe(cfg store.Config) {
 		if n, err := strconv.Atoi(p); err == nil {
 			port = n
 		}
-	} else if v, err := config.Get(cfg.DataDir, "server-port"); err == nil && v != "" {
+	} else if v, err := config.GetWithProfile(cfg.DataDir, cfg.Profile, "server-port"); err == nil && v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			port = n
 		}
@@ -1534,7 +1537,10 @@ func printUsage() {
 	fmt.Printf(`engram v%s — Persistent memory for AI coding agents
 
 Usage:
-  engram <command> [arguments]
+  engram [--profile NAME] <command> [arguments]
+
+Global flags:
+  --profile NAME     Use a specific config profile (overrides default-profile)
 
 Commands:
   serve [port]       Start HTTP API server (default: 7437)
@@ -1557,7 +1563,7 @@ Commands:
                      Merge similar project names into one canonical name
                        --all      Scan ALL projects for similar name groups
                        --dry-run  Preview what would be merged (no changes)
-  config <sub>       Manage persistent configuration (set, get, list, path)
+  config <sub>       Manage persistent configuration (set, get, list, profiles, path)
   setup [agent]      Install/setup agent integration (opencode, claude-code, gemini-cli, codex)
   sync               Export new memories as compressed chunk to .engram/
                        --import   Import new chunks from .engram/ into local DB
@@ -1581,6 +1587,12 @@ Environment:
   ENGRAM_DATA_DIR    Override data directory (default: ~/.engram)
   ENGRAM_PORT        Override HTTP server port (default: 7437)
   ENGRAM_PROJECT     Override auto-detected project name for MCP server
+
+Profiles:
+  Use profiles to manage multiple databases (e.g., per-team or per-project):
+    engram config set --profile dev database-url postgres://.../engram_dev
+    engram config set default-profile dev
+    engram --profile dev mcp
 
 MCP Configuration (add to your agent's config):
   {
@@ -1694,6 +1706,22 @@ func migrateOrphanedDB(correctDir string) {
 		log.Printf("[engram] migration complete — memories recovered")
 		return
 	}
+}
+
+// parseGlobalProfile extracts --profile <name> from os.Args, removes it from
+// os.Args so downstream commands don't see it, and resolves against
+// default-profile from config. Returns the resolved profile name (may be "").
+func parseGlobalProfile(dataDir string) string {
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "--profile" && i+1 < len(os.Args) {
+			profile := os.Args[i+1]
+			// Remove --profile and its value from os.Args.
+			os.Args = append(os.Args[:i], os.Args[i+2:]...)
+			return profile
+		}
+	}
+	// No explicit --profile flag: check config for default-profile.
+	return config.ResolveProfile(dataDir, "")
 }
 
 func truncate(s string, max int) string {

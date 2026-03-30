@@ -133,14 +133,16 @@ func (tp *TokenProvider) Identity() string {
 }
 
 // resolveAuthMethod determines the authentication method from env vars,
-// config file, and the connection string host. Returns "entra" or "password".
+// config file (with profile support), and the connection string host.
+// Returns "entra" or "password".
 // dataDir is used to read config file fallback; empty string skips config lookup.
-func resolveAuthMethod(connStr string, dataDir string) string {
+// profile is the active profile name (may be "").
+func resolveAuthMethod(connStr string, dataDir string, profile string) string {
 	if method := os.Getenv("ENGRAM_AUTH_METHOD"); method != "" {
 		return strings.ToLower(strings.TrimSpace(method))
 	}
 	if dataDir != "" {
-		if method, err := config.Get(dataDir, "auth-method"); err == nil && method != "" {
+		if method, err := config.GetWithProfile(dataDir, profile, "auth-method"); err == nil && method != "" {
 			return strings.ToLower(strings.TrimSpace(method))
 		}
 	}

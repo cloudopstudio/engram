@@ -54,16 +54,6 @@ var ValidKeys = map[string]KeyInfo{
 		Default:     "",
 		Description: "Default profile name (used when --profile is not given)",
 	},
-	"tenant-id": {
-		EnvVar:      "AZURE_TENANT_ID",
-		Default:     "",
-		Description: "Azure Entra ID tenant ID (for device code flow)",
-	},
-	"client-id": {
-		EnvVar:      "AZURE_CLIENT_ID",
-		Default:     "",
-		Description: "Azure app registration client ID (for device code flow)",
-	},
 }
 
 // profileExcludedKeys are keys that cannot be set inside a profile.
@@ -368,46 +358,4 @@ func ResolveProfile(dataDir, explicit string) string {
 		return ""
 	}
 	return cf.Root["default-profile"]
-}
-
-// ValidateProfile checks whether a named profile exists in the config file.
-// Returns true if the profile exists (has at least one key), false otherwise.
-// Returns false on any error (graceful — callers use this for warnings only).
-func ValidateProfile(dataDir, profile string) bool {
-	if profile == "" {
-		return true // no profile to validate
-	}
-	cf, err := loadRaw(dataDir)
-	if err != nil {
-		return false
-	}
-	_, ok := cf.Profiles[profile]
-	return ok
-}
-
-// DeleteProfile removes a named profile from config.json. Returns an error
-// if the profile does not exist. If the deleted profile is the current
-// default-profile, default-profile is cleared.
-func DeleteProfile(dataDir, profile string) error {
-	if profile == "" {
-		return fmt.Errorf("profile name cannot be empty")
-	}
-
-	cf, err := loadRaw(dataDir)
-	if err != nil {
-		return err
-	}
-
-	if _, ok := cf.Profiles[profile]; !ok {
-		return fmt.Errorf("profile %q not found", profile)
-	}
-
-	delete(cf.Profiles, profile)
-
-	// If the deleted profile was the default, clear default-profile.
-	if cf.Root["default-profile"] == profile {
-		delete(cf.Root, "default-profile")
-	}
-
-	return saveRaw(dataDir, cf)
 }

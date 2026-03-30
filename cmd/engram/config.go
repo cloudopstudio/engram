@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/Gentleman-Programming/engram/internal/store"
@@ -24,8 +23,6 @@ func cmdConfig(cfg store.Config) {
 		cmdConfigList(cfg)
 	case "profiles":
 		cmdConfigProfiles(cfg)
-	case "delete-profile":
-		cmdConfigDeleteProfile(cfg)
 	case "path":
 		fmt.Println(config.Path(cfg.DataDir))
 	default:
@@ -35,9 +32,8 @@ func cmdConfig(cfg store.Config) {
 	}
 }
 
-// parseConfigProfile extracts --profile <name> or --profile=<name> from
-// os.Args[3:] and returns the profile name and the remaining args (with the
-// flag removed).
+// parseConfigProfile extracts --profile <name> from os.Args[3:] and returns
+// the profile name and the remaining args (with the flag pair removed).
 func parseConfigProfile() (profile string, args []string) {
 	for i := 3; i < len(os.Args); i++ {
 		if os.Args[i] == "--profile" && i+1 < len(os.Args) {
@@ -45,13 +41,6 @@ func parseConfigProfile() (profile string, args []string) {
 			// Collect remaining args without the --profile pair.
 			args = append(args, os.Args[3:i]...)
 			args = append(args, os.Args[i+2:]...)
-			return profile, args
-		}
-		if strings.HasPrefix(os.Args[i], "--profile=") {
-			profile = strings.TrimPrefix(os.Args[i], "--profile=")
-			// Collect remaining args without the --profile=NAME token.
-			args = append(args, os.Args[3:i]...)
-			args = append(args, os.Args[i+1:]...)
 			return profile, args
 		}
 	}
@@ -235,19 +224,6 @@ func cmdConfigProfiles(cfg store.Config) {
 	}
 }
 
-func cmdConfigDeleteProfile(cfg store.Config) {
-	if len(os.Args) < 4 {
-		fmt.Fprintln(os.Stderr, "usage: engram config delete-profile <name>")
-		exitFunc(1)
-	}
-	name := os.Args[3]
-
-	if err := config.DeleteProfile(cfg.DataDir, name); err != nil {
-		fatal(err)
-	}
-	fmt.Printf("deleted profile %q\n", name)
-}
-
 func printConfigUsage() {
 	fmt.Fprintln(os.Stderr, `usage: engram config <subcommand>
 
@@ -256,7 +232,6 @@ Subcommands:
   get [--profile NAME] <key>          Get a configuration value (shows source)
   list [--profile NAME]               List all configuration with sources
   profiles                            List all configured profiles
-  delete-profile <name>               Delete a profile from config
   path                                Print config file path
 
 Valid keys:`)
