@@ -329,12 +329,12 @@ func New(cfg Config) (*Store, error) {
 	if authMethod != "password" {
 		var err error
 		if cfg.AuthInteractive {
-			// Device code flow with persistent token cache.
+			// Device code flow with file-based token cache.
 			tenantID, clientID, resolveErr := resolveInteractiveAuth(cfg.DataDir, cfg.Profile)
 			if resolveErr != nil {
 				return nil, fmt.Errorf("engram: %w", resolveErr)
 			}
-			tp, err = NewDeviceCodeTokenProvider(tenantID, clientID)
+			tp, err = NewDeviceCodeTokenProvider(tenantID, clientID, cfg.DataDir)
 			if err != nil {
 				return nil, fmt.Errorf("engram: device code auth failed: %w", err)
 			}
