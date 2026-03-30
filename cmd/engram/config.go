@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/Gentleman-Programming/engram/internal/store"
@@ -34,8 +35,9 @@ func cmdConfig(cfg store.Config) {
 	}
 }
 
-// parseConfigProfile extracts --profile <name> from os.Args[3:] and returns
-// the profile name and the remaining args (with the flag pair removed).
+// parseConfigProfile extracts --profile <name> or --profile=<name> from
+// os.Args[3:] and returns the profile name and the remaining args (with the
+// flag removed).
 func parseConfigProfile() (profile string, args []string) {
 	for i := 3; i < len(os.Args); i++ {
 		if os.Args[i] == "--profile" && i+1 < len(os.Args) {
@@ -43,6 +45,13 @@ func parseConfigProfile() (profile string, args []string) {
 			// Collect remaining args without the --profile pair.
 			args = append(args, os.Args[3:i]...)
 			args = append(args, os.Args[i+2:]...)
+			return profile, args
+		}
+		if strings.HasPrefix(os.Args[i], "--profile=") {
+			profile = strings.TrimPrefix(os.Args[i], "--profile=")
+			// Collect remaining args without the --profile=NAME token.
+			args = append(args, os.Args[3:i]...)
+			args = append(args, os.Args[i+1:]...)
 			return profile, args
 		}
 	}

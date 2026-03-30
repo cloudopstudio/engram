@@ -264,6 +264,115 @@ func TestCmdConfigSetWithProfile(t *testing.T) {
 	}
 }
 
+// ─── --profile=NAME (equals sign) tests for config subcommand ────────────────
+
+func TestCmdConfigSetWithProfileEquals(t *testing.T) {
+	cfg := testConfig(t)
+	stubExitWithPanic(t)
+
+	// Set a profile-specific value using --profile=devops syntax
+	withArgs(t, "engram", "config", "set", "--profile=devops", "database-url", "postgres://devops/db")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdConfig(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("config set --profile=devops failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "set database-url = postgres://devops/db") || !strings.Contains(stdout, "(profile: devops)") {
+		t.Fatalf("unexpected set output: %q", stdout)
+	}
+
+	// Verify it was NOT written to root config
+	rootVal, err := config.Get(cfg.DataDir, "database-url")
+	if err != nil {
+		t.Fatalf("config.Get root: %v", err)
+	}
+	if rootVal != "" {
+		t.Fatalf("expected root database-url to be empty, got %q — value leaked to root config", rootVal)
+	}
+
+	// Get back using --profile=devops
+	withArgs(t, "engram", "config", "get", "--profile=devops", "database-url")
+	stdout, stderr, recovered = captureOutputAndRecover(t, func() { cmdConfig(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("config get --profile=devops failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "postgres://devops/db") || !strings.Contains(stdout, "(profile: devops)") {
+		t.Fatalf("unexpected get output: %q", stdout)
+	}
+}
+
+func TestCmdConfigListWithProfileEquals(t *testing.T) {
+	cfg := testConfig(t)
+	stubExitWithPanic(t)
+
+	// Set profile value
+	if err := config.SetWithProfile(cfg.DataDir, "devops", "database-url", "postgres://devops/db"); err != nil {
+		t.Fatalf("SetWithProfile: %v", err)
+	}
+
+	t.Setenv("ENGRAM_DATABASE_URL", "")
+	t.Setenv("ENGRAM_PORT", "")
+	t.Setenv("ENGRAM_AUTH_METHOD", "")
+
+	withArgs(t, "engram", "config", "list", "--profile=devops")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdConfig(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("config list --profile=devops failed: panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "Profile: devops") {
+		t.Fatalf("expected profile header, got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "postgres://devops/db") || !strings.Contains(stdout, "(profile: devops)") {
+		t.Fatalf("expected profile database-url, got: %q", stdout)
+	}
+}
+
+func TestParseConfigProfileEqualsSign(t *testing.T) {
+	t.Run("parses --profile=NAME", func(t *testing.T) {
+		withArgs(t, "engram", "config", "set", "--profile=devops", "database-url", "postgres://devops/db")
+		profile, args := parseConfigProfile()
+		if profile != "devops" {
+			t.Fatalf("profile = %q, want %q", profile, "devops")
+		}
+		// args should be [database-url, postgres://devops/db] — without --profile=devops
+		if len(args) != 2 || args[0] != "database-url" || args[1] != "postgres://devops/db" {
+			t.Fatalf("args = %v, want [database-url postgres://devops/db]", args)
+		}
+	})
+
+	t.Run("parses --profile NAME (space)", func(t *testing.T) {
+		withArgs(t, "engram", "config", "set", "--profile", "dev", "database-url", "postgres://dev/db")
+		profile, args := parseConfigProfile()
+		if profile != "dev" {
+			t.Fatalf("profile = %q, want %q", profile, "dev")
+		}
+		if len(args) != 2 || args[0] != "database-url" || args[1] != "postgres://dev/db" {
+			t.Fatalf("args = %v, want [database-url postgres://dev/db]", args)
+		}
+	})
+
+	t.Run("returns empty when no --profile", func(t *testing.T) {
+		withArgs(t, "engram", "config", "set", "database-url", "postgres://localhost/db")
+		profile, args := parseConfigProfile()
+		if profile != "" {
+			t.Fatalf("profile = %q, want empty", profile)
+		}
+		if len(args) != 2 || args[0] != "database-url" || args[1] != "postgres://localhost/db" {
+			t.Fatalf("args = %v, want [database-url postgres://localhost/db]", args)
+		}
+	})
+
+	t.Run("profile=NAME at end of args", func(t *testing.T) {
+		withArgs(t, "engram", "config", "get", "database-url", "--profile=devops")
+		profile, args := parseConfigProfile()
+		if profile != "devops" {
+			t.Fatalf("profile = %q, want %q", profile, "devops")
+		}
+		if len(args) != 1 || args[0] != "database-url" {
+			t.Fatalf("args = %v, want [database-url]", args)
+		}
+	})
+}
+
 func TestCmdConfigGetProfileFallsBackToRoot(t *testing.T) {
 	cfg := testConfig(t)
 	stubExitWithPanic(t)
