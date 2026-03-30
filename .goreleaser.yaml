@@ -12,21 +12,6 @@ builds:
     binary: engram
     env:
       - CGO_ENABLED=0
-    goos:
-      - linux
-      - darwin
-      - windows
-    goarch:
-      - amd64
-      - arm64
-    ldflags:
-      - -s -w -X main.version={{.Version}}
-
-  - id: engram-pg
-    main: ./cmd/engram
-    binary: engram-pg
-    env:
-      - CGO_ENABLED=0
     tags:
       - pgstore
     goos:
@@ -50,16 +35,6 @@ archives:
       - goos: windows
         formats:
           - zip
-  - id: pgstore
-    builds:
-      - engram-pg
-    formats:
-      - tar.gz
-    name_template: "{{ .ProjectName }}-pg_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format_overrides:
-      - goos: windows
-        formats:
-          - zip
 
 checksum:
   name_template: "checksums.txt"
@@ -73,7 +48,9 @@ changelog:
       - "^ci:"
 
 brews:
-  - repository:
+  - ids:
+      - default
+    repository:
       owner: Gentleman-Programming
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"

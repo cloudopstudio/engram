@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -131,11 +132,17 @@ func (tp *TokenProvider) Identity() string {
 	return claims.Email
 }
 
-// resolveAuthMethod determines the authentication method from env vars and
-// the connection string host. Returns "entra" or "password".
-func resolveAuthMethod(connStr string) string {
+// resolveAuthMethod determines the authentication method from env vars,
+// config file, and the connection string host. Returns "entra" or "password".
+// dataDir is used to read config file fallback; empty string skips config lookup.
+func resolveAuthMethod(connStr string, dataDir string) string {
 	if method := os.Getenv("ENGRAM_AUTH_METHOD"); method != "" {
 		return strings.ToLower(strings.TrimSpace(method))
+	}
+	if dataDir != "" {
+		if method, err := config.Get(dataDir, "auth-method"); err == nil && method != "" {
+			return strings.ToLower(strings.TrimSpace(method))
+		}
 	}
 	// Auto-detect: if the host is Azure, use Entra ID.
 	if strings.Contains(connStr, ".database.azure.com") {

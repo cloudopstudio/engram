@@ -22,6 +22,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/Gentleman-Programming/engram/internal/mcp"
 	"github.com/Gentleman-Programming/engram/internal/server"
 	"github.com/Gentleman-Programming/engram/internal/setup"
@@ -144,6 +145,8 @@ func main() {
 		cmdSync(cfg)
 	case "setup":
 		cmdSetup()
+	case "config":
+		cmdConfig(cfg)
 	case "migrate":
 		cmdMigrate(cfg)
 	case "version", "--version", "-v":
@@ -163,6 +166,10 @@ func cmdServe(cfg store.Config) {
 	port := 7437 // "ENGR" on phone keypad vibes
 	if p := os.Getenv("ENGRAM_PORT"); p != "" {
 		if n, err := strconv.Atoi(p); err == nil {
+			port = n
+		}
+	} else if v, err := config.Get(cfg.DataDir, "server-port"); err == nil && v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
 			port = n
 		}
 	}
@@ -806,6 +813,7 @@ Commands:
   stats              Show memory system statistics
   export [file]      Export all memories to JSON (default: engram-export.json)
   import <file>      Import memories from a JSON export file
+  config <sub>       Manage persistent configuration (set, get, list, path)
   setup [agent]      Install/setup agent integration (opencode, claude-code, gemini-cli, codex)
   sync               Export new memories as compressed chunk to .engram/
                        --import   Import new chunks from .engram/ into local DB

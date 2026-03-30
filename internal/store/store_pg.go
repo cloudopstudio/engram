@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -311,10 +312,15 @@ type Store struct {
 func New(cfg Config) (*Store, error) {
 	connStr := os.Getenv("ENGRAM_DATABASE_URL")
 	if connStr == "" {
-		return nil, fmt.Errorf("engram: ENGRAM_DATABASE_URL must be set for PostgreSQL mode")
+		if v, err := config.Get(cfg.DataDir, "database-url"); err == nil && v != "" {
+			connStr = v
+		}
+	}
+	if connStr == "" {
+		return nil, fmt.Errorf("engram: database-url not configured. Set ENGRAM_DATABASE_URL or run: engram config set database-url <url>")
 	}
 
-	authMethod := resolveAuthMethod(connStr)
+	authMethod := resolveAuthMethod(connStr, cfg.DataDir)
 
 	var tp *TokenProvider
 	var identity string
@@ -2750,8 +2756,9 @@ func ClassifyTool(toolName string) string {
 // ─── Exported helpers for migrate command ────────────────────────────────────
 
 // ResolveAuthMethodExported exposes resolveAuthMethod for the migration CLI.
+// Passes empty dataDir so config file lookup is skipped (migration uses env vars only).
 func ResolveAuthMethodExported(connStr string) string {
-	return resolveAuthMethod(connStr)
+	return resolveAuthMethod(connStr, "")
 }
 
 // ConfigurePGPoolExported exposes configurePGPool for the migration CLI.

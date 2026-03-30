@@ -1,6 +1,6 @@
 [← Back to README](../README.md)
 
-# Engram-PG Setup Guide
+# Engram Cloud Setup Guide
 
 PostgreSQL-backed engram for team collaboration with shared persistent memory.
 
@@ -19,11 +19,11 @@ PostgreSQL-backed engram for team collaboration with shared persistent memory.
 
 ## Overview
 
-**engram-pg** is the PostgreSQL-backed variant of engram. Instead of a local SQLite file per developer, the entire team shares a single Azure Database for PostgreSQL — every `mem_save`, `mem_search`, and `mem_session_summary` reads and writes to the same database.
+**engram** ships with built-in PostgreSQL support. When configured with `ENGRAM_DATABASE_URL`, it connects to PostgreSQL instead of using a local SQLite file. The entire team shares a single Azure Database for PostgreSQL — every `mem_save`, `mem_search`, and `mem_session_summary` reads and writes to the same database.
 
 ### Why Use It
 
-| Feature | engram (SQLite) | engram-pg (PostgreSQL) |
+| Feature | engram (SQLite) | engram (PostgreSQL) |
 |---------|----------------|----------------------|
 | Storage | Local `~/.engram/engram.db` per machine | Shared Azure PG instance |
 | Collaboration | Git Sync (async, chunk-based) | Real-time shared memory |
@@ -38,7 +38,7 @@ PostgreSQL-backed engram for team collaboration with shared persistent memory.
  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
  │  Dev A       │   │  Dev B       │   │  Dev C       │
  │  (macOS)     │   │  (Linux)     │   │  (Windows)   │
- │  engram-pg   │   │  engram-pg   │   │  engram-pg   │
+ │  engram      │   │  engram      │   │  engram      │
  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
         │                  │                   │
         │    Entra ID      │    Entra ID       │    Entra ID
@@ -55,7 +55,7 @@ PostgreSQL-backed engram for team collaboration with shared persistent memory.
                     └─────────────┘
 ```
 
-Each developer runs `engram-pg` locally. The binary connects to Azure Database for PostgreSQL using Entra ID tokens (acquired via `az login`). No passwords are stored — authentication is fully managed by Azure AD.
+Each developer runs `engram` locally. When `ENGRAM_DATABASE_URL` is set, the binary connects to Azure Database for PostgreSQL using Entra ID tokens (acquired via `az login`). No passwords are stored — authentication is fully managed by Azure AD.
 
 ---
 
@@ -77,30 +77,30 @@ Each developer runs `engram-pg` locally. The binary connects to Azure Database f
 
 ### From GitHub Release (recommended)
 
-Download the prebuilt `engram-pg` binary for your platform from [GitHub Releases](https://github.com/Gentleman-Programming/engram/releases). The PG variant is built with `-tags pgstore` and ships as a separate binary.
+Download the prebuilt `engram` binary for your platform from [GitHub Releases](https://github.com/Gentleman-Programming/engram/releases). PostgreSQL support is built-in.
 
 #### macOS (Apple Silicon)
 
 ```bash
 # Download the latest release
-curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram-pg_darwin_arm64.tar.gz -o engram-pg.tar.gz
-tar xzf engram-pg.tar.gz
-chmod +x engram-pg
-mv engram-pg ~/.local/bin/
+curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_darwin_arm64.tar.gz -o engram.tar.gz
+tar xzf engram.tar.gz
+chmod +x engram
+mv engram ~/.local/bin/
 
 # Verify
-engram-pg version
+engram version
 ```
 
 #### macOS (Intel)
 
 ```bash
-curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram-pg_darwin_amd64.tar.gz -o engram-pg.tar.gz
-tar xzf engram-pg.tar.gz
-chmod +x engram-pg
-mv engram-pg ~/.local/bin/
+curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_darwin_amd64.tar.gz -o engram.tar.gz
+tar xzf engram.tar.gz
+chmod +x engram
+mv engram ~/.local/bin/
 
-engram-pg version
+engram version
 ```
 
 > **Tip:** Ensure `~/.local/bin` is in your `PATH`. Add `export PATH="$HOME/.local/bin:$PATH"` to your `~/.zshrc` or `~/.bashrc` if needed.
@@ -108,48 +108,54 @@ engram-pg version
 #### Linux (amd64)
 
 ```bash
-curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram-pg_linux_amd64.tar.gz -o engram-pg.tar.gz
-tar xzf engram-pg.tar.gz
-chmod +x engram-pg
-sudo mv engram-pg /usr/local/bin/
+curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_linux_amd64.tar.gz -o engram.tar.gz
+tar xzf engram.tar.gz
+chmod +x engram
+sudo mv engram /usr/local/bin/
 
-engram-pg version
+engram version
 ```
 
 #### Linux (arm64)
 
 ```bash
-curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram-pg_linux_arm64.tar.gz -o engram-pg.tar.gz
-tar xzf engram-pg.tar.gz
-chmod +x engram-pg
-sudo mv engram-pg /usr/local/bin/
+curl -L https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_linux_arm64.tar.gz -o engram.tar.gz
+tar xzf engram.tar.gz
+chmod +x engram
+sudo mv engram /usr/local/bin/
 
-engram-pg version
+engram version
 ```
 
 #### Windows (amd64)
 
 ```powershell
 # Download the latest release
-Invoke-WebRequest -Uri "https://github.com/Gentleman-Programming/engram/releases/latest/download/engram-pg_windows_amd64.zip" -OutFile engram-pg.zip
-Expand-Archive engram-pg.zip -DestinationPath .
-Move-Item engram-pg.exe "$env:USERPROFILE\go\bin\"
+Invoke-WebRequest -Uri "https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_windows_amd64.zip" -OutFile engram.zip
+Expand-Archive engram.zip -DestinationPath .
+Move-Item engram.exe "$env:USERPROFILE\go\bin\"
 
 # Verify
-engram-pg.exe version
+engram.exe version
 ```
 
 #### Windows (arm64)
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/Gentleman-Programming/engram/releases/latest/download/engram-pg_windows_arm64.zip" -OutFile engram-pg.zip
-Expand-Archive engram-pg.zip -DestinationPath .
-Move-Item engram-pg.exe "$env:USERPROFILE\go\bin\"
+Invoke-WebRequest -Uri "https://github.com/Gentleman-Programming/engram/releases/latest/download/engram_windows_arm64.zip" -OutFile engram.zip
+Expand-Archive engram.zip -DestinationPath .
+Move-Item engram.exe "$env:USERPROFILE\go\bin\"
 
-engram-pg.exe version
+engram.exe version
 ```
 
 > **Tip:** Ensure `%USERPROFILE%\go\bin` is in your `PATH`. Add it via **System Properties → Environment Variables** if needed.
+
+### From Homebrew
+
+```bash
+brew install Gentleman-Programming/tap/engram
+```
 
 ### Build from Source
 
@@ -158,14 +164,14 @@ Requires **Go 1.25+**.
 ```bash
 git clone https://github.com/Gentleman-Programming/engram.git
 cd engram
-go build -tags pgstore -o engram-pg ./cmd/engram/
+go build -tags pgstore -o engram ./cmd/engram/
 ```
 
-The `-tags pgstore` flag activates the PostgreSQL store backend instead of SQLite. The resulting binary is `engram-pg` — it has the same CLI interface as `engram` but connects to PostgreSQL instead of creating a local SQLite file.
+The `-tags pgstore` flag activates the PostgreSQL store backend in addition to SQLite. The resulting `engram` binary auto-selects the backend based on whether `ENGRAM_DATABASE_URL` is set.
 
 > **Version stamping** (optional):
 > ```bash
-> go build -tags pgstore -ldflags="-X main.version=local-$(git describe --tags --always)" -o engram-pg ./cmd/engram/
+> go build -tags pgstore -ldflags="-X main.version=local-$(git describe --tags --always)" -o engram ./cmd/engram/
 > ```
 
 ---
@@ -176,7 +182,7 @@ The `-tags pgstore` flag activates the PostgreSQL store backend instead of SQLit
 
 1. Go to the [Azure Portal](https://portal.azure.com) → **Create a resource** → **Azure Database for PostgreSQL Flexible Server**
 2. Choose your subscription and resource group
-3. Pick a server name (e.g., `engram-pg`)
+3. Pick a server name (e.g., `engram-db`)
 4. Select **PostgreSQL 16** (recommended — supports HNSW indexes for future pgvector)
 5. Choose a compute tier appropriate for your team size (Burstable B1ms is fine for <10 devs)
 6. Deploy
@@ -230,7 +236,7 @@ Configure network access so team members can connect:
 
 ### 5a. With Entra ID (recommended for teams)
 
-Entra ID provides passwordless authentication. Each developer authenticates via `az login` — engram-pg acquires a token automatically and uses it as the PG password.
+Entra ID provides passwordless authentication. Each developer authenticates via `az login` — engram acquires a token automatically and uses it as the PG password.
 
 #### macOS
 
@@ -243,18 +249,18 @@ az login
 
 # Create a wrapper script for convenience
 mkdir -p ~/.local/bin
-cat > ~/.local/bin/engram-pg-cloud << 'EOF'
+cat > ~/.local/bin/engram-cloud << 'EOF'
 #!/bin/bash
 export ENGRAM_DATABASE_URL="postgres://<your-email>@<server>.postgres.database.azure.com:5432/engram?sslmode=require"
 export ENGRAM_AUTH_METHOD=entra
-exec engram-pg "$@"
+exec engram "$@"
 EOF
-chmod +x ~/.local/bin/engram-pg-cloud
+chmod +x ~/.local/bin/engram-cloud
 ```
 
 Replace:
 - `<your-email>` — your Entra ID email (e.g., `dev-a@company.com`)
-- `<server>` — your Azure PG server name (e.g., `engram-pg`)
+- `<server>` — your Azure PG server name (e.g., `engram-db`)
 
 #### Linux
 
@@ -271,13 +277,13 @@ az login
 
 # Create wrapper script
 mkdir -p ~/.local/bin
-cat > ~/.local/bin/engram-pg-cloud << 'EOF'
+cat > ~/.local/bin/engram-cloud << 'EOF'
 #!/bin/bash
 export ENGRAM_DATABASE_URL="postgres://<your-email>@<server>.postgres.database.azure.com:5432/engram?sslmode=require"
 export ENGRAM_AUTH_METHOD=entra
-exec engram-pg "$@"
+exec engram "$@"
 EOF
-chmod +x ~/.local/bin/engram-pg-cloud
+chmod +x ~/.local/bin/engram-cloud
 ```
 
 > **Other Linux distros:** See [Install the Azure CLI on Linux](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli-linux) for apt, yum, zypper, and manual install options.
@@ -292,22 +298,22 @@ winget install Microsoft.AzureCLI
 az login
 
 # Create wrapper script
-# Save as: C:\Users\<user>\go\bin\engram-pg-cloud.cmd
+# Save as: C:\Users\<user>\go\bin\engram-cloud.cmd
 @echo off
 set ENGRAM_DATABASE_URL=postgres://<your-email>@<server>.postgres.database.azure.com:5432/engram?sslmode=require
 set ENGRAM_AUTH_METHOD=entra
-engram-pg.exe %*
+engram.exe %*
 ```
 
-Save the file above as `engram-pg-cloud.cmd` in a directory that's in your `PATH` (e.g., `%USERPROFILE%\go\bin\`).
+Save the file above as `engram-cloud.cmd` in a directory that's in your `PATH` (e.g., `%USERPROFILE%\go\bin\`).
 
-> **PowerShell alternative** — create `engram-pg-cloud.ps1`:
+> **PowerShell alternative** — create `engram-cloud.ps1`:
 > ```powershell
 > $env:ENGRAM_DATABASE_URL = "postgres://<your-email>@<server>.postgres.database.azure.com:5432/engram?sslmode=require"
 > $env:ENGRAM_AUTH_METHOD = "entra"
-> & engram-pg.exe @args
+> & engram.exe @args
 > ```
-> Note: `.ps1` scripts require `pwsh -File engram-pg-cloud.ps1` to invoke — `.cmd` is simpler for MCP config.
+> Note: `.ps1` scripts require `pwsh -File engram-cloud.ps1` to invoke — `.cmd` is simpler for MCP config.
 
 ### 5b. With Password (for local dev/testing)
 
@@ -317,35 +323,35 @@ For local PostgreSQL instances (Docker, Homebrew postgres, etc.) where Entra ID 
 
 ```bash
 # Start a local PG (if you don't have one):
-# docker run -d --name engram-pg -e POSTGRES_DB=engram -e POSTGRES_USER=engram -e POSTGRES_PASSWORD=password -p 5432:5432 postgres:16-alpine
+# docker run -d --name engram-db -e POSTGRES_DB=engram -e POSTGRES_USER=engram -e POSTGRES_PASSWORD=password -p 5432:5432 postgres:16-alpine
 
 # Create wrapper script
 mkdir -p ~/.local/bin
-cat > ~/.local/bin/engram-pg-local << 'EOF'
+cat > ~/.local/bin/engram-local << 'EOF'
 #!/bin/bash
 export ENGRAM_DATABASE_URL="postgres://engram:password@localhost:5432/engram?sslmode=disable"
 export ENGRAM_AUTH_METHOD=password
-exec engram-pg "$@"
+exec engram "$@"
 EOF
-chmod +x ~/.local/bin/engram-pg-local
+chmod +x ~/.local/bin/engram-local
 ```
 
 #### Windows
 
-Save as `engram-pg-local.cmd` in a directory in your `PATH`:
+Save as `engram-local.cmd` in a directory in your `PATH`:
 
 ```cmd
 @echo off
 set ENGRAM_DATABASE_URL=postgres://engram:password@localhost:5432/engram?sslmode=disable
 set ENGRAM_AUTH_METHOD=password
-engram-pg.exe %*
+engram.exe %*
 ```
 
 ### Environment Variables Reference
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `ENGRAM_DATABASE_URL` | PostgreSQL connection string (required for engram-pg) | — |
+| `ENGRAM_DATABASE_URL` | PostgreSQL connection string (enables PG mode) | — |
 | `ENGRAM_AUTH_METHOD` | `entra` or `password` | Auto-detected: `entra` for `*.database.azure.com`, `password` otherwise |
 | `ENGRAM_MIGRATE_SOURCE` | Source SQLite DB for migration | `~/.engram/engram.db` |
 | `ENGRAM_DATA_DIR` | Data directory (used for default migration source path) | `~/.engram` |
@@ -356,7 +362,7 @@ engram-pg.exe %*
 
 ## MCP Client Configuration
 
-Configure your AI agent to use `engram-pg-cloud` (or `engram-pg-local`) instead of `engram`.
+Configure your AI agent to use `engram-cloud` (or `engram-local`) instead of plain `engram` to auto-set the database URL. Alternatively, set `ENGRAM_DATABASE_URL` in your environment and use `engram` directly.
 
 ### OpenCode
 
@@ -367,7 +373,7 @@ Edit `~/.config/opencode/opencode.json` (Windows: `%APPDATA%\opencode\opencode.j
   "mcp": {
     "engram": {
       "type": "local",
-      "command": ["engram-pg-cloud", "mcp"],
+      "command": ["engram-cloud", "mcp"],
       "enabled": true
     }
   }
@@ -379,7 +385,7 @@ Edit `~/.config/opencode/opencode.json` (Windows: `%APPDATA%\opencode\opencode.j
 **Option A: Via `claude mcp add`:**
 
 ```bash
-claude mcp add engram -- engram-pg-cloud mcp
+claude mcp add engram -- engram-cloud mcp
 ```
 
 **Option B: Manual config** — add to `.claude/settings.json` (project) or `~/.claude/settings.json` (global):
@@ -388,7 +394,7 @@ claude mcp add engram -- engram-pg-cloud mcp
 {
   "mcpServers": {
     "engram": {
-      "command": "engram-pg-cloud",
+      "command": "engram-cloud",
       "args": ["mcp"]
     }
   }
@@ -403,7 +409,7 @@ Edit `~/.gemini/settings.json` (Windows: `%APPDATA%\gemini\settings.json`):
 {
   "mcpServers": {
     "engram": {
-      "command": "engram-pg-cloud",
+      "command": "engram-cloud",
       "args": ["mcp"]
     }
   }
@@ -418,7 +424,7 @@ Add to `.vscode/mcp.json` (workspace) or user-level `mcp.json`:
 {
   "servers": {
     "engram": {
-      "command": "engram-pg-cloud",
+      "command": "engram-cloud",
       "args": ["mcp"]
     }
   }
@@ -431,13 +437,13 @@ Edit `~/.codex/config.toml` (Windows: `%APPDATA%\codex\config.toml`):
 
 ```toml
 [mcp_servers.engram]
-command = "engram-pg-cloud"
+command = "engram-cloud"
 args = ["mcp"]
 ```
 
 ### Any Other MCP Agent
 
-The pattern is always the same — replace `engram` with `engram-pg-cloud` (or `engram-pg-local`) in your agent's MCP config. The `mcp` subcommand starts the MCP server on stdio, identical to the SQLite version.
+The pattern is always the same — use `engram-cloud` (or `engram-local`) in your agent's MCP config. These wrapper scripts just set `ENGRAM_DATABASE_URL` and call `engram`. The `mcp` subcommand starts the MCP server on stdio, identical to the SQLite version.
 
 ---
 
@@ -459,10 +465,10 @@ export ENGRAM_AUTH_METHOD=entra
 az login
 
 # Run migration
-engram-pg migrate
+engram migrate
 
 # Verify
-engram-pg search --query "test" --project <your-project>
+engram search --query "test" --project <your-project>
 ```
 
 ### Windows
@@ -479,10 +485,10 @@ $env:ENGRAM_AUTH_METHOD = "entra"
 az login
 
 # Run migration
-engram-pg.exe migrate
+engram.exe migrate
 
 # Verify
-engram-pg.exe search --query "test" --project <your-project>
+engram.exe search --query "test" --project <your-project>
 ```
 
 ### What Gets Migrated
@@ -519,7 +525,7 @@ Understanding how token refresh works prevents authentication surprises.
   Azure CLI caches credentials locally
        │
        ▼
-  engram-pg starts ──► NewTokenProvider()
+  engram starts ──► NewTokenProvider()
        │                 uses azidentity.DefaultAzureCredential
        │                 (checks: CLI cache → Managed Identity → Env Vars)
        │
@@ -561,7 +567,7 @@ Understanding how token refresh works prevents authentication surprises.
 ### Key Details
 
 - **Token validity:** Azure AD tokens last ~60-90 minutes
-- **Refresh threshold:** engram-pg refreshes tokens **5 minutes before expiry** — no interruptions during normal use
+- **Refresh threshold:** engram refreshes tokens **5 minutes before expiry** — no interruptions during normal use
 - **Caching:** All connections in the pool share the same cached token — only one Azure AD request per refresh cycle
 - **Thread safety:** Multiple concurrent MCP tool calls safely share the token (protected by sync.RWMutex with double-check locking)
 - **Connection pool:** Max 5 connections, max lifetime 30 minutes (rotated before token expiry)
@@ -602,7 +608,7 @@ engram: entra token for pg connection: no Azure credential available
 **Fix:**
 ```bash
 az login
-# Then retry your engram-pg command
+# Then retry your engram command
 ```
 
 If you're using password auth and see `password authentication failed`:
@@ -646,27 +652,29 @@ engram: connect to PG: tls: ... certificate
 ### Migrate Command Not Available
 
 ```
-engram: 'migrate' command requires the pgstore build variant.
+engram: 'migrate' command requires the pgstore build tag.
   Rebuild with: go build -tags pgstore ./cmd/engram/
 ```
 
-**Cause:** You're running the standard `engram` binary (SQLite), not `engram-pg`.
+**Cause:** You built engram from source without the `pgstore` build tag.
 
-**Fix:** Use the `engram-pg` binary, or build with `-tags pgstore`:
+**Fix:** Rebuild with the pgstore tag:
 ```bash
-go build -tags pgstore -o engram-pg ./cmd/engram/
+go build -tags pgstore -o engram ./cmd/engram/
 ```
+
+> **Note:** Pre-built release binaries always include PostgreSQL support. This error only occurs with custom source builds.
 
 ### Windows: PATH Issues
 
-**Symptom:** MCP client can't find `engram-pg-cloud`.
+**Symptom:** MCP client can't find `engram-cloud`.
 
 **Fix:**
-- Ensure the directory containing `engram-pg-cloud.cmd` is in your system `PATH`
+- Ensure the directory containing `engram-cloud.cmd` is in your system `PATH`
 - In MCP configs, use the **full path** if PATH resolution fails:
   ```json
   {
-    "command": "C:\\Users\\<user>\\go\\bin\\engram-pg-cloud.cmd",
+    "command": "C:\\Users\\<user>\\go\\bin\\engram-cloud.cmd",
     "args": ["mcp"]
   }
   ```
@@ -679,7 +687,7 @@ go build -tags pgstore -o engram-pg ./cmd/engram/
   ```json
   {
     "command": "pwsh",
-    "args": ["-File", "C:\\Users\\<user>\\go\\bin\\engram-pg-cloud.ps1", "mcp"]
+    "args": ["-File", "C:\\Users\\<user>\\go\\bin\\engram-cloud.ps1", "mcp"]
   }
   ```
 
@@ -702,9 +710,9 @@ Ensure the installed path is in your `PATH`.
 engram: ENGRAM_DATABASE_URL must be set for PostgreSQL mode
 ```
 
-**Cause:** engram-pg requires a connection string.
+**Cause:** engram requires a connection string for PostgreSQL mode.
 
-**Fix:** Set the environment variable before running engram-pg, or use a wrapper script (see [Section 5](#authentication-configuration)).
+**Fix:** Set the environment variable before running engram, or use a wrapper script (see [Section 5](#authentication-configuration)).
 
 ---
 
@@ -714,7 +722,7 @@ If you need to switch back to the standard SQLite-based engram:
 
 ### 1. Change MCP Config
 
-Replace `engram-pg-cloud` with `engram` in your agent's MCP config:
+Remove the `ENGRAM_DATABASE_URL` environment variable — use `engram` directly in your agent's MCP config:
 
 ```json
 {
@@ -739,18 +747,18 @@ Or for OpenCode:
 
 ### 2. Your Local Data Is Untouched
 
-The SQLite database at `~/.engram/engram.db` (Windows: `%USERPROFILE%\.engram\engram.db`) was **never modified** by the PG migration or by running engram-pg. It's still there with all your pre-migration data.
+The SQLite database at `~/.engram/engram.db` (Windows: `%USERPROFILE%\.engram\engram.db`) was **never modified** by the PG migration or by running engram in PG mode. It's still there with all your pre-migration data.
 
 ### 3. Export from PG (Optional)
 
 If you accumulated new data in PostgreSQL that you want to keep locally:
 
 ```bash
-# Export from PG to JSON
-engram-pg export engram-pg-backup.json
+# Export from PG to JSON (with ENGRAM_DATABASE_URL set)
+engram export engram-backup.json
 
-# Import into local SQLite
-engram import engram-pg-backup.json
+# Import into local SQLite (without ENGRAM_DATABASE_URL)
+engram import engram-backup.json
 ```
 
 ### 4. Verify
