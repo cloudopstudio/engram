@@ -44,7 +44,9 @@ engram/
 ├── internal/
 │   ├── store/store.go              # Core: SQLite + FTS5 + all data operations
 │   ├── server/server.go            # HTTP REST API server (port 7437)
-│   ├── mcp/mcp.go                  # MCP stdio server (13 tools)
+│   ├── mcp/mcp.go                  # MCP stdio server (15 tools)
+│   ├── project/                     # Project name detection + similarity matching
+│   │   └── project.go              # DetectProject, FindSimilar, Levenshtein
 │   ├── sync/sync.go                # Git sync: manifest + chunks (gzipped JSONL)
 │   └── tui/                        # Bubbletea terminal UI
 │       ├── model.go                # Screen constants, Model struct, Init(), custom messages
@@ -96,6 +98,9 @@ engram stats              Show memory system statistics
 engram export [file]      Export all memories to JSON (default: engram-export.json)
 engram import <file>      Import memories from a JSON export file
 engram sync               Export new memories as chunk [--import] [--status] [--project NAME] [--all]
+engram projects list      Show all projects with obs/session/prompt counts
+engram projects consolidate  Interactive merge of similar project names [--all] [--dry-run]
+engram projects prune     Remove projects with 0 observations [--dry-run]
 engram version            Print version
 engram help               Show help
 ```
@@ -106,6 +111,7 @@ engram help               Show help
 |---|---|---|
 | `ENGRAM_DATA_DIR` | Override data directory | `~/.engram` |
 | `ENGRAM_PORT` | Override HTTP server port | `7437` |
+| `ENGRAM_PROJECT` | Override project name for MCP server | auto-detected via git |
 
 ---
 
@@ -250,7 +256,7 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 
 ---
 
-## MCP Tools (13 tools)
+## MCP Tools (15 tools)
 
 ### mem_search
 
@@ -320,6 +326,41 @@ Register the start of a new coding session.
 ### mem_session_end
 
 Mark a session as completed with optional summary.
+
+### mem_capture_passive
+
+Extract structured learnings from text output. Looks for `## Key Learnings:` sections and saves each numbered/bulleted item as a separate observation. Duplicates are automatically skipped.
+
+### mem_merge_projects
+
+**Admin tool.** Merge multiple project name variants into a single canonical name. Accepts an array of source project names and a target canonical name. All observations, sessions, and prompts from the source projects are reassigned to the canonical project.
+
+---
+
+## Project Name Normalization
+
+Engram automatically prevents project name drift — the same project saved under different names (`"engram"` vs `"Engram"` vs `"engram-memory"`) by different clients or users.
+
+### Automatic normalization
+
+All project names are normalized on write and read: **lowercase**, **trimmed**, **collapsed hyphens/underscores**. If a name is changed during normalization, a warning is included in the response.
+
+### Auto-detection
+
+The MCP server auto-detects the project name at startup using a priority chain:
+1. `--project` flag
+2. `ENGRAM_PROJECT` environment variable
+3. Git remote origin URL (extracts repo name)
+4. Git repository root directory name
+5. Current working directory basename
+
+### Similar-project warnings
+
+When saving to a project that doesn't exist yet, Engram checks for similar existing project names (Levenshtein distance, substring, case-insensitive matching) and warns the agent if a likely variant already exists.
+
+### Retroactive cleanup
+
+Use `engram projects consolidate` to interactively merge variant project names, or `mem_merge_projects` for agent-driven consolidation.
 
 ---
 
@@ -578,7 +619,7 @@ The `tool.execute.after` hook receives:
 
 ### ENGRAM_TOOLS (excluded from tool count)
 
-`mem_search`, `mem_save`, `mem_update`, `mem_delete`, `mem_suggest_topic_key`, `mem_save_prompt`, `mem_session_summary`, `mem_context`, `mem_stats`, `mem_timeline`, `mem_get_observation`, `mem_session_start`, `mem_session_end`
+`mem_search`, `mem_save`, `mem_update`, `mem_delete`, `mem_suggest_topic_key`, `mem_save_prompt`, `mem_session_summary`, `mem_context`, `mem_stats`, `mem_timeline`, `mem_get_observation`, `mem_session_start`, `mem_session_end`, `mem_capture_passive`, `mem_merge_projects`
 
 ---
 

@@ -9,8 +9,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Gentleman-Programming/engram/internal/mcp"
 	"github.com/Gentleman-Programming/engram/internal/store"
 	versioncheck "github.com/Gentleman-Programming/engram/internal/version"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 
 func testConfig(t *testing.T) store.Config {
@@ -637,5 +639,318 @@ func TestCmdSearchLocalMode(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Found") && !strings.Contains(stdout, "local-result") {
 		t.Fatalf("expected local search results, got: %q", stdout)
+	}
+}
+
+// ─── Projects command tests ───────────────────────────────────────────────────
+
+func TestCmdProjectsListEmpty(t *testing.T) {
+	cfg := testConfig(t)
+
+	withArgs(t, "engram", "projects", "list")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsList(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "No projects found") {
+		t.Fatalf("expected empty projects message, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsList(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed observations for two projects
+	mustSeedObservation(t, cfg, "s-alpha", "alpha", "note", "alpha-note", "alpha content", "project")
+	mustSeedObservation(t, cfg, "s-alpha", "alpha", "bugfix", "alpha-bug", "alpha bug", "project")
+	mustSeedObservation(t, cfg, "s-beta", "beta", "decision", "beta-note", "beta content", "project")
+
+	withArgs(t, "engram", "projects", "list")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsList(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "Projects (2)") {
+		t.Fatalf("expected 'Projects (2)', got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "alpha") || !strings.Contains(stdout, "beta") {
+		t.Fatalf("expected project names in output, got: %q", stdout)
+	}
+	// alpha has 2 observations, beta has 1 — alpha should appear first
+	alphaIdx := strings.Index(stdout, "alpha")
+	betaIdx := strings.Index(stdout, "beta")
+	if alphaIdx > betaIdx {
+		t.Fatalf("expected alpha (more obs) before beta, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsRoutesSubcommands(t *testing.T) {
+	cfg := testConfig(t)
+
+	// "list" subcommand
+	withArgs(t, "engram", "projects", "list")
+	stdout, _ := captureOutput(t, func() { cmdProjects(cfg) })
+	if !strings.Contains(stdout, "No projects found") && !strings.Contains(stdout, "Projects") {
+		t.Fatalf("expected projects list output, got: %q", stdout)
+	}
+
+	// default (no subcommand) → list
+	withArgs(t, "engram", "projects")
+	stdout2, _ := captureOutput(t, func() { cmdProjects(cfg) })
+	_ = stdout2 // just checking it doesn't crash
+}
+
+func TestCmdProjectsConsolidateNoSimilar(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed a single unique project
+	mustSeedObservation(t, cfg, "s-unique", "unique-project", "note", "unique note", "content", "project")
+
+	// Set cwd to a temp dir named "unique-project" with no git
+	workDir := filepath.Join(t.TempDir(), "unique-project")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	withCwd(t, workDir)
+
+	// Stub detectProject to return the known canonical
+	old := detectProject
+	detectProject = func(string) string { return "unique-project" }
+	t.Cleanup(func() { detectProject = old })
+
+	withArgs(t, "engram", "projects", "consolidate")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "No similar") {
+		t.Fatalf("expected no-similar message, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsConsolidateDryRun(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed a canonical and a similar variant (substring match, distinct after normalize)
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+
+	old := detectProject
+	detectProject = func(string) string { return "engram" }
+	t.Cleanup(func() { detectProject = old })
+
+	withArgs(t, "engram", "projects", "consolidate", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "dry-run") {
+		t.Fatalf("expected dry-run message, got: %q", stdout)
+	}
+	// Verify no actual merge happened (both projects still exist)
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	names, err := s.ListProjectNames()
+	if err != nil {
+		t.Fatalf("ListProjectNames: %v", err)
+	}
+	// Should still have both names (no merge happened)
+	if len(names) < 2 {
+		t.Fatalf("expected 2 project names after dry-run, got: %v", names)
+	}
+}
+
+func TestCmdProjectsConsolidateSingleProject(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed canonical and a similar variant (substring match, distinct after normalize)
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+
+	old := detectProject
+	detectProject = func(string) string { return "engram" }
+	t.Cleanup(func() { detectProject = old })
+
+	// Stub scanInputLine to answer "all"
+	oldScan := scanInputLine
+	t.Cleanup(func() { scanInputLine = oldScan })
+	scanInputLine = func(a ...any) (int, error) {
+		if ptr, ok := a[0].(*string); ok {
+			*ptr = "all"
+		}
+		return 1, nil
+	}
+
+	withArgs(t, "engram", "projects", "consolidate")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "Merged into") {
+		t.Fatalf("expected merge result, got: %q", stdout)
+	}
+
+	// Verify engram-memory was merged into engram
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer s.Close()
+	names, err := s.ListProjectNames()
+	if err != nil {
+		t.Fatalf("ListProjectNames: %v", err)
+	}
+	if len(names) != 1 || names[0] != "engram" {
+		t.Fatalf("expected only 'engram' after merge, got: %v", names)
+	}
+}
+
+func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed similar projects (substring match, stays distinct after normalize)
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+
+	withArgs(t, "engram", "projects", "consolidate", "--all", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "dry-run") || !strings.Contains(stdout, "Group") {
+		t.Fatalf("expected dry-run group output, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsAllNoGroups(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed completely unrelated projects
+	mustSeedObservation(t, cfg, "s-foo", "fooproject", "note", "foo", "content", "project")
+	mustSeedObservation(t, cfg, "s-bar", "barproject", "note", "bar", "content", "project")
+	mustSeedObservation(t, cfg, "s-qux", "quxproject", "note", "qux", "content", "project")
+
+	withArgs(t, "engram", "projects", "consolidate", "--all")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	// The three "project"-suffixed names might be grouped by similarity.
+	// We just verify it runs without error and produces readable output.
+	_ = stdout
+}
+
+func TestCmdMCPDetectsProjectFromFlag(t *testing.T) {
+	// Test that --project flag is parsed and passed to MCP config.
+	// We can't easily test the full MCP server startup (it blocks on stdio),
+	// but we test the flag-parsing + detectProject chain indirectly by
+	// checking that cmdMCP doesn't crash when store is available.
+	//
+	// The key invariant tested: --project sets detectedProject correctly.
+	// We verify by stubbing newMCPServerWithConfig and checking the MCPConfig.
+	cfg := testConfig(t)
+
+	var capturedCfg mcp.MCPConfig
+	oldNew := newMCPServerWithConfig
+	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
+	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		capturedCfg = mcpCfg
+		// Return a valid server so serveMCP doesn't panic
+		return oldNew(s, mcpCfg, allowlist)
+	}
+
+	oldServe := serveMCP
+	t.Cleanup(func() { serveMCP = oldServe })
+	// Prevent actual stdio serve — return immediately
+	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
+		return nil
+	}
+
+	withArgs(t, "engram", "mcp", "--project=myproject")
+	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
+
+	if capturedCfg.DefaultProject != "myproject" {
+		t.Fatalf("expected DefaultProject=%q, got %q", "myproject", capturedCfg.DefaultProject)
+	}
+}
+
+func TestCmdMCPDetectsProjectFromEnv(t *testing.T) {
+	cfg := testConfig(t)
+
+	t.Setenv("ENGRAM_PROJECT", "env-project")
+
+	var capturedCfg mcp.MCPConfig
+	oldNew := newMCPServerWithConfig
+	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
+	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		capturedCfg = mcpCfg
+		return oldNew(s, mcpCfg, allowlist)
+	}
+
+	oldServe := serveMCP
+	t.Cleanup(func() { serveMCP = oldServe })
+	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
+		return nil
+	}
+
+	withArgs(t, "engram", "mcp")
+	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
+
+	if capturedCfg.DefaultProject != "env-project" {
+		t.Fatalf("expected DefaultProject=%q, got %q", "env-project", capturedCfg.DefaultProject)
+	}
+}
+
+func TestCmdMCPDetectsProjectFromGit(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Stub detectProject to simulate git detection
+	old := detectProject
+	t.Cleanup(func() { detectProject = old })
+	detectProject = func(string) string { return "detected-from-git" }
+
+	var capturedCfg mcp.MCPConfig
+	oldNew := newMCPServerWithConfig
+	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
+	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		capturedCfg = mcpCfg
+		return oldNew(s, mcpCfg, allowlist)
+	}
+
+	oldServe := serveMCP
+	t.Cleanup(func() { serveMCP = oldServe })
+	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
+		return nil
+	}
+
+	withArgs(t, "engram", "mcp")
+	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
+
+	if capturedCfg.DefaultProject != "detected-from-git" {
+		t.Fatalf("expected DefaultProject=%q, got %q", "detected-from-git", capturedCfg.DefaultProject)
+	}
+}
+
+func TestCmdSyncUsesDetectProject(t *testing.T) {
+	workDir := t.TempDir()
+	withCwd(t, workDir)
+
+	cfg := testConfig(t)
+
+	// Stub detectProject to verify it's called instead of filepath.Base
+	old := detectProject
+	t.Cleanup(func() { detectProject = old })
+	detectProject = func(dir string) string { return "git-detected-project" }
+
+	withArgs(t, "engram", "sync")
+	stdout, stderr := captureOutput(t, func() { cmdSync(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "git-detected-project") {
+		t.Fatalf("expected detectProject result in output, got: %q", stdout)
 	}
 }

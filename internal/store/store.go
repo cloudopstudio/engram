@@ -781,6 +781,9 @@ func (s *Store) migrateFTSTopicKey() error {
 // ─── Sessions ────────────────────────────────────────────────────────────────
 
 func (s *Store) CreateSession(id, project, directory string) error {
+	// Normalize project name before storing
+	project, _ = NormalizeProject(project)
+
 	return s.withTx(func(tx *sql.Tx) error {
 		if err := s.createSessionTx(tx, id, project, directory); err != nil {
 			return err
@@ -842,6 +845,9 @@ func (s *Store) GetSession(id string) (*Session, error) {
 }
 
 func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {
+	// Normalize project filter for case-insensitive matching
+	project, _ = NormalizeProject(project)
+
 	if limit <= 0 {
 		limit = 5
 	}
@@ -969,6 +975,9 @@ func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation,
 // ─── Observations ────────────────────────────────────────────────────────────
 
 func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
+	// Normalize project name (lowercase + trim) before any persistence
+	p.Project, _ = NormalizeProject(p.Project)
+
 	// Strip <private>...</private> tags before persisting ANYTHING
 	title := stripPrivateTags(p.Title)
 	content := stripPrivateTags(p.Content)
@@ -1094,6 +1103,9 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 }
 
 func (s *Store) RecentObservations(project, scope string, limit int) ([]Observation, error) {
+	// Normalize project filter for case-insensitive matching
+	project, _ = NormalizeProject(project)
+
 	if limit <= 0 {
 		limit = s.cfg.MaxContextResults
 	}
@@ -1124,6 +1136,9 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 // ─── User Prompts ────────────────────────────────────────────────────────────
 
 func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
+	// Normalize project name before storing
+	p.Project, _ = NormalizeProject(p.Project)
+
 	content := stripPrivateTags(p.Content)
 	if len(content) > s.cfg.MaxObservationLength {
 		content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
@@ -1157,6 +1172,9 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 }
 
 func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
+	// Normalize project filter for case-insensitive matching
+	project, _ = NormalizeProject(project)
+
 	if limit <= 0 {
 		limit = 20
 	}
@@ -1276,7 +1294,7 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 			}
 		}
 		if p.Project != nil {
-			project = *p.Project
+			project, _ = NormalizeProject(*p.Project)
 		}
 		if p.Scope != nil {
 			scope = normalizeScope(*p.Scope)
@@ -1471,6 +1489,9 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 // ─── Search (FTS5) ───────────────────────────────────────────────────────────
 
 func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error) {
+	// Normalize project filter so "Engram" finds records stored as "engram"
+	opts.Project, _ = NormalizeProject(opts.Project)
+
 	limit := opts.Limit
 	if limit <= 0 {
 		limit = 10
@@ -2293,6 +2314,289 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 		}
 		result.PromptsUpdated, _ = res.RowsAffected()
 
+		// Enqueue sync mutations so cloud sync picks up the migrated records.
+		// Same pattern used by EnrollProject and MergeProjects.
+		return s.backfillProjectSyncMutationsTx(tx, newName)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// ─── Project Queries ──────────────────────────────────────────────────────────
+
+// ProjectNameCount holds a project name and how many observations it has.
+type ProjectNameCount struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+// ListProjectNames returns all distinct project names from observations,
+// ordered alphabetically. Used for fuzzy matching and consolidation.
+func (s *Store) ListProjectNames() ([]string, error) {
+	rows, err := s.queryItHook(s.db,
+		`SELECT DISTINCT project FROM observations
+		 WHERE project IS NOT NULL AND project != '' AND deleted_at IS NULL
+		 ORDER BY project`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		results = append(results, name)
+	}
+	return results, rows.Err()
+}
+
+// ProjectStats holds aggregate statistics for a single project.
+type ProjectStats struct {
+	Name             string   `json:"name"`
+	ObservationCount int      `json:"observation_count"`
+	SessionCount     int      `json:"session_count"`
+	PromptCount      int      `json:"prompt_count"`
+	Directories      []string `json:"directories"` // unique directories from sessions
+}
+
+// ListProjectsWithStats returns all projects with aggregated counts.
+// Ordered by observation count descending.
+func (s *Store) ListProjectsWithStats() ([]ProjectStats, error) {
+	// Observation counts per project
+	obsRows, err := s.queryItHook(s.db,
+		`SELECT project, COUNT(*) as cnt
+		 FROM observations
+		 WHERE project IS NOT NULL AND project != '' AND deleted_at IS NULL
+		 GROUP BY project`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list projects obs: %w", err)
+	}
+	defer obsRows.Close()
+
+	statsMap := make(map[string]*ProjectStats)
+	for obsRows.Next() {
+		var name string
+		var cnt int
+		if err := obsRows.Scan(&name, &cnt); err != nil {
+			return nil, err
+		}
+		statsMap[name] = &ProjectStats{Name: name, ObservationCount: cnt}
+	}
+	if err := obsRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Session counts + directories per project
+	sessRows, err := s.queryItHook(s.db,
+		`SELECT project, COUNT(*) as cnt, directory
+		 FROM sessions
+		 WHERE project IS NOT NULL AND project != ''
+		 GROUP BY project, directory`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list projects sessions: %w", err)
+	}
+	defer sessRows.Close()
+
+	type projDir struct {
+		count int
+		dirs  map[string]bool
+	}
+	sessData := make(map[string]*projDir)
+	for sessRows.Next() {
+		var name, dir string
+		var cnt int
+		if err := sessRows.Scan(&name, &cnt, &dir); err != nil {
+			return nil, err
+		}
+		if sessData[name] == nil {
+			sessData[name] = &projDir{dirs: make(map[string]bool)}
+		}
+		sessData[name].count += cnt
+		if dir != "" {
+			sessData[name].dirs[dir] = true
+		}
+	}
+	if err := sessRows.Err(); err != nil {
+		return nil, err
+	}
+
+	for name, sd := range sessData {
+		if statsMap[name] == nil {
+			statsMap[name] = &ProjectStats{Name: name}
+		}
+		statsMap[name].SessionCount = sd.count
+		for d := range sd.dirs {
+			statsMap[name].Directories = append(statsMap[name].Directories, d)
+		}
+	}
+
+	// Prompt counts per project
+	promptRows, err := s.queryItHook(s.db,
+		`SELECT project, COUNT(*) as cnt
+		 FROM user_prompts
+		 WHERE project IS NOT NULL AND project != ''
+		 GROUP BY project`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list projects prompts: %w", err)
+	}
+	defer promptRows.Close()
+
+	for promptRows.Next() {
+		var name string
+		var cnt int
+		if err := promptRows.Scan(&name, &cnt); err != nil {
+			return nil, err
+		}
+		if statsMap[name] == nil {
+			statsMap[name] = &ProjectStats{Name: name}
+		}
+		statsMap[name].PromptCount = cnt
+	}
+	if err := promptRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Convert to slice, sorted by observation count descending
+	results := make([]ProjectStats, 0, len(statsMap))
+	for _, ps := range statsMap {
+		results = append(results, *ps)
+	}
+	// Simple insertion sort — project lists are small
+	for i := 1; i < len(results); i++ {
+		for j := i; j > 0 && results[j].ObservationCount > results[j-1].ObservationCount; j-- {
+			results[j], results[j-1] = results[j-1], results[j]
+		}
+	}
+
+	return results, nil
+}
+
+// CountObservationsForProject returns the number of non-deleted observations
+// for the given project name. Used by handleSave for the similar-project
+// warning instead of the heavier ListProjectsWithStats.
+func (s *Store) CountObservationsForProject(name string) (int, error) {
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM observations WHERE project = ? AND deleted_at IS NULL`,
+		name,
+	).Scan(&count)
+	return count, err
+}
+
+// MergeResult summarizes the result of merging multiple project name variants
+// into a single canonical project name.
+type MergeResult struct {
+	Canonical           string   `json:"canonical"`
+	SourcesMerged       []string `json:"sources_merged"`
+	ObservationsUpdated int64    `json:"observations_updated"`
+	SessionsUpdated     int64    `json:"sessions_updated"`
+	PromptsUpdated      int64    `json:"prompts_updated"`
+}
+
+// MergeProjects migrates all records from each source project name into the
+// canonical name. Sources that equal the canonical (after normalization) or
+// have no records are silently skipped — the operation is idempotent.
+// All updates are performed inside a single transaction for atomicity.
+func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult, error) {
+	canonical, _ = NormalizeProject(canonical)
+	if canonical == "" {
+		return nil, fmt.Errorf("canonical project name must not be empty")
+	}
+
+	result := &MergeResult{Canonical: canonical}
+
+	err := s.withTx(func(tx *sql.Tx) error {
+		for _, src := range sources {
+			src, _ = NormalizeProject(src)
+			if src == "" || src == canonical {
+				continue
+			}
+
+			res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project = ?`, canonical, src)
+			if err != nil {
+				return fmt.Errorf("merge observations %q → %q: %w", src, canonical, err)
+			}
+			n, _ := res.RowsAffected()
+			result.ObservationsUpdated += n
+
+			res, err = s.execHook(tx, `UPDATE sessions SET project = ? WHERE project = ?`, canonical, src)
+			if err != nil {
+				return fmt.Errorf("merge sessions %q → %q: %w", src, canonical, err)
+			}
+			n, _ = res.RowsAffected()
+			result.SessionsUpdated += n
+
+			res, err = s.execHook(tx, `UPDATE user_prompts SET project = ? WHERE project = ?`, canonical, src)
+			if err != nil {
+				return fmt.Errorf("merge prompts %q → %q: %w", src, canonical, err)
+			}
+			n, _ = res.RowsAffected()
+			result.PromptsUpdated += n
+
+			result.SourcesMerged = append(result.SourcesMerged, src)
+		}
+		// Enqueue sync mutations so cloud sync picks up the merged records.
+		// Same pattern used by EnrollProject.
+		return s.backfillProjectSyncMutationsTx(tx, canonical)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// ─── Project Pruning ─────────────────────────────────────────────────────────
+
+// PruneResult holds the outcome of pruning a single project.
+type PruneResult struct {
+	Project         string `json:"project"`
+	SessionsDeleted int64  `json:"sessions_deleted"`
+	PromptsDeleted  int64  `json:"prompts_deleted"`
+}
+
+// PruneProject removes all sessions and prompts for a project that has zero
+// (non-deleted) observations. Returns an error if the project still has
+// observations — the caller must verify first.
+func (s *Store) PruneProject(project string) (*PruneResult, error) {
+	if project == "" {
+		return nil, fmt.Errorf("project name must not be empty")
+	}
+
+	// Safety check: refuse to prune if observations exist.
+	count, err := s.CountObservationsForProject(project)
+	if err != nil {
+		return nil, fmt.Errorf("count observations: %w", err)
+	}
+	if count > 0 {
+		return nil, fmt.Errorf("project %q still has %d observations — cannot prune", project, count)
+	}
+
+	result := &PruneResult{Project: project}
+
+	err = s.withTx(func(tx *sql.Tx) error {
+		res, err := s.execHook(tx, `DELETE FROM user_prompts WHERE project = ?`, project)
+		if err != nil {
+			return fmt.Errorf("prune prompts: %w", err)
+		}
+		result.PromptsDeleted, _ = res.RowsAffected()
+
+		res, err = s.execHook(tx, `DELETE FROM sessions WHERE project = ?`, project)
+		if err != nil {
+			return fmt.Errorf("prune sessions: %w", err)
+		}
+		result.SessionsDeleted, _ = res.RowsAffected()
+
 		return nil
 	})
 	if err != nil {
@@ -2918,6 +3222,30 @@ func normalizeScope(scope string) string {
 	return "project"
 }
 
+// NormalizeProject applies canonical project name normalization:
+// lowercase + trim whitespace + collapse consecutive hyphens/underscores.
+// Returns the normalized name and a warning message if the name was changed
+// (empty string if no change was needed).
+// Exported so MCP and CLI handlers can surface the warning to users.
+func NormalizeProject(project string) (normalized string, warning string) {
+	if project == "" {
+		return "", ""
+	}
+	n := strings.TrimSpace(strings.ToLower(project))
+	// Collapse multiple consecutive hyphens
+	for strings.Contains(n, "--") {
+		n = strings.ReplaceAll(n, "--", "-")
+	}
+	// Collapse multiple consecutive underscores
+	for strings.Contains(n, "__") {
+		n = strings.ReplaceAll(n, "__", "_")
+	}
+	if n == project {
+		return n, ""
+	}
+	return n, fmt.Sprintf("⚠️ Project name normalized: %q → %q", project, n)
+}
+
 // SuggestTopicKey generates a stable topic key suggestion from type/title/content.
 // It infers a topic family (e.g. architecture/*, bug/*) and then appends
 // a normalized segment from title/content for stable cross-session keys.
@@ -3204,6 +3532,9 @@ func cleanMarkdown(text string) string {
 // PassiveCapture extracts learnings from text and saves them as observations.
 // It deduplicates against existing observations using content hash matching.
 func (s *Store) PassiveCapture(p PassiveCaptureParams) (*PassiveCaptureResult, error) {
+	// Normalize project name before storing
+	p.Project, _ = NormalizeProject(p.Project)
+
 	result := &PassiveCaptureResult{}
 
 	learnings := ExtractLearnings(p.Content)

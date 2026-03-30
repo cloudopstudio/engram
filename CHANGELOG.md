@@ -20,4 +20,9 @@ Breaking changes are always marked with a `type:breaking-change` label and docum
 
 <!-- Changes that are merged but not yet released are tracked here until the next tag. -->
 
-_No unreleased changes at this time._
+- **feat(project):** add project name auto-detection via git remote and normalization (lowercase + trim + collapse) on all read/write paths
+- **feat(cli):** add `engram projects list|consolidate|prune` commands for project hygiene
+- **feat(mcp):** add `mem_merge_projects` tool for agent-driven project consolidation
+- **feat(mcp):** auto-detect project at MCP startup via `--project` flag, `ENGRAM_PROJECT` env, or git remote
+- **feat(mcp):** similar-project warnings when saving to a new project that resembles an existing one
+- **fix(sync):** use git remote detection instead of `filepath.Base(cwd)` for project name

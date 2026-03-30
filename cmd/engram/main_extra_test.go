@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/mcp"
 	engramsrv "github.com/Gentleman-Programming/engram/internal/server"
 	"github.com/Gentleman-Programming/engram/internal/setup"
 	"github.com/Gentleman-Programming/engram/internal/store"
@@ -938,10 +939,13 @@ func TestCmdMCP(t *testing.T) {
 		}
 	}
 
-	t.Run("no tools filter uses newMCPServer", func(t *testing.T) {
+	t.Run("no tools filter uses newMCPServerWithConfig with nil allowlist", func(t *testing.T) {
 		called := false
-		newMCPServer = func(s *store.Store) *mcpserver.MCPServer {
+		newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
 			called = true
+			if allowlist != nil {
+				t.Errorf("expected nil allowlist for no tools filter, got %v", allowlist)
+			}
 			return mcpserver.NewMCPServer("test", "0")
 		}
 		withArgs(t, "engram", "mcp")
@@ -950,13 +954,13 @@ func TestCmdMCP(t *testing.T) {
 			t.Fatalf("expected clean run, got panic=%v stderr=%q", recovered, stderr)
 		}
 		if !called {
-			t.Fatal("expected newMCPServer to be called")
+			t.Fatal("expected newMCPServerWithConfig to be called")
 		}
 	})
 
-	t.Run("--tools flag uses newMCPServerWithTools", func(t *testing.T) {
+	t.Run("--tools flag uses newMCPServerWithConfig with non-nil allowlist", func(t *testing.T) {
 		var gotAllowlist map[string]bool
-		newMCPServerWithTools = func(s *store.Store, allowlist map[string]bool) *mcpserver.MCPServer {
+		newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
 			gotAllowlist = allowlist
 			return mcpserver.NewMCPServer("test", "0")
 		}
@@ -966,13 +970,13 @@ func TestCmdMCP(t *testing.T) {
 			t.Fatalf("expected clean run, got panic=%v stderr=%q", recovered, stderr)
 		}
 		if gotAllowlist == nil {
-			t.Fatal("expected newMCPServerWithTools to be called with non-nil allowlist")
+			t.Fatal("expected newMCPServerWithConfig to be called with non-nil allowlist")
 		}
 	})
 
-	t.Run("--tools as separate arg uses newMCPServerWithTools", func(t *testing.T) {
+	t.Run("--tools as separate arg uses newMCPServerWithConfig with non-nil allowlist", func(t *testing.T) {
 		var gotAllowlist map[string]bool
-		newMCPServerWithTools = func(s *store.Store, allowlist map[string]bool) *mcpserver.MCPServer {
+		newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
 			gotAllowlist = allowlist
 			return mcpserver.NewMCPServer("test", "0")
 		}
@@ -982,7 +986,7 @@ func TestCmdMCP(t *testing.T) {
 			t.Fatalf("expected clean run, got panic=%v stderr=%q", recovered, stderr)
 		}
 		if gotAllowlist == nil {
-			t.Fatal("expected newMCPServerWithTools to be called with non-nil allowlist")
+			t.Fatal("expected newMCPServerWithConfig to be called with non-nil allowlist")
 		}
 	})
 

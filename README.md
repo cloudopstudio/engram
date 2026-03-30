@@ -85,6 +85,8 @@ Full details on session lifecycle, topic keys, and memory hygiene → [docs/ARCH
 | `mem_stats` | Memory statistics |
 | `mem_session_start` | Register session start |
 | `mem_session_end` | Mark session complete |
+| `mem_capture_passive` | Extract learnings from text output |
+| `mem_merge_projects` | Merge project name variants (admin) |
 
 Full tool reference → [docs/ARCHITECTURE.md#mcp-tools](docs/ARCHITECTURE.md#mcp-tools)
 
@@ -122,7 +124,7 @@ Full sync documentation → [DOCS.md](DOCS.md)
 |---------|-------------|
 | `engram setup [agent]` | Install agent integration |
 | `engram serve [port]` | Start HTTP API (default: 7437) |
-| `engram mcp` | Start MCP server (stdio) |
+| `engram mcp` | Start MCP server (stdio). Accepts `--project` or `ENGRAM_PROJECT` |
 | `engram tui` | Launch terminal UI |
 | `engram search <query>` | Search memories |
 | `engram save <title> <msg>` | Save a memory |
@@ -132,6 +134,9 @@ Full sync documentation → [DOCS.md](DOCS.md)
 | `engram export [file]` | Export to JSON |
 | `engram import <file>` | Import from JSON |
 | `engram sync` | Git sync export |
+| `engram projects list` | Show all projects with observation/session/prompt counts |
+| `engram projects consolidate` | Interactive merge of similar project names (`--all`, `--dry-run`) |
+| `engram projects prune` | Remove projects with 0 observations (`--dry-run`) |
 | `engram version` | Show version |
 
 ## Documentation

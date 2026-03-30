@@ -2862,7 +2862,8 @@ func TestCreateSessionUpsertsEmptyProjectAndDirectory(t *testing.T) {
 		t.Fatalf("create session: %v", err)
 	}
 
-	// Second call with real project/directory should fill in the blanks
+	// Second call with real project/directory should fill in the blanks.
+	// Project names are normalized to lowercase, so "projectA" becomes "projecta".
 	if err := s.CreateSession("sess-upsert", "projectA", "/tmp/a"); err != nil {
 		t.Fatalf("upsert session: %v", err)
 	}
@@ -2871,8 +2872,8 @@ func TestCreateSessionUpsertsEmptyProjectAndDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get session: %v", err)
 	}
-	if sess.Project != "projectA" {
-		t.Fatalf("expected project=projectA after upsert, got %q", sess.Project)
+	if sess.Project != "projecta" {
+		t.Fatalf("expected project=projecta after upsert (normalized), got %q", sess.Project)
 	}
 	if sess.Directory != "/tmp/a" {
 		t.Fatalf("expected directory=/tmp/a after upsert, got %q", sess.Directory)
@@ -2882,7 +2883,7 @@ func TestCreateSessionUpsertsEmptyProjectAndDirectory(t *testing.T) {
 func TestCreateSessionDoesNotOverwriteExistingProject(t *testing.T) {
 	s := newTestStore(t)
 
-	// Create session with project A
+	// Create session with project A (normalized to "projecta")
 	if err := s.CreateSession("sess-preserve", "projectA", "/tmp/a"); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -2896,8 +2897,9 @@ func TestCreateSessionDoesNotOverwriteExistingProject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get session: %v", err)
 	}
-	if sess.Project != "projectA" {
-		t.Fatalf("expected project=projectA (preserved), got %q", sess.Project)
+	// Project names are normalized to lowercase, so "projectA" is stored as "projecta"
+	if sess.Project != "projecta" {
+		t.Fatalf("expected project=projecta (preserved, normalized), got %q", sess.Project)
 	}
 	if sess.Directory != "/tmp/a" {
 		t.Fatalf("expected directory=/tmp/a (preserved), got %q", sess.Directory)
@@ -4005,5 +4007,437 @@ func TestMigrateProjectIdempotent(t *testing.T) {
 	}
 	if r2.Migrated {
 		t.Fatal("second migration should be a no-op")
+	}
+}
+
+// ─── Phase 2: project-name-drift — NormalizeProject, ListProjectNames,
+//              ListProjectsWithStats, MergeProjects tests ─────────────────────
+
+func TestNormalizeProjectFunction(t *testing.T) {
+	tests := []struct {
+		input       string
+		wantName    string
+		wantWarning bool
+	}{
+		{"engram", "engram", false},
+		{"Engram", "engram", true},
+		{"ENGRAM", "engram", true},
+		{"  engram  ", "engram", true},
+		{"Engram-Memory", "engram-memory", true},
+		{"engram--memory", "engram-memory", true},
+		{"engram__memory", "engram_memory", true},
+		{"", "", false},
+		{"already-lower", "already-lower", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got, warning := NormalizeProject(tc.input)
+			if got != tc.wantName {
+				t.Errorf("NormalizeProject(%q) name = %q, want %q", tc.input, got, tc.wantName)
+			}
+			if tc.wantWarning && warning == "" {
+				t.Errorf("NormalizeProject(%q) expected a warning, got empty string", tc.input)
+			}
+			if !tc.wantWarning && warning != "" {
+				t.Errorf("NormalizeProject(%q) expected no warning, got %q", tc.input, warning)
+			}
+		})
+	}
+}
+
+func TestAddObservationNormalizesProject(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Save with mixed-case project name
+	id, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Normalize test",
+		Content:   "This should be stored under lowercase project",
+		Project:   "Engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	obs, err := s.GetObservation(id)
+	if err != nil {
+		t.Fatalf("GetObservation: %v", err)
+	}
+
+	// Stored project should be normalized to lowercase
+	if obs.Project == nil || *obs.Project != "engram" {
+		got := "<nil>"
+		if obs.Project != nil {
+			got = *obs.Project
+		}
+		t.Errorf("stored project = %q, want \"engram\"", got)
+	}
+}
+
+func TestSearchNormalizesProjectFilter(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Store observation under already-lowercase project
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Search normalize test",
+		Content:   "content for project filter normalization",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	// Search with UPPERCASE project filter — should still find the record
+	results, err := s.Search("normalize test", SearchOptions{
+		Project: "Engram", // intentionally mixed-case
+		Limit:   10,
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+
+	if len(results) == 0 {
+		t.Fatalf("expected ≥1 result when searching with normalized project filter, got 0")
+	}
+}
+
+func TestRecentObservationsNormalizesProjectFilter(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "engram", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Recent obs test",
+		Content:   "some content",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	// Query with uppercase project name
+	obs, err := s.RecentObservations("ENGRAM", "", 10)
+	if err != nil {
+		t.Fatalf("RecentObservations: %v", err)
+	}
+	if len(obs) == 0 {
+		t.Fatalf("expected ≥1 result with normalized project filter, got 0")
+	}
+}
+
+func TestCreateSessionNormalizesProject(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s-norm", "MyProject", "/tmp"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	sess, err := s.GetSession("s-norm")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.Project != "myproject" {
+		t.Errorf("expected project=myproject (normalized), got %q", sess.Project)
+	}
+}
+
+func TestListProjectNames(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "alpha", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := s.CreateSession("s2", "beta", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	for _, proj := range []string{"alpha", "alpha", "beta", "gamma"} {
+		_, err := s.AddObservation(AddObservationParams{
+			SessionID: "s1",
+			Type:      "decision",
+			Title:     "test " + proj,
+			Content:   "content for " + proj,
+			Project:   proj,
+			Scope:     "project",
+		})
+		if err != nil {
+			t.Fatalf("AddObservation: %v", err)
+		}
+	}
+
+	names, err := s.ListProjectNames()
+	if err != nil {
+		t.Fatalf("ListProjectNames: %v", err)
+	}
+
+	// Should return distinct names: alpha, beta, gamma
+	want := map[string]bool{"alpha": true, "beta": true, "gamma": true}
+	for _, n := range names {
+		if !want[n] {
+			t.Errorf("unexpected project name %q in results", n)
+		}
+		delete(want, n)
+	}
+	if len(want) > 0 {
+		t.Errorf("missing project names: %v", want)
+	}
+}
+
+func TestListProjectsWithStats(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "proj-a", "/work/a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if err := s.CreateSession("s2", "proj-b", "/work/b"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Add 3 observations to proj-a
+	for i := 0; i < 3; i++ {
+		_, err := s.AddObservation(AddObservationParams{
+			SessionID: "s1",
+			Type:      "decision",
+			Title:     "obs a",
+			Content:   strings.Repeat("x", i+1), // unique content per obs
+			Project:   "proj-a",
+			Scope:     "project",
+		})
+		if err != nil {
+			t.Fatalf("AddObservation proj-a: %v", err)
+		}
+	}
+
+	// Add 1 observation to proj-b
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "s2",
+		Type:      "decision",
+		Title:     "obs b",
+		Content:   "content for proj-b",
+		Project:   "proj-b",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation proj-b: %v", err)
+	}
+
+	stats, err := s.ListProjectsWithStats()
+	if err != nil {
+		t.Fatalf("ListProjectsWithStats: %v", err)
+	}
+
+	if len(stats) < 2 {
+		t.Fatalf("expected ≥2 project stats, got %d", len(stats))
+	}
+
+	// Find proj-a and proj-b in results
+	statsMap := make(map[string]ProjectStats)
+	for _, ps := range stats {
+		statsMap[ps.Name] = ps
+	}
+
+	if a, ok := statsMap["proj-a"]; !ok {
+		t.Error("proj-a not in ListProjectsWithStats results")
+	} else {
+		if a.ObservationCount != 3 {
+			t.Errorf("proj-a: expected 3 observations, got %d", a.ObservationCount)
+		}
+		if a.SessionCount != 1 {
+			t.Errorf("proj-a: expected 1 session, got %d", a.SessionCount)
+		}
+	}
+
+	if b, ok := statsMap["proj-b"]; !ok {
+		t.Error("proj-b not in ListProjectsWithStats results")
+	} else {
+		if b.ObservationCount != 1 {
+			t.Errorf("proj-b: expected 1 observation, got %d", b.ObservationCount)
+		}
+	}
+
+	// Results should be sorted by observation count descending
+	if stats[0].Name != "proj-a" {
+		t.Errorf("expected proj-a first (most observations), got %q", stats[0].Name)
+	}
+}
+
+func TestMergeProjects(t *testing.T) {
+	s := newTestStore(t)
+
+	// Set up three source projects
+	sources := []string{"engram", "Engram", "engram-memory"}
+	canonical := "engram"
+
+	if err := s.CreateSession("s1", "engram", "/work"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Add observations to each source
+	for _, src := range []string{"engram", "engram-memory"} {
+		for i := 0; i < 2; i++ {
+			_, err := s.AddObservation(AddObservationParams{
+				SessionID: "s1",
+				Type:      "decision",
+				Title:     "obs from " + src,
+				Content:   strings.Repeat(src, i+1),
+				Project:   src,
+				Scope:     "project",
+			})
+			if err != nil {
+				t.Fatalf("AddObservation %s: %v", src, err)
+			}
+		}
+	}
+
+	result, err := s.MergeProjects(sources, canonical)
+	if err != nil {
+		t.Fatalf("MergeProjects: %v", err)
+	}
+
+	if result.Canonical != "engram" {
+		t.Errorf("canonical = %q, want \"engram\"", result.Canonical)
+	}
+
+	// "Engram" normalizes to "engram" (same as canonical) → skipped
+	// "engram-memory" is different → merged
+	// Only "engram-memory" should appear in SourcesMerged (and possibly "engram" if it had records,
+	// but it equals canonical after normalization → skipped)
+	for _, merged := range result.SourcesMerged {
+		if merged == "engram" {
+			t.Error("canonical 'engram' should not appear in SourcesMerged")
+		}
+	}
+
+	// All records from engram-memory should now be under "engram"
+	obs, err := s.RecentObservations("engram", "", 20)
+	if err != nil {
+		t.Fatalf("RecentObservations: %v", err)
+	}
+	if len(obs) < 4 {
+		t.Errorf("expected ≥4 observations under 'engram' after merge, got %d", len(obs))
+	}
+
+	// engram-memory should have 0 observations
+	obsMerged, err := s.RecentObservations("engram-memory", "", 10)
+	if err != nil {
+		t.Fatalf("RecentObservations engram-memory: %v", err)
+	}
+	if len(obsMerged) != 0 {
+		t.Errorf("expected 0 observations under 'engram-memory' after merge, got %d", len(obsMerged))
+	}
+}
+
+func TestMergeProjectsIdempotent(t *testing.T) {
+	s := newTestStore(t)
+
+	// Merge a nonexistent source — should not error
+	result, err := s.MergeProjects([]string{"ghost-project"}, "engram")
+	if err != nil {
+		t.Fatalf("MergeProjects with nonexistent source: %v", err)
+	}
+	if result.ObservationsUpdated != 0 {
+		t.Errorf("expected 0 observations updated for nonexistent source, got %d", result.ObservationsUpdated)
+	}
+}
+
+func TestMergeProjectsCanonicalInSources(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "engram", "/work"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Put some obs under "engram"
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "existing",
+		Content:   "existing observation",
+		Project:   "engram",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	// Sources include the canonical itself — should be silently skipped
+	result, err := s.MergeProjects([]string{"engram", "Engram"}, "engram")
+	if err != nil {
+		t.Fatalf("MergeProjects: %v", err)
+	}
+
+	// Nothing should have been changed (engram and Engram both normalize to "engram" = canonical)
+	if result.ObservationsUpdated != 0 {
+		t.Errorf("expected 0 observations updated when sources equal canonical, got %d", result.ObservationsUpdated)
+	}
+	if len(result.SourcesMerged) != 0 {
+		t.Errorf("expected empty SourcesMerged when all sources equal canonical, got %v", result.SourcesMerged)
+	}
+}
+
+func TestCountObservationsForProject(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "alpha", "/work/alpha"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// No observations yet — count should be 0
+	count, err := s.CountObservationsForProject("alpha")
+	if err != nil {
+		t.Fatalf("CountObservationsForProject: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0, got %d", count)
+	}
+
+	// Add two observations
+	for i := 0; i < 2; i++ {
+		if _, err := s.AddObservation(AddObservationParams{
+			SessionID: "s1",
+			Type:      "decision",
+			Title:     "obs " + string(rune('A'+i)),
+			Content:   "unique content that is definitely unique " + string(rune('A'+i)),
+			Project:   "alpha",
+			Scope:     "project",
+		}); err != nil {
+			t.Fatalf("AddObservation: %v", err)
+		}
+	}
+
+	count, err = s.CountObservationsForProject("alpha")
+	if err != nil {
+		t.Fatalf("CountObservationsForProject: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2, got %d", count)
+	}
+
+	// Different project should return 0
+	count, err = s.CountObservationsForProject("beta")
+	if err != nil {
+		t.Fatalf("CountObservationsForProject for beta: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 for beta, got %d", count)
 	}
 }

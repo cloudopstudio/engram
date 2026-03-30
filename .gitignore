@@ -30,3 +30,5 @@ node_modules/
 .github/skills
 .gemini/skills
 engram-pg
+engram-dev
+.atl/

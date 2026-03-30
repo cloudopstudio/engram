@@ -66,6 +66,8 @@ Next session starts → Previous session context is injected automatically
 | `mem_stats` | Memory system statistics |
 | `mem_session_start` | Register a session start |
 | `mem_session_end` | Mark a session as completed |
+| `mem_capture_passive` | Extract learnings from text output |
+| `mem_merge_projects` | Merge project name variants into canonical name (admin) |
 
 ---
 
@@ -122,8 +124,10 @@ engram/
 ├── internal/
 │   ├── store/store.go              # Core: SQLite + FTS5 + all data ops
 │   ├── server/server.go            # HTTP REST API (port 7437)
-│   ├── mcp/mcp.go                  # MCP stdio server (13 tools)
+│   ├── mcp/mcp.go                  # MCP stdio server (15 tools)
 │   ├── setup/setup.go              # Agent plugin installer (go:embed)
+│   ├── project/                     # Project name detection + similarity matching
+│   │   └── project.go              # DetectProject, FindSimilar, Levenshtein
 │   ├── sync/sync.go                # Git sync: manifest + compressed chunks
 │   └── tui/                        # Bubbletea terminal UI
 │       ├── model.go                # Screen constants, Model, Init()
@@ -165,5 +169,8 @@ engram export [file]      Export all memories to JSON
 engram import <file>      Import memories from JSON
 engram sync               Export new memories as compressed chunk to .engram/
 engram sync --all         Export ALL projects (ignore directory-based filter)
+engram projects list      Show all projects with obs/session/prompt counts
+engram projects consolidate  Interactive merge of similar project names [--all] [--dry-run]
+engram projects prune     Remove projects with 0 observations [--dry-run]
 engram version            Show version
 ```
