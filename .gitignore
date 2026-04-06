@@ -32,3 +32,4 @@ node_modules/
 engram-pg
 engram-dev
 .atl/
+.release-notes-beta.md
