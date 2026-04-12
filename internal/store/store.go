@@ -1261,6 +1261,9 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 // It returns ErrSessionHasObservations if the session has any observations
 // (including soft-deleted ones) to prevent orphaned rows.
 // It returns ErrSessionNotFound if no session with that ID exists.
+//
+// Note: this delete is local-only. It does not enqueue a sync mutation, so
+// remote stores (if autosync is enabled) will not be affected.
 func (s *Store) DeleteSession(id string) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		// Count ALL observations for the session, including soft-deleted ones,
@@ -1296,6 +1299,9 @@ func (s *Store) DeleteSession(id string) error {
 
 // DeletePrompt hard-deletes a single prompt by ID.
 // It returns ErrPromptNotFound if no prompt with that ID exists.
+//
+// Note: this delete is local-only. It does not enqueue a sync mutation, so
+// remote stores (if autosync is enabled) will not be affected.
 func (s *Store) DeletePrompt(id int64) error {
 	res, err := s.execHook(s.db, `DELETE FROM user_prompts WHERE id = ?`, id)
 	if err != nil {
