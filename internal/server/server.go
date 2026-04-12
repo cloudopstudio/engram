@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/store"
@@ -101,6 +102,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /sessions", s.handleCreateSession)
 	s.mux.HandleFunc("POST /sessions/{id}/end", s.handleEndSession)
 	s.mux.HandleFunc("GET /sessions/recent", s.handleRecentSessions)
+	s.mux.HandleFunc("DELETE /sessions/{id}", s.handleDeleteSession)
 
 	// Observations
 	s.mux.HandleFunc("POST /observations", s.handleAddObservation)
@@ -120,6 +122,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /prompts", s.handleAddPrompt)
 	s.mux.HandleFunc("GET /prompts/recent", s.handleRecentPrompts)
 	s.mux.HandleFunc("GET /prompts/search", s.handleSearchPrompts)
+	s.mux.HandleFunc("DELETE /prompts/{id}", s.handleDeletePrompt)
 
 	// Context
 	s.mux.HandleFunc("GET /context", s.handleContext)
@@ -428,6 +431,51 @@ func (s *Server) handleSearchPrompts(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, prompts)
 }
 
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		jsonError(w, http.StatusBadRequest, "session id is required")
+		return
+	}
+
+	if err := s.store.DeleteSession(id); err != nil {
+		// Surface "has observations" as 409 Conflict, everything else as 500/404.
+		msg := err.Error()
+		if contains(msg, "has") && contains(msg, "observation") {
+			jsonError(w, http.StatusConflict, msg)
+			return
+		}
+		if contains(msg, "not found") {
+			jsonError(w, http.StatusNotFound, msg)
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, msg)
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]string{"id": id, "status": "deleted"})
+}
+
+func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid prompt id")
+		return
+	}
+
+	if err := s.store.DeletePrompt(id); err != nil {
+		if contains(err.Error(), "not found") {
+			jsonError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{"id": id, "status": "deleted"})
+}
+
 // ─── Export / Import ─────────────────────────────────────────────────────────
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
@@ -596,4 +644,8 @@ func queryBool(r *http.Request, key string, defaultVal bool) bool {
 		return defaultVal
 	}
 	return b
+}
+
+func contains(s, substr string) bool {
+	return strings.Contains(s, substr)
 }

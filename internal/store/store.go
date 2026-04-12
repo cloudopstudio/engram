@@ -1247,6 +1247,51 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 	return results, rows.Err()
 }
 
+// ─── Delete Session ──────────────────────────────────────────────────────────
+
+// DeleteSession removes a session hard. It returns an error if the session has
+// any non-deleted observations — callers should only delete empty sessions.
+func (s *Store) DeleteSession(id string) error {
+	var count int
+	row := s.db.QueryRow(
+		`SELECT COUNT(*) FROM observations WHERE session_id = ? AND deleted_at IS NULL`, id,
+	)
+	if err := row.Scan(&count); err != nil {
+		return fmt.Errorf("delete session: count observations: %w", err)
+	}
+	if count > 0 {
+		return fmt.Errorf("delete session: session %q has %d observation(s); delete them first", id, count)
+	}
+	// Also delete any prompts belonging to the session and the session row itself.
+	if _, err := s.db.Exec(`DELETE FROM user_prompts WHERE session_id = ?`, id); err != nil {
+		return fmt.Errorf("delete session: remove prompts: %w", err)
+	}
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete session: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("delete session: session %q not found", id)
+	}
+	return nil
+}
+
+// ─── Delete Prompt ───────────────────────────────────────────────────────────
+
+// DeletePrompt removes a single prompt by ID (hard delete).
+func (s *Store) DeletePrompt(id int64) error {
+	res, err := s.db.Exec(`DELETE FROM user_prompts WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete prompt: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("delete prompt: prompt #%d not found", id)
+	}
+	return nil
+}
+
 // ─── Get Single Observation ──────────────────────────────────────────────────
 
 func (s *Store) GetObservation(id int64) (*Observation, error) {
