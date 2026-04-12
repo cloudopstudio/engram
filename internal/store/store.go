@@ -27,6 +27,11 @@ import (
 
 var openDB = sql.Open
 
+// sqliteConstraintForeignKey is the extended SQLite result code for a foreign-key
+// constraint violation (SQLITE_CONSTRAINT_FOREIGNKEY = 787).
+// See https://www.sqlite.org/rescode.html#constraint_foreignkey
+const sqliteConstraintForeignKey = 787
+
 // Sentinel errors returned by delete operations so callers can use errors.Is.
 var (
 	ErrSessionNotFound        = errors.New("session not found")
@@ -1271,11 +1276,17 @@ func (s *Store) DeleteSession(id string) error {
 		// Count ALL observations for the session, including soft-deleted ones,
 		// because the FK constraint on observations.session_id has no ON DELETE CASCADE.
 		var count int
-		if err := tx.QueryRow(
-			`SELECT COUNT(*) FROM observations WHERE session_id = ?`, id,
-		).Scan(&count); err != nil {
+		rows, err := s.queryItHook(tx, `SELECT COUNT(*) FROM observations WHERE session_id = ?`, id)
+		if err != nil {
 			return fmt.Errorf("delete session: count observations: %w", err)
 		}
+		if rows.Next() {
+			if err := rows.Scan(&count); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("delete session: count observations: %w", err)
+			}
+		}
+		_ = rows.Close()
 		if count > 0 {
 			return fmt.Errorf("%w: session %q has %d observation(s)", ErrSessionHasObservations, id, count)
 		}
@@ -1287,7 +1298,7 @@ func (s *Store) DeleteSession(id string) error {
 		res, err := s.execHook(tx, `DELETE FROM sessions WHERE id = ?`, id)
 		if err != nil {
 			var sqliteErr *sqlite.Error
-			if errors.As(err, &sqliteErr) && sqliteErr.Code() == 787 { // SQLITE_CONSTRAINT_FOREIGNKEY
+			if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqliteConstraintForeignKey {
 				return fmt.Errorf("%w: session %q has observation(s)", ErrSessionHasObservations, id)
 			}
 			return fmt.Errorf("delete session: %w", err)

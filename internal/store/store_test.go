@@ -4556,76 +4556,76 @@ func TestDeleteSession_DeletesPromptsAlso(t *testing.T) {
 }
 
 func TestDeleteSession_FKConstraintFallback(t *testing.T) {
-	// Simulate the race condition where a concurrent goroutine inserts an
-	// observation between the COUNT query and the DELETE statement inside
-	// withTx. Because SQLite (WAL mode) only allows one writer at a time, we
-	// use a channel to synchronise: the racer waits until withTx has already
-	// passed the COUNT check (count == 0), then inserts the observation so the
-	// subsequent DELETE FROM sessions fails with a real FK constraint error.
-	// DeleteSession must translate that error into ErrSessionHasObservations.
+	// Verify that a SQLite FK constraint error on the DELETE FROM sessions
+	// statement is translated into ErrSessionHasObservations.
+	//
+	// SQLite is a single-writer database, so it is not possible to inject an
+	// observation from a concurrent connection while the transaction already
+	// holds the write lock. Instead we simulate the race by:
+	//   1. Pre-inserting an observation directly (bypassing store logic).
+	//   2. Mocking the queryIt hook so the COUNT query returns 0 (as if the
+	//      observation arrived after the count).
+	//   3. Letting DeleteSession proceed; the DELETE FROM sessions then fails
+	//      with a real SQLite FK constraint error (SQLITE_CONSTRAINT_FOREIGNKEY).
 	s := newTestStore(t)
 
 	if err := s.CreateSession("sess-race", "proj", "/tmp"); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 
-	// racerReady is closed by the exec hook right before the DELETE so the
-	// racer goroutine knows it can start its insertion.
-	racerReady := make(chan struct{})
-	// racerDone is closed by the racer goroutine once the insertion is done.
-	racerDone := make(chan struct{})
+	// Insert the observation directly, bypassing the store COUNT guard.
+	if _, err := s.db.Exec(`
+		INSERT INTO observations
+			(session_id, type, title, content, project, scope, created_at, updated_at, sync_id, duplicate_count, revision_count)
+		VALUES
+			('sess-race', 'decision', 'race obs', 'content', 'proj', 'project',
+			 datetime('now'), datetime('now'), 'sync-race-1', 1, 1)`); err != nil {
+		t.Fatalf("pre-insert observation: %v", err)
+	}
 
-	origExec := s.hooks.exec
-	injected := false
-	s.hooks.exec = func(db execer, query string, args ...any) (sql.Result, error) {
-		if !injected && strings.Contains(query, "DELETE FROM sessions") {
-			injected = true
-			close(racerReady) // signal the racer to start
-			<-racerDone       // wait for the racer to finish inserting
+	// Mock queryIt so the COUNT returns 0, simulating the race window where the
+	// observation did not exist when the count ran.
+	origQueryIt := s.hooks.queryIt
+	faked := false
+	s.hooks.queryIt = func(db queryer, query string, args ...any) (rowScanner, error) {
+		if !faked && strings.Contains(query, "COUNT(*)") && strings.Contains(query, "observations WHERE session_id") {
+			faked = true
+			// Return a scanner that always yields count = 0.
+			return &fakeCountScanner{}, nil
 		}
-		return origExec(db, query, args...)
+		return origQueryIt(db, query, args...)
 	}
 	defer func() { s.hooks = defaultStoreHooks() }()
 
-	// Racer goroutine: opens a second connection, waits for the signal, then
-	// inserts an observation to cause a FK violation on the pending DELETE.
-	dbPath := filepath.Join(s.cfg.DataDir, "engram.db")
-	go func() {
-		<-racerReady
-		db2, err := sql.Open("sqlite", dbPath)
-		if err != nil {
-			t.Errorf("racer: open db2: %v", err)
-			close(racerDone)
-			return
-		}
-		defer db2.Close()
-		if _, err := db2.Exec("PRAGMA journal_mode = WAL"); err != nil {
-			t.Errorf("racer: pragma: %v", err)
-		}
-		// The insertion may itself be delayed by busy_timeout while withTx
-		// holds the write lock; it will eventually succeed once withTx commits
-		// or rolls back. We capture the error but do not fail on SQLITE_BUSY —
-		// the important assertion is on the DeleteSession return value below.
-		_, _ = db2.Exec(`
-			INSERT INTO observations
-				(session_id, type, title, content, project, scope, created_at, updated_at, sync_id, duplicate_count, revision_count)
-			VALUES
-				('sess-race', 'decision', 'race obs', 'content', 'proj', 'project',
-				 datetime('now'), datetime('now'), 'sync-race-1', 1, 1)`)
-		close(racerDone)
-	}()
-
 	err := s.DeleteSession("sess-race")
-	// Two outcomes are acceptable:
-	//   1. The racer inserted before the DELETE committed → FK constraint →
-	//      ErrSessionHasObservations (the path we are hardening).
-	//   2. The racer lost the race and inserted after the rollback → the
-	//      session is gone, DeleteSession succeeds with nil.
-	// We only FAIL if we get an unexpected error type.
-	if err != nil && !errors.Is(err, ErrSessionHasObservations) {
-		t.Fatalf("expected nil or ErrSessionHasObservations, got: %v", err)
+	if !errors.Is(err, ErrSessionHasObservations) {
+		t.Fatalf("expected ErrSessionHasObservations from FK constraint, got: %v", err)
 	}
 }
+
+// fakeCountScanner is a rowScanner that yields a single row with value 0,
+// used to simulate a COUNT(*) result of zero.
+type fakeCountScanner struct {
+	done bool
+}
+
+func (f *fakeCountScanner) Next() bool {
+	if f.done {
+		return false
+	}
+	f.done = true
+	return true
+}
+func (f *fakeCountScanner) Scan(dest ...any) error {
+	if len(dest) > 0 {
+		if p, ok := dest[0].(*int); ok {
+			*p = 0
+		}
+	}
+	return nil
+}
+func (f *fakeCountScanner) Err() error   { return nil }
+func (f *fakeCountScanner) Close() error { return nil }
 
 // ─── DeletePrompt tests ──────────────────────────────────────────────────────
 
