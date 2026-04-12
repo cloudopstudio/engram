@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -413,5 +414,127 @@ func TestHandleStatsReturnsInternalServerErrorOnLoaderError(t *testing.T) {
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 stats response, got %d", rec.Code)
+	}
+}
+
+// ─── DELETE /sessions/{id} tests ─────────────────────────────────────────────
+
+func TestHandleDeleteSession_Success(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	// Create an empty session.
+	createReq := httptest.NewRequest(http.MethodPost, "/sessions",
+		strings.NewReader(`{"id":"sess-del","project":"proj"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	h.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating session, got %d", createRec.Code)
+	}
+
+	// Delete it.
+	delReq := httptest.NewRequest(http.MethodDelete, "/sessions/sess-del", nil)
+	delRec := httptest.NewRecorder()
+	h.ServeHTTP(delRec, delReq)
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 deleting empty session, got %d: %s", delRec.Code, delRec.Body.String())
+	}
+}
+
+func TestHandleDeleteSession_NotFound(t *testing.T) {
+	srv := New(newServerTestStore(t), 0)
+	h := srv.Handler()
+
+	req := httptest.NewRequest(http.MethodDelete, "/sessions/does-not-exist", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+}
+
+func TestHandleDeleteSession_HasObservations(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	// Create session + add an observation via the store directly.
+	if err := st.CreateSession("sess-obs", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := st.AddObservation(store.AddObservationParams{
+		SessionID: "sess-obs",
+		Type:      "decision",
+		Title:     "some obs",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/sessions/sess-obs", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when session has observations, got %d", rec.Code)
+	}
+}
+
+// ─── DELETE /prompts/{id} tests ───────────────────────────────────────────────
+
+func TestHandleDeletePrompt_Success(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	if err := st.CreateSession("sess-p", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	promptID, err := st.AddPrompt(store.AddPromptParams{
+		SessionID: "sess-p",
+		Content:   "delete me",
+		Project:   "proj",
+	})
+	if err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/prompts/%d", promptID), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 deleting prompt, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleDeletePrompt_NotFound(t *testing.T) {
+	srv := New(newServerTestStore(t), 0)
+	h := srv.Handler()
+
+	req := httptest.NewRequest(http.MethodDelete, "/prompts/999999", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+}
+
+func TestHandleDeletePrompt_BadID(t *testing.T) {
+	srv := New(newServerTestStore(t), 0)
+	h := srv.Handler()
+
+	req := httptest.NewRequest(http.MethodDelete, "/prompts/not-a-number", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid prompt id, got %d", rec.Code)
 	}
 }

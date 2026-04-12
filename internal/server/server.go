@@ -6,13 +6,13 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/store"
@@ -439,17 +439,14 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.store.DeleteSession(id); err != nil {
-		// Surface "has observations" as 409 Conflict, everything else as 500/404.
-		msg := err.Error()
-		if contains(msg, "has") && contains(msg, "observation") {
-			jsonError(w, http.StatusConflict, msg)
-			return
+		switch {
+		case errors.Is(err, store.ErrSessionHasObservations):
+			jsonError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, store.ErrSessionNotFound):
+			jsonError(w, http.StatusNotFound, err.Error())
+		default:
+			jsonError(w, http.StatusInternalServerError, err.Error())
 		}
-		if contains(msg, "not found") {
-			jsonError(w, http.StatusNotFound, msg)
-			return
-		}
-		jsonError(w, http.StatusInternalServerError, msg)
 		return
 	}
 
@@ -465,7 +462,7 @@ func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.store.DeletePrompt(id); err != nil {
-		if contains(err.Error(), "not found") {
+		if errors.Is(err, store.ErrPromptNotFound) {
 			jsonError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -644,8 +641,4 @@ func queryBool(r *http.Request, key string, defaultVal bool) bool {
 		return defaultVal
 	}
 	return b
-}
-
-func contains(s, substr string) bool {
-	return strings.Contains(s, substr)
 }

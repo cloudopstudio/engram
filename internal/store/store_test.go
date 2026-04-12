@@ -3684,6 +3684,25 @@ func TestEnqueueSyncMutationPopulatesProjectFromPromptPayload(t *testing.T) {
 }
 
 // ─── Phase 4: ListPendingSyncMutations enrollment filtering ──────────────────
+	})
+	if err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	var project string
+	err = s.db.QueryRow(
+		`SELECT project FROM sync_mutations WHERE entity = ? ORDER BY seq DESC LIMIT 1`,
+		SyncEntityPrompt,
+	).Scan(&project)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if project != "prompt-proj" {
+		t.Fatalf("expected project='prompt-proj', got %q", project)
+	}
+}
+
+// ─── Phase 4: ListPendingSyncMutations enrollment filtering ──────────────────
 
 func TestListPendingFiltersNonEnrolledProjects(t *testing.T) {
 	s := newTestStore(t)
@@ -4439,5 +4458,157 @@ func TestCountObservationsForProject(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("expected 0 for beta, got %d", count)
+	}
+}
+
+// ─── DeleteSession tests ─────────────────────────────────────────────────────
+
+func TestDeleteSession_EmptySession(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-empty", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	if err := s.DeleteSession("sess-empty"); err != nil {
+		t.Fatalf("expected no error deleting empty session, got: %v", err)
+	}
+
+	// Session should be gone.
+	sessions, err := s.RecentSessions("proj", 10)
+	if err != nil {
+		t.Fatalf("recent sessions: %v", err)
+	}
+	for _, ss := range sessions {
+		if ss.ID == "sess-empty" {
+			t.Fatal("expected session to be deleted but it still exists")
+		}
+	}
+}
+
+func TestDeleteSession_NotFound(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.DeleteSession("does-not-exist")
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound, got: %v", err)
+	}
+}
+
+func TestDeleteSession_HasActiveObservations(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-has-obs", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-has-obs",
+		Type:      "decision",
+		Title:     "some decision",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	err := s.DeleteSession("sess-has-obs")
+	if !errors.Is(err, ErrSessionHasObservations) {
+		t.Fatalf("expected ErrSessionHasObservations, got: %v", err)
+	}
+}
+
+func TestDeleteSession_HasSoftDeletedObservations(t *testing.T) {
+	// Even soft-deleted observations must block the session delete
+	// to avoid FK constraint violations.
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-soft", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-soft",
+		Type:      "decision",
+		Title:     "soft deleted obs",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if err := s.DeleteObservation(obsID, false); err != nil {
+		t.Fatalf("soft delete observation: %v", err)
+	}
+
+	err = s.DeleteSession("sess-soft")
+	if !errors.Is(err, ErrSessionHasObservations) {
+		t.Fatalf("expected ErrSessionHasObservations for soft-deleted obs, got: %v", err)
+	}
+}
+
+func TestDeleteSession_DeletesPromptsAlso(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-with-prompts", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{
+		SessionID: "sess-with-prompts",
+		Content:   "a prompt",
+		Project:   "proj",
+	}); err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	if err := s.DeleteSession("sess-with-prompts"); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+
+	prompts, err := s.RecentPrompts("proj", 10)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("expected prompts to be deleted with session, got %d", len(prompts))
+	}
+}
+
+// ─── DeletePrompt tests ──────────────────────────────────────────────────────
+
+func TestDeletePrompt_Success(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-p", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	id, err := s.AddPrompt(AddPromptParams{
+		SessionID: "sess-p",
+		Content:   "delete me",
+		Project:   "proj",
+	})
+	if err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	if err := s.DeletePrompt(id); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	prompts, err := s.RecentPrompts("proj", 10)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("expected prompt to be deleted, got %d", len(prompts))
+	}
+}
+
+func TestDeletePrompt_NotFound(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.DeletePrompt(999999)
+	if !errors.Is(err, ErrPromptNotFound) {
+		t.Fatalf("expected ErrPromptNotFound, got: %v", err)
 	}
 }

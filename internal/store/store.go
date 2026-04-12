@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,6 +26,13 @@ import (
 )
 
 var openDB = sql.Open
+
+// Sentinel errors returned by delete operations so callers can use errors.Is.
+var (
+	ErrSessionNotFound        = errors.New("session not found")
+	ErrSessionHasObservations = errors.New("session still has observations")
+	ErrPromptNotFound         = errors.New("prompt not found")
+)
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -1249,37 +1257,49 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 
 // ─── Delete Session ──────────────────────────────────────────────────────────
 
-// DeleteSession removes a session hard. It returns an error if the session has
-// any non-deleted observations — callers should only delete empty sessions.
+// DeleteSession hard-deletes a session and its prompts.
+// It returns ErrSessionHasObservations if the session has any observations
+// (including soft-deleted ones) to prevent orphaned rows.
+// It returns ErrSessionNotFound if no session with that ID exists.
 func (s *Store) DeleteSession(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("delete session: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Count ALL observations for the session, including soft-deleted ones,
+	// because the FK constraint on observations.session_id has no ON DELETE CASCADE.
 	var count int
-	row := s.db.QueryRow(
-		`SELECT COUNT(*) FROM observations WHERE session_id = ? AND deleted_at IS NULL`, id,
-	)
-	if err := row.Scan(&count); err != nil {
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM observations WHERE session_id = ?`, id,
+	).Scan(&count); err != nil {
 		return fmt.Errorf("delete session: count observations: %w", err)
 	}
 	if count > 0 {
-		return fmt.Errorf("delete session: session %q has %d observation(s); delete them first", id, count)
+		return fmt.Errorf("%w: session %q has %d observation(s)", ErrSessionHasObservations, id, count)
 	}
-	// Also delete any prompts belonging to the session and the session row itself.
-	if _, err := s.db.Exec(`DELETE FROM user_prompts WHERE session_id = ?`, id); err != nil {
+
+	if _, err := tx.Exec(`DELETE FROM user_prompts WHERE session_id = ?`, id); err != nil {
 		return fmt.Errorf("delete session: remove prompts: %w", err)
 	}
-	res, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)
+
+	res, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete session: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("delete session: session %q not found", id)
+		return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
 	}
-	return nil
+
+	return tx.Commit()
 }
 
 // ─── Delete Prompt ───────────────────────────────────────────────────────────
 
-// DeletePrompt removes a single prompt by ID (hard delete).
+// DeletePrompt hard-deletes a single prompt by ID.
+// It returns ErrPromptNotFound if no prompt with that ID exists.
 func (s *Store) DeletePrompt(id int64) error {
 	res, err := s.db.Exec(`DELETE FROM user_prompts WHERE id = ?`, id)
 	if err != nil {
@@ -1287,7 +1307,7 @@ func (s *Store) DeletePrompt(id int64) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("delete prompt: prompt #%d not found", id)
+		return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
 	}
 	return nil
 }
