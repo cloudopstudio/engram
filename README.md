@@ -150,3 +150,9 @@ MIT
 ---
 
 **Inspired by [claude-mem](https://github.com/thedotmack/claude-mem)** — but agent-agnostic, simpler, and built different.
+
+## Contributors
+
+<a href="https://github.com/Gentleman-Programming/engram/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Gentleman-Programming/engram" />
+</a>
