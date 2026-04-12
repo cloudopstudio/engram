@@ -68,27 +68,16 @@ That's it. No Node.js, no Python, no Docker. **One binary, one SQLite file.**
 
 Full details on session lifecycle, topic keys, and memory hygiene → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
-## MCP Tools
+## MCP Tools (15)
 
-| Tool | Purpose |
-|------|---------|
-| `mem_save` | Save observation |
-| `mem_update` | Update by ID |
-| `mem_delete` | Soft or hard delete |
-| `mem_suggest_topic_key` | Stable key for evolving topics |
-| `mem_search` | Full-text search |
-| `mem_session_summary` | End-of-session save |
-| `mem_context` | Recent session context |
-| `mem_timeline` | Chronological drill-in |
-| `mem_get_observation` | Full content by ID |
-| `mem_save_prompt` | Save user prompt |
-| `mem_stats` | Memory statistics |
-| `mem_session_start` | Register session start |
-| `mem_session_end` | Mark session complete |
-| `mem_capture_passive` | Extract learnings from text output |
-| `mem_merge_projects` | Merge project name variants (admin) |
+| Category | Tools |
+|----------|-------|
+| **Save & Update** | `mem_save`, `mem_update`, `mem_delete`, `mem_suggest_topic_key` |
+| **Search & Retrieve** | `mem_search`, `mem_context`, `mem_timeline`, `mem_get_observation` |
+| **Session Lifecycle** | `mem_session_start`, `mem_session_end`, `mem_session_summary` |
+| **Utilities** | `mem_save_prompt`, `mem_stats`, `mem_capture_passive`, `mem_merge_projects` |
 
-Full tool reference → [docs/ARCHITECTURE.md#mcp-tools](docs/ARCHITECTURE.md#mcp-tools)
+Full tool reference with parameters → [DOCS.md#mcp-tools-15-tools](DOCS.md#mcp-tools-15-tools)
 
 ## Terminal UI
 
@@ -124,7 +113,7 @@ Full sync documentation → [DOCS.md](DOCS.md)
 |---------|-------------|
 | `engram setup [agent]` | Install agent integration |
 | `engram serve [port]` | Start HTTP API (default: 7437) |
-| `engram mcp` | Start MCP server (stdio). Accepts `--project` or `ENGRAM_PROJECT` |
+| `engram mcp` | Start MCP server (stdio) |
 | `engram tui` | Launch terminal UI |
 | `engram search <query>` | Search memories |
 | `engram save <title> <msg>` | Save a memory |
@@ -133,12 +122,12 @@ Full sync documentation → [DOCS.md](DOCS.md)
 | `engram stats` | Memory statistics |
 | `engram export [file]` | Export to JSON |
 | `engram import <file>` | Import from JSON |
-| `engram sync` | Git sync export |
-| `engram projects list` | Show all projects with observation/session/prompt counts |
-| `engram projects consolidate` | Interactive merge of similar project names (`--all`, `--dry-run`) |
-| `engram projects prune` | Remove projects with 0 observations (`--dry-run`) |
-| `engram obsidian-export` | Export memories to Obsidian vault (beta) |
+| `engram sync` | Git sync export/import |
+| `engram projects list\|consolidate\|prune` | Manage project names |
+| `engram obsidian-export` | Export to Obsidian vault (beta) |
 | `engram version` | Show version |
+
+Full CLI with all flags → [docs/ARCHITECTURE.md#cli-reference](docs/ARCHITECTURE.md#cli-reference)
 
 ## Documentation
 

@@ -1,72 +1,36 @@
-# Engram
+[← Back to README](README.md)
+
+# Engram — Technical Reference
 
 **Persistent memory for AI coding agents**
 
-> *Engram* is a neuroscience term for the physical trace of a memory in the brain.
-
-## What is Engram?
-
-An agent-agnostic persistent memory system. A Go binary with SQLite + FTS5 full-text search, exposed via CLI, HTTP API, and MCP server. Thin adapter plugins connect it to specific agents (OpenCode, Claude Code, Cursor, Windsurf, etc.).
-
-**Why Go?** Single binary, cross-platform, no runtime dependencies. Uses `modernc.org/sqlite` (pure Go, no CGO).
-
-- **Module**: `github.com/Gentleman-Programming/engram`
+This is the complete technical reference for Engram. For getting started, see the [README](README.md). For per-agent setup, see [Agent Setup](docs/AGENT-SETUP.md).
 
 ---
 
-## Architecture
+## Quick Navigation
 
-The Go binary is the brain. Thin adapter plugins per-agent talk to it via HTTP or MCP stdio.
+| Section | What you'll find |
+|---------|-----------------|
+| [Database Schema](#database-schema) | Tables, FTS5, SQLite config |
+| [HTTP API](#http-api-endpoints) | All REST endpoints with request/response details |
+| [MCP Tools](#mcp-tools-15-tools) | Detailed reference for all 15 memory tools |
+| [Memory Protocol](#memory-protocol) | When/how agents should use the tools |
+| [Project Name Normalization](#project-name-normalization) | Auto-detection, normalization, similar-project warnings |
+| [Features](#features) | FTS5 search, timeline, privacy, git sync, compression |
+| [TUI](#terminal-ui-tui) | Screens, navigation, architecture |
+| [Running as a Service](#running-as-a-service) | systemd setup |
+| [Design Decisions](#design-decisions) | Why Go, why SQLite, why no auto-capture |
 
-```
-Agent (OpenCode/Claude Code/Cursor/etc.)
-    ↓ (plugin or MCP)
-Engram Go Binary
-    ↓
-SQLite + FTS5 (~/.engram/engram.db)
-```
+For other docs:
 
-Four interfaces:
-
-1. **CLI** — Direct terminal usage (`engram search`, `engram save`, etc.)
-2. **HTTP API** — REST API on port 7437 for plugins and integrations
-3. **MCP Server** — stdio transport for any MCP-compatible agent
-4. **TUI** — Interactive terminal UI for browsing memories (`engram tui`)
-
----
-
-## Project Structure
-
-```
-engram/
-├── cmd/engram/main.go              # CLI entrypoint — all commands
-├── internal/
-│   ├── store/store.go              # Core: SQLite + FTS5 + all data operations
-│   ├── server/server.go            # HTTP REST API server (port 7437)
-│   ├── mcp/mcp.go                  # MCP stdio server (15 tools)
-│   ├── setup/setup.go              # Agent plugin installer (go:embed)
-│   ├── project/                     # Project name detection + similarity matching
-│   │   └── project.go              # DetectProject, FindSimilar, Levenshtein
-│   ├── sync/sync.go                # Git sync: manifest + chunks (gzipped JSONL)
-│   └── tui/                        # Bubbletea terminal UI
-│       ├── model.go                # Screen constants, Model struct, Init(), custom messages
-│       ├── styles.go               # Lipgloss styles (Catppuccin Mocha palette)
-│       ├── update.go               # Update(), handleKeyPress(), per-screen handlers
-│       └── view.go                 # View(), per-screen renderers
-├── plugin/
-│   ├── opencode/engram.ts          # OpenCode adapter plugin
-│   └── claude-code/                # Claude Code plugin (hooks + skill)
-│       ├── .claude-plugin/plugin.json
-│       ├── .mcp.json
-│       ├── hooks/hooks.json
-│       ├── scripts/                # session-start, post-compaction, subagent-stop, session-stop
-│       └── skills/memory/SKILL.md
-├── skills/                         # Contributor AI skills (repo-wide standards)
-├── DOCS.md
-├── go.mod
-├── go.sum
-└── .gitignore
-```
+| Doc | Description |
+|-----|-------------|
+| [Installation](docs/INSTALLATION.md) | All install methods + platform support |
+| [Agent Setup](docs/AGENT-SETUP.md) | Per-agent configuration + compaction survival |
+| [Architecture](docs/ARCHITECTURE.md) | How it works, session lifecycle, CLI reference, project structure |
+| [Plugins](docs/PLUGINS.md) | OpenCode & Claude Code plugin details |
+| [Comparison](docs/COMPARISON.md) | Why Engram vs claude-mem |
 
 ---
 
@@ -87,125 +51,6 @@ engram/
 - Busy timeout 5000ms
 - Synchronous NORMAL
 - Foreign keys ON
-
----
-
-## CLI Commands
-
-```
-engram serve [port]       Start HTTP API server (default: 7437)
-engram mcp                Start MCP server (stdio transport)
-engram tui                Launch interactive terminal UI
-engram search <query>     Search memories [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]
-engram save <title> <msg> Save a memory [--type TYPE] [--project PROJECT] [--scope SCOPE] [--topic TOPIC_KEY]
-engram timeline <obs_id>  Show chronological context around an observation [--before N] [--after N]
-engram context [project]  Show recent context from previous sessions
-engram stats              Show memory system statistics
-engram export [file]      Export all memories to JSON (default: engram-export.json)
-engram import <file>      Import memories from a JSON export file
-engram sync               Export new memories as chunk [--import] [--status] [--project NAME] [--all]
-engram projects list      Show all projects with obs/session/prompt counts
-engram projects consolidate  Interactive merge of similar project names [--all] [--dry-run]
-engram projects prune     Remove projects with 0 observations [--dry-run]
-engram obsidian-export    Export memories to Obsidian vault [--vault PATH] [--project NAME] [--limit N] [--since DATE] [--force] [--graph-config PATH] [--watch] [--interval N]
-engram version            Print version
-engram help               Show help
-```
-
-### Environment Variables
-
-| Variable | Description | Default |
-|---|---|---|
-| `ENGRAM_DATA_DIR` | Override data directory | `~/.engram` |
-| `ENGRAM_PORT` | Override HTTP server port | `7437` |
-| `ENGRAM_PROJECT` | Override project name for MCP server | auto-detected via git |
-
----
-
-## Running as a Service
-
-### Using systemd
-
-First you need add your engram binary to use in a global way. By example: `/usr/bin`, `/usr/local/bin` or `~/.local/bin`.
-In this documentation we will use `~/.local/bin`.
-
-1. First, move binary to `~/.local/bin` (Check if this is in your $PATH variable).
-2. Create a directory for you service with user scope and engram data: `mkdir -p ~/.engram ~/.config/systemd/user`.
-3. Create your service file in the following path: `~/.config/systemd/user/engram.service`.
-4. Reload service list: `systemctl --user daemon-reload`.
-5. Enable your service: `systemctl --user enable engram`.
-6. Then start it: `systemctl --user start engram`.
-7. And finally check the logs: `journalctl --user -u engram -f`.
-
-The following code is an example of the `~/.config/systemd/user/engram.service` file:
-
-```shell
-[Unit]
-Description=Engram Memory Server
-After=network.target
-
-[Service]
-WorkingDirectory=%h
-ExecStart=%h/.local/bin/engram serve
-Restart=always
-RestartSec=3
-Environment=ENGRAM_DATA_DIR=%h/.engram
-
-[Install]
-WantedBy=default.target
-```
-
----
-
-## Terminal UI (TUI)
-
-Interactive Bubbletea-based terminal UI. Launch with `engram tui`.
-
-Built with [Bubbletea](https://github.com/charmbracelet/bubbletea) v1, [Lipgloss](https://github.com/charmbracelet/lipgloss), and [Bubbles](https://github.com/charmbracelet/bubbles) components. Follows the Gentleman Bubbletea skill patterns.
-
-### Screens
-
-| Screen | Description |
-|---|---|
-| **Dashboard** | Stats overview (sessions, observations, prompts, projects) + menu |
-| **Search** | FTS5 text search with text input |
-| **Search Results** | Browsable results list from search |
-| **Recent Observations** | Browse all observations, newest first |
-| **Observation Detail** | Full content of a single observation, scrollable |
-| **Timeline** | Chronological context around an observation (before/after) |
-| **Sessions** | Browse all sessions |
-| **Session Detail** | Observations within a specific session |
-
-### Navigation
-
-- `j/k` or `↑/↓` — Navigate lists
-- `Enter` — Select / drill into detail
-- `t` — View timeline for selected observation
-- `s` or `/` — Quick search from any screen
-- `Esc` or `q` — Go back / quit
-- `Ctrl+C` — Force quit
-
-### Visual Features
-
-- **Catppuccin Mocha** color palette
-- **`(active)` badge** — shown next to sessions and observations from active (non-completed) sessions, sorted to the top of every list
-- **Scroll indicators** — shows position in long lists (e.g. "showing 1-20 of 50")
-- **2-line items** — each observation shows title + content preview
-
-### Architecture (Gentleman Bubbletea patterns)
-
-- `model.go` — Screen constants as `Screen int` iota, single `Model` struct holds ALL state
-- `styles.go` — Lipgloss styles organized by concern (layout, dashboard, list, detail, timeline, search)
-- `update.go` — `Update()` with type switch, `handleKeyPress()` routes to per-screen handlers, each returns `(tea.Model, tea.Cmd)`
-- `view.go` — `View()` routes to per-screen renderers, shared `renderObservationListItem()` for consistent list formatting
-
-### Store Methods (TUI-specific)
-
-The TUI uses dedicated store methods that don't filter by session status (unlike `RecentSessions`/`RecentObservations` which only show completed sessions for MCP context injection):
-
-- `AllSessions()` — All sessions regardless of status, active sorted first
-- `AllObservations()` — All observations regardless of session status, active sorted first
-- `SessionObservations(sessionID)` — All observations for a specific session, chronological order
 
 ---
 
@@ -249,6 +94,10 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 
 - `GET /context` — Formatted context. Query: `?project=X&scope=project|personal`
 
+### Passive Capture
+
+- `POST /observations/passive` — Extract structured learnings from text. Body: `{content, session_id?, project?}`
+
 ### Export / Import
 
 - `GET /export` — Export all data as JSON
@@ -258,10 +107,6 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 
 - `GET /stats` — Memory statistics
 
-### Passive Capture
-
-- `POST /observations/passive` — Extract structured learnings from text. Body: `{content, session_id?, project?}`
-
 ### Project Migration
 
 - `POST /projects/migrate` — Migrate observations between project names. Body: `{source, target}`
@@ -269,6 +114,14 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 ### Sync Status
 
 - `GET /sync/status` — Chunk sync status (local vs remote counts, pending imports)
+
+### Environment Variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `ENGRAM_DATA_DIR` | Override data directory | `~/.engram` |
+| `ENGRAM_PORT` | Override HTTP server port | `7437` |
+| `ENGRAM_PROJECT` | Override project name for MCP server | auto-detected via git |
 
 ---
 
@@ -325,13 +178,13 @@ Get full untruncated content of a specific observation by ID.
 
 ### mem_session_summary
 
-Save comprehensive end-of-session summary using OpenCode-style format:
+Save comprehensive end-of-session summary:
 
 ```
 ## Goal
 ## Instructions
 ## Discoveries
-## Accomplished (✅ done, 🔲 pending)
+## Accomplished
 ## Relevant Files
 ```
 
@@ -353,56 +206,11 @@ Extract structured learnings from text output. Looks for `## Key Learnings:` sec
 
 ---
 
-## Project Name Normalization
+## Memory Protocol
 
-Engram automatically prevents project name drift — the same project saved under different names (`"engram"` vs `"Engram"` vs `"engram-memory"`) by different clients or users.
+The Memory Protocol teaches agents **when** and **how** to use Engram's MCP tools. Without it, the agent has the tools but no behavioral guidance. Add this to your agent's prompt file (see [Agent Setup](docs/AGENT-SETUP.md) for per-agent locations).
 
-### Automatic normalization
-
-All project names are normalized on write and read: **lowercase**, **trimmed**, **collapsed hyphens/underscores**. If a name is changed during normalization, a warning is included in the response.
-
-### Auto-detection
-
-The MCP server auto-detects the project name at startup using a priority chain:
-1. `--project` flag
-2. `ENGRAM_PROJECT` environment variable
-3. Git remote origin URL (extracts repo name)
-4. Git repository root directory name
-5. Current working directory basename
-
-### Similar-project warnings
-
-When saving to a project that doesn't exist yet, Engram checks for similar existing project names (Levenshtein distance, substring, case-insensitive matching) and warns the agent if a likely variant already exists.
-
-### Retroactive cleanup
-
-Use `engram projects consolidate` to interactively merge variant project names, or `mem_merge_projects` for agent-driven consolidation.
-
----
-
-## MCP Configuration
-
-Add to any agent's config:
-
-```json
-{
-  "mcp": {
-    "engram": {
-      "type": "stdio",
-      "command": "engram",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
----
-
-## Memory Protocol Full Text
-
-The Memory Protocol teaches agents **when** and **how** to use Engram's MCP tools. Without it, the agent has the tools but no behavioral guidance. Add this to your agent's prompt file (see README for per-agent locations).
-
-### WHEN TO SAVE (mandatory — not optional)
+### WHEN TO SAVE (mandatory)
 
 Call `mem_save` IMMEDIATELY after any of these:
 - Bug fix completed
@@ -434,7 +242,7 @@ Format for `mem_save`:
 
 ### WHEN TO SEARCH MEMORY
 
-When the user asks to recall something — any variation of "remember", "recall", "what did we do", "how did we solve", "recordar", "acordate", "qué hicimos", or references to past work:
+When the user asks to recall something — any variation of "remember", "recall", "what did we do", "how did we solve", "recordar", "acordate", or references to past work:
 1. First call `mem_context` — checks recent session history (fast, cheap)
 2. If not found, call `mem_search` with relevant keywords (FTS5 full-text search)
 3. If you find a match, use `mem_get_observation` for full untruncated content
@@ -469,9 +277,9 @@ Before ending a session or saying "done" / "listo" / "that's it", you MUST call 
 
 This is NOT optional. If you skip this, the next session starts blind.
 
-### PASSIVE CAPTURE — automatic learning extraction
+### PASSIVE CAPTURE
 
-When completing a task or subtask, include a `## Key Learnings:` section at the end of your response with numbered items. Engram will automatically extract and save these as observations.
+When completing a task, include a `## Key Learnings:` section at the end of your response with numbered items. Engram will automatically extract and save these as observations.
 
 Example:
 ```
@@ -481,28 +289,55 @@ Example:
 2. JWT refresh tokens need atomic rotation to prevent race conditions
 ```
 
-You can also call `mem_capture_passive(content)` directly with any text that contains a learning section. This is a safety net — it captures knowledge even if you forget to call `mem_save` explicitly.
+You can also call `mem_capture_passive(content)` directly with any text that contains a learning section.
 
 ### AFTER COMPACTION
 
-If you see a message about compaction or context reset, or if you see "FIRST ACTION REQUIRED" in your context:
-1. IMMEDIATELY call `mem_session_summary` with the compacted summary content — this persists what was done before compaction
-2. Then call `mem_context` to recover any additional context from previous sessions
+If you see a message about compaction or context reset:
+1. IMMEDIATELY call `mem_session_summary` with the compacted summary content
+2. Then call `mem_context` to recover additional context from previous sessions
 3. Only THEN continue working
 
 Do not skip step 1. Without it, everything done before compaction is lost from memory.
 
 ---
 
+## Project Name Normalization
+
+Engram automatically prevents project name drift — the same project saved under different names (`"engram"` vs `"Engram"` vs `"engram-memory"`) by different clients or users.
+
+### Automatic normalization
+
+All project names are normalized on write and read: **lowercase**, **trimmed**, **collapsed hyphens/underscores**. If a name is changed during normalization, a warning is included in the response.
+
+### Auto-detection
+
+The MCP server auto-detects the project name at startup using a priority chain:
+1. `--project` flag
+2. `ENGRAM_PROJECT` environment variable
+3. Git remote origin URL (extracts repo name)
+4. Git repository root directory name
+5. Current working directory basename
+
+### Similar-project warnings
+
+When saving to a project that doesn't exist yet, Engram checks for similar existing project names (Levenshtein distance, substring, case-insensitive matching) and warns the agent if a likely variant already exists.
+
+### Retroactive cleanup
+
+Use `engram projects consolidate` to interactively merge variant project names, or `mem_merge_projects` for agent-driven consolidation.
+
+---
+
 ## Features
 
-### 1. Full-Text Search (FTS5)
+### Full-Text Search (FTS5)
 
 - Searches across title, content, tool_name, type, and project
 - Query sanitization: wraps each word in quotes to avoid FTS5 syntax errors
 - Supports type and project filters
 
-### 2. Timeline (Progressive Disclosure)
+### Timeline (Progressive Disclosure)
 
 Three-layer pattern for token-efficient memory retrieval:
 
@@ -510,7 +345,7 @@ Three-layer pattern for token-efficient memory retrieval:
 2. `mem_timeline` — Drill into chronological neighborhood of a result
 3. `mem_get_observation` — Get full untruncated content
 
-### 3. Privacy Tags
+### Privacy Tags
 
 `<private>...</private>` content is stripped at TWO levels:
 
@@ -519,36 +354,35 @@ Three-layer pattern for token-efficient memory retrieval:
 
 Example: `Set up API with <private>sk-abc123</private>` becomes `Set up API with [REDACTED]`
 
-### 4. User Prompt Storage
+### User Prompt Storage
 
 Separate table captures what the USER asked (not just tool calls). Gives future sessions the "why" behind the "what". Full FTS5 search support.
 
-### 5. Export / Import
+### Export / Import
 
 Share memories across machines, backup, or migrate:
 
 - `engram export` — JSON dump of all sessions, observations, prompts
 - `engram import <file>` — Load from JSON, sessions use INSERT OR IGNORE (skip duplicates), atomic transaction
 
-### 6. Git Sync (Chunked)
+### Git Sync (Chunked)
 
 Share memories through git repositories using compressed chunks with a manifest index.
 
 - `engram sync` — Exports new memories as a gzipped JSONL chunk to `.engram/chunks/`
-- `engram sync --all` — Exports ALL memories from every project (ignores directory-based filter)
+- `engram sync --all` — Exports ALL memories from every project
 - `engram sync --import` — Imports chunks listed in the manifest that haven't been imported yet
-- `engram sync --status` — Shows how many chunks exist locally vs remotely, and how many are pending import
+- `engram sync --status` — Shows how many chunks exist locally vs remotely
 - `engram sync --project NAME` — Filters export to a specific project
 
-**Architecture**:
 ```
 .engram/
-├── manifest.json          ← index of all chunks (small, git-mergeable)
+├── manifest.json          <- index of all chunks (small, git-mergeable)
 ├── chunks/
-│   ├── a3f8c1d2.jsonl.gz ← chunk 1 (gzipped JSONL)
-│   ├── b7d2e4f1.jsonl.gz ← chunk 2
+│   ├── a3f8c1d2.jsonl.gz <- chunk 1 (gzipped JSONL)
+│   ├── b7d2e4f1.jsonl.gz <- chunk 2
 │   └── ...
-└── engram.db              ← local working DB (gitignored)
+└── engram.db              <- local working DB (gitignored)
 ```
 
 **Why chunks?**
@@ -558,127 +392,83 @@ Share memories through git repositories using compressed chunks with a manifest 
 - The manifest is the only file git diffs — it's small and append-only
 - Compressed: a chunk with 8 sessions + 10 observations = ~2KB
 
-**Auto-import**: The OpenCode plugin detects `.engram/manifest.json` at startup and runs `engram sync --import` to load any new chunks. Clone a repo → open OpenCode → team memories are loaded.
-
-**Tracking**: The local DB stores a `sync_chunks` table with chunk IDs that have been imported. This prevents re-importing the same data if `sync --import` runs multiple times.
-
-### 7. AI Compression (Agent-Driven)
+### Agent-Driven Compression
 
 Instead of a separate LLM service, the agent itself compresses observations. The agent already has the model, context, and API key.
 
 **Two levels:**
 
-- **Per-action** (`mem_save`): Structured summaries after each significant action
+- **Per-action** (`mem_save`): Structured summaries (What/Why/Where/Learned)
+- **Session summary** (`mem_session_summary`): Comprehensive end-of-session summary (Goal/Instructions/Discoveries/Accomplished/Files)
 
-  ```
-  **What**: [what was done]
-  **Why**: [reasoning]
-  **Where**: [files affected]
-  **Learned**: [gotchas, decisions]
-  ```
+### No Raw Auto-Capture
 
-- **Session summary** (`mem_session_summary`): OpenCode-style comprehensive summary
-
-  ```
-  ## Goal
-  ## Instructions
-  ## Discoveries
-  ## Accomplished
-  ## Relevant Files
-  ```
-
-The OpenCode plugin injects the **Memory Protocol** via system prompt to teach agents both formats, plus strict rules about when to save and a mandatory session close protocol.
-
-### 8. No Raw Auto-Capture (Agent-Only Memory)
-
-The OpenCode plugin does NOT auto-capture raw tool calls. All memory comes from the agent itself:
-
-- **`mem_save`** — Agent saves structured observations after significant work (decisions, bugfixes, patterns)
-- **`mem_session_summary`** — Agent saves comprehensive end-of-session summaries
-
-**Why?** Raw tool calls (`edit: {file: "foo.go"}`, `bash: {command: "go build"}`) are noisy and pollute FTS5 search results. The agent's curated summaries are higher signal, more searchable, and don't bloat the database. Shell history and git provide the raw audit trail.
-
-The plugin still counts tool calls per session (for session end summary stats) but doesn't persist them as observations.
+All memory comes from the agent itself — no firehose of raw tool calls. Why? Raw tool calls (`edit: {file: "foo.go"}`, `bash: {command: "go build"}`) are noisy and pollute FTS5 search. The agent's curated summaries are higher signal, more searchable, and don't bloat the database. Shell history and git provide the raw audit trail.
 
 ---
 
-## OpenCode Plugin
+## Terminal UI (TUI)
 
-Install with `engram setup opencode` — this copies the plugin to `~/.config/opencode/plugins/engram.ts` AND auto-registers the MCP server in `opencode.json`.
+Interactive Bubbletea-based terminal UI. Launch with `engram tui`.
 
-A thin TypeScript adapter that:
+### Screens
 
-1. **Auto-starts** the engram binary if not running
-2. **Auto-imports** git-synced memories from `.engram/memories.json` if present in the project
-3. **Captures events**: `session.created`, `session.idle`, `session.deleted`, `message.updated`
-4. **Tracks tool count**: Counts tool calls per session (for session end stats), but does NOT persist raw tool observations
-5. **Captures user prompts**: From `message.updated` events (>10 chars)
-6. **Injects Memory Protocol**: Strict rules for when to save, when to search, and mandatory session close protocol — via `chat.system.transform`
-7. **Injects context on compaction**: Auto-saves checkpoint + injects previous session context + reminds compressor
-8. **Privacy**: Strips `<private>` tags before sending to HTTP API
+| Screen | Description |
+|---|---|
+| **Dashboard** | Stats overview (sessions, observations, prompts, projects) + menu |
+| **Search** | FTS5 text search with text input |
+| **Search Results** | Browsable results list from search |
+| **Recent Observations** | Browse all observations, newest first |
+| **Observation Detail** | Full content of a single observation, scrollable |
+| **Timeline** | Chronological context around an observation (before/after) |
+| **Sessions** | Browse all sessions |
+| **Session Detail** | Observations within a specific session |
 
-### Session Resilience
+### Navigation
 
-The plugin uses `ensureSession()` — an idempotent function that creates the session in engram if it doesn't exist yet. This is called from every hook that receives a `sessionID`, not just `session.created`. This means:
+- `j/k` or arrow keys — Navigate lists
+- `Enter` — Select / drill into detail
+- `t` — View timeline for selected observation
+- `s` or `/` — Quick search from any screen
+- `Esc` or `q` — Go back / quit
+- `Ctrl+C` — Force quit
 
-- **Plugin reload**: If OpenCode restarts or the plugin is reloaded mid-session, the session is re-created on the next tool call or compaction event
-- **Reconnect**: If you reconnect to an existing session, the session is created on-demand
-- **No lost data**: Prompts, tool counts, and compaction context all work even if `session.created` was missed
+### Visual Features
 
-Session IDs come from OpenCode's hook inputs (`input.sessionID` in `tool.execute.after`, `input.sessionID` in `experimental.session.compacting`) rather than from a fragile in-memory Map populated by events.
-
-### Plugin API Types (OpenCode `@opencode-ai/plugin`)
-
-The `tool.execute.after` hook receives:
-- **`input`**: `{ tool, sessionID, callID, args }` — `input.sessionID` identifies the OpenCode session
-- **`output`**: `{ title, output, metadata }` — `output.output` has the result string
-
-### ENGRAM_TOOLS (excluded from tool count)
-
-`mem_search`, `mem_save`, `mem_update`, `mem_delete`, `mem_suggest_topic_key`, `mem_save_prompt`, `mem_session_summary`, `mem_context`, `mem_stats`, `mem_timeline`, `mem_get_observation`, `mem_session_start`, `mem_session_end`, `mem_capture_passive`, `mem_merge_projects`
+- **Catppuccin Mocha** color palette
+- **`(active)` badge** — shown next to sessions and observations from active sessions, sorted to top
+- **Scroll indicators** — position in long lists (e.g. "showing 1-20 of 50")
+- **2-line items** — each observation shows title + content preview
 
 ---
 
-## Dependencies
+## Running as a Service
 
-### Go
+### Using systemd
 
-- `github.com/mark3labs/mcp-go v0.44.0` — MCP protocol implementation
-- `modernc.org/sqlite v1.45.0` — Pure Go SQLite driver (no CGO)
-- `github.com/charmbracelet/bubbletea v1.3.10` — Terminal UI framework
-- `github.com/charmbracelet/lipgloss v1.1.0` — Terminal styling
-- `github.com/charmbracelet/bubbles v1.0.0` — TUI components (textinput, etc.)
-- `github.com/a-h/templ v0.3.1001` — HTML templating (for dashboard)
-- `github.com/lib/pq` — Postgres driver (for cloud server)
-- `github.com/golang-jwt/jwt/v5` — JWT token generation and validation (for cloud auth)
-- `golang.org/x/crypto` — bcrypt password hashing (for cloud auth)
-- `github.com/ory/dockertest/v3` — Docker-based integration testing
+1. Move binary to `~/.local/bin` (ensure it's in your `$PATH`)
+2. Create directories: `mkdir -p ~/.engram ~/.config/systemd/user`
+3. Create `~/.config/systemd/user/engram.service` (see below)
+4. `systemctl --user daemon-reload`
+5. `systemctl --user enable engram`
+6. `systemctl --user start engram`
+7. `journalctl --user -u engram -f`
 
-### OpenCode Plugin
+```ini
+[Unit]
+Description=Engram Memory Server
+After=network.target
 
-- `@opencode-ai/plugin` — OpenCode plugin types and helpers
-- Runtime: Bun (built into OpenCode)
+[Service]
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/engram serve
+Restart=always
+RestartSec=3
+Environment=ENGRAM_DATA_DIR=%h/.engram
 
----
-
-## Installation
-
-### From source
-
-```bash
-git clone https://github.com/Gentleman-Programming/engram.git
-cd engram
-go build -o engram ./cmd/engram
-go install ./cmd/engram
+[Install]
+WantedBy=default.target
 ```
-
-### Binary location
-
-After `go install`: `$GOPATH/bin/engram` (typically `~/go/bin/engram`)
-
-### Data location
-
-`~/.engram/engram.db` (SQLite database, created on first run)
 
 ---
 
@@ -690,19 +480,33 @@ After `go install`: `$GOPATH/bin/engram` (typically `~/go/bin/engram`)
 4. **Agent-driven compression** — The agent already has an LLM. No separate compression service.
 5. **Privacy at two layers** — Strip in plugin AND store. Defense in depth.
 6. **Pure Go SQLite (modernc.org/sqlite)** — No CGO means true cross-platform binary distribution.
-7. **No raw auto-capture** — Raw tool calls (edit, bash, etc.) are noisy, pollute search results, and bloat the database. The agent saves curated summaries via `mem_save` and `mem_session_summary` instead. Shell history and git provide the raw audit trail.
-8. **TUI with Bubbletea** — Interactive terminal UI for browsing memories without leaving the terminal. Follows Gentleman Bubbletea patterns (screen constants, single Model struct, vim keys).
+7. **No raw auto-capture** — The agent saves curated summaries. Shell history and git provide the raw audit trail.
+8. **TUI with Bubbletea** — Interactive terminal UI following Gentleman Bubbletea patterns.
 
 ---
 
-## Inspired By
+## Dependencies
 
-[claude-mem](https://github.com/thedotmack/claude-mem) — But agent-agnostic and with a Go core instead of TypeScript.
+### Go
 
-Key differences from claude-mem:
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `github.com/mark3labs/mcp-go` | v0.44.0 | MCP protocol implementation |
+| `modernc.org/sqlite` | v1.45.0 | Pure Go SQLite driver (no CGO) |
+| `github.com/charmbracelet/bubbletea` | v1.3.10 | Terminal UI framework |
+| `github.com/charmbracelet/lipgloss` | v1.1.0 | Terminal styling |
+| `github.com/charmbracelet/bubbles` | v1.0.0 | TUI components |
 
-- Agent-agnostic (not locked to Claude Code)
-- Go binary (not Node.js/TypeScript)
-- FTS5 instead of ChromaDB
-- Agent-driven compression instead of separate LLM calls
-- Simpler architecture (single binary, embedded web dashboard)
+### OpenCode Plugin
+
+- `@opencode-ai/plugin` — OpenCode plugin types and helpers
+- Runtime: Bun (built into OpenCode)
+
+---
+
+## Next Steps
+
+- [Agent Setup](docs/AGENT-SETUP.md) — connect your agent to Engram
+- [Plugins](docs/PLUGINS.md) — what the OpenCode and Claude Code plugins add beyond bare MCP
+- [Obsidian Brain](docs/beta/obsidian-brain.md) — visualize memories as a knowledge graph (beta)
+- [Contributing](CONTRIBUTING.md) — how to contribute
