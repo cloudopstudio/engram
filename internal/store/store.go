@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 var openDB = sql.Open
@@ -1262,8 +1262,10 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 // (including soft-deleted ones) to prevent orphaned rows.
 // It returns ErrSessionNotFound if no session with that ID exists.
 //
-// Note: this delete is local-only. It does not enqueue a sync mutation, so
-// remote stores (if autosync is enabled) will not be affected.
+// Note: this delete only removes local rows. It does not enqueue a delete
+// sync mutation, but any previously enqueued mutations for the session or its
+// prompts may still be synced later if autosync is enabled, and a later pull
+// may recreate the deleted rows locally.
 func (s *Store) DeleteSession(id string) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		// Count ALL observations for the session, including soft-deleted ones,
@@ -1284,7 +1286,8 @@ func (s *Store) DeleteSession(id string) error {
 
 		res, err := s.execHook(tx, `DELETE FROM sessions WHERE id = ?`, id)
 		if err != nil {
-			if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+			var sqliteErr *sqlite.Error
+			if errors.As(err, &sqliteErr) && sqliteErr.Code() == 787 { // SQLITE_CONSTRAINT_FOREIGNKEY
 				return fmt.Errorf("%w: session %q has observation(s)", ErrSessionHasObservations, id)
 			}
 			return fmt.Errorf("delete session: %w", err)
@@ -1303,8 +1306,10 @@ func (s *Store) DeleteSession(id string) error {
 // DeletePrompt hard-deletes a single prompt by ID.
 // It returns ErrPromptNotFound if no prompt with that ID exists.
 //
-// Note: this delete is local-only. It does not enqueue a sync mutation, so
-// remote stores (if autosync is enabled) will not be affected.
+// Note: this delete only removes local rows. It does not enqueue a delete
+// sync mutation, but any previously enqueued mutations for the prompt
+// may still be synced later if autosync is enabled, and a later pull
+// may recreate the deleted row locally.
 func (s *Store) DeletePrompt(id int64) error {
 	res, err := s.execHook(s.db, `DELETE FROM user_prompts WHERE id = ?`, id)
 	if err != nil {

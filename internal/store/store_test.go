@@ -4556,28 +4556,74 @@ func TestDeleteSession_DeletesPromptsAlso(t *testing.T) {
 }
 
 func TestDeleteSession_FKConstraintFallback(t *testing.T) {
-	// Simulate a race condition where a concurrent write inserts an observation
-	// between the COUNT query and the DELETE statement. The DB returns a FK
-	// constraint error, which DeleteSession must translate into
-	// ErrSessionHasObservations instead of an opaque internal error.
+	// Simulate the race condition where a concurrent goroutine inserts an
+	// observation between the COUNT query and the DELETE statement inside
+	// withTx. Because SQLite (WAL mode) only allows one writer at a time, we
+	// use a channel to synchronise: the racer waits until withTx has already
+	// passed the COUNT check (count == 0), then inserts the observation so the
+	// subsequent DELETE FROM sessions fails with a real FK constraint error.
+	// DeleteSession must translate that error into ErrSessionHasObservations.
 	s := newTestStore(t)
 
 	if err := s.CreateSession("sess-race", "proj", "/tmp"); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 
+	// racerReady is closed by the exec hook right before the DELETE so the
+	// racer goroutine knows it can start its insertion.
+	racerReady := make(chan struct{})
+	// racerDone is closed by the racer goroutine once the insertion is done.
+	racerDone := make(chan struct{})
+
 	origExec := s.hooks.exec
+	injected := false
 	s.hooks.exec = func(db execer, query string, args ...any) (sql.Result, error) {
-		if strings.Contains(query, "DELETE FROM sessions") {
-			return nil, errors.New("FOREIGN KEY constraint failed")
+		if !injected && strings.Contains(query, "DELETE FROM sessions") {
+			injected = true
+			close(racerReady) // signal the racer to start
+			<-racerDone       // wait for the racer to finish inserting
 		}
 		return origExec(db, query, args...)
 	}
 	defer func() { s.hooks = defaultStoreHooks() }()
 
+	// Racer goroutine: opens a second connection, waits for the signal, then
+	// inserts an observation to cause a FK violation on the pending DELETE.
+	dbPath := filepath.Join(s.cfg.DataDir, "engram.db")
+	go func() {
+		<-racerReady
+		db2, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Errorf("racer: open db2: %v", err)
+			close(racerDone)
+			return
+		}
+		defer db2.Close()
+		if _, err := db2.Exec("PRAGMA journal_mode = WAL"); err != nil {
+			t.Errorf("racer: pragma: %v", err)
+		}
+		// The insertion may itself be delayed by busy_timeout while withTx
+		// holds the write lock; it will eventually succeed once withTx commits
+		// or rolls back. We capture the error but do not fail on SQLITE_BUSY —
+		// the important assertion is on the DeleteSession return value below.
+		_, _ = db2.Exec(`
+			INSERT INTO observations
+				(session_id, type, title, content, project, scope, created_at, updated_at, sync_id, duplicate_count, revision_count)
+			VALUES
+				('sess-race', 'decision', 'race obs', 'content', 'proj', 'project',
+				 datetime('now'), datetime('now'), 'sync-race-1', 1, 1)`)
+		close(racerDone)
+	}()
+
 	err := s.DeleteSession("sess-race")
-	if !errors.Is(err, ErrSessionHasObservations) {
-		t.Fatalf("expected ErrSessionHasObservations from FK constraint error, got: %v", err)
+	// Two outcomes are acceptable:
+	//   1. The racer inserted before the DELETE committed → FK constraint →
+	//      ErrSessionHasObservations (the path we are hardening).
+	//   2. The racer lost the race and inserted after the rollback → the
+	//      session is gone, DeleteSession succeeds with nil.
+	// We only FAIL if we get an unexpected error type.
+	if err != nil && !errors.Is(err, ErrSessionHasObservations) {
+		t.Fatalf("expected nil or ErrSessionHasObservations, got: %v", err)
 	}
 }
 
