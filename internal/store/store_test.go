@@ -4555,6 +4555,32 @@ func TestDeleteSession_DeletesPromptsAlso(t *testing.T) {
 	}
 }
 
+func TestDeleteSession_FKConstraintFallback(t *testing.T) {
+	// Simulate a race condition where a concurrent write inserts an observation
+	// between the COUNT query and the DELETE statement. The DB returns a FK
+	// constraint error, which DeleteSession must translate into
+	// ErrSessionHasObservations instead of an opaque internal error.
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-race", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	origExec := s.hooks.exec
+	s.hooks.exec = func(db execer, query string, args ...any) (sql.Result, error) {
+		if strings.Contains(query, "DELETE FROM sessions") {
+			return nil, errors.New("FOREIGN KEY constraint failed")
+		}
+		return origExec(db, query, args...)
+	}
+	defer func() { s.hooks = defaultStoreHooks() }()
+
+	err := s.DeleteSession("sess-race")
+	if !errors.Is(err, ErrSessionHasObservations) {
+		t.Fatalf("expected ErrSessionHasObservations from FK constraint error, got: %v", err)
+	}
+}
+
 // ─── DeletePrompt tests ──────────────────────────────────────────────────────
 
 func TestDeletePrompt_Success(t *testing.T) {

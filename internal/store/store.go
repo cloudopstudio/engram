@@ -1284,6 +1284,9 @@ func (s *Store) DeleteSession(id string) error {
 
 		res, err := s.execHook(tx, `DELETE FROM sessions WHERE id = ?`, id)
 		if err != nil {
+			if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+				return fmt.Errorf("%w: session %q has observation(s)", ErrSessionHasObservations, id)
+			}
 			return fmt.Errorf("delete session: %w", err)
 		}
 		n, _ := res.RowsAffected()
