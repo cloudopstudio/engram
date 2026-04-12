@@ -450,7 +450,8 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.notifyWrite()
+	// local-only delete: do not notify autosync to avoid triggering a pull
+	// that could recreate the deleted rows from a remote store.
 	jsonResponse(w, http.StatusOK, map[string]string{"id": id, "status": "deleted"})
 }
 
@@ -471,7 +472,6 @@ func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.notifyWrite()
 	jsonResponse(w, http.StatusOK, map[string]any{"id": id, "status": "deleted"})
 }
 

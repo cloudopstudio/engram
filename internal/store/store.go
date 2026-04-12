@@ -1322,15 +1322,17 @@ func (s *Store) DeleteSession(id string) error {
 // may still be synced later if autosync is enabled, and a later pull
 // may recreate the deleted row locally.
 func (s *Store) DeletePrompt(id int64) error {
-	res, err := s.execHook(s.db, `DELETE FROM user_prompts WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete prompt: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
-	}
-	return nil
+	return s.withTx(func(tx *sql.Tx) error {
+		res, err := s.execHook(tx, `DELETE FROM user_prompts WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("delete prompt: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
+		}
+		return nil
+	})
 }
 
 // ─── Get Single Observation ──────────────────────────────────────────────────
