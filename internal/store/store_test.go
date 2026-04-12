@@ -3684,25 +3684,6 @@ func TestEnqueueSyncMutationPopulatesProjectFromPromptPayload(t *testing.T) {
 }
 
 // ─── Phase 4: ListPendingSyncMutations enrollment filtering ──────────────────
-	})
-	if err != nil {
-		t.Fatalf("add prompt: %v", err)
-	}
-
-	var project string
-	err = s.db.QueryRow(
-		`SELECT project FROM sync_mutations WHERE entity = ? ORDER BY seq DESC LIMIT 1`,
-		SyncEntityPrompt,
-	).Scan(&project)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if project != "prompt-proj" {
-		t.Fatalf("expected project='prompt-proj', got %q", project)
-	}
-}
-
-// ─── Phase 4: ListPendingSyncMutations enrollment filtering ──────────────────
 
 func TestListPendingFiltersNonEnrolledProjects(t *testing.T) {
 	s := newTestStore(t)
