@@ -1262,38 +1262,34 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 // (including soft-deleted ones) to prevent orphaned rows.
 // It returns ErrSessionNotFound if no session with that ID exists.
 func (s *Store) DeleteSession(id string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("delete session: begin tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
+	return s.withTx(func(tx *sql.Tx) error {
+		// Count ALL observations for the session, including soft-deleted ones,
+		// because the FK constraint on observations.session_id has no ON DELETE CASCADE.
+		var count int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM observations WHERE session_id = ?`, id,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("delete session: count observations: %w", err)
+		}
+		if count > 0 {
+			return fmt.Errorf("%w: session %q has %d observation(s)", ErrSessionHasObservations, id, count)
+		}
 
-	// Count ALL observations for the session, including soft-deleted ones,
-	// because the FK constraint on observations.session_id has no ON DELETE CASCADE.
-	var count int
-	if err := tx.QueryRow(
-		`SELECT COUNT(*) FROM observations WHERE session_id = ?`, id,
-	).Scan(&count); err != nil {
-		return fmt.Errorf("delete session: count observations: %w", err)
-	}
-	if count > 0 {
-		return fmt.Errorf("%w: session %q has %d observation(s)", ErrSessionHasObservations, id, count)
-	}
+		if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE session_id = ?`, id); err != nil {
+			return fmt.Errorf("delete session: remove prompts: %w", err)
+		}
 
-	if _, err := tx.Exec(`DELETE FROM user_prompts WHERE session_id = ?`, id); err != nil {
-		return fmt.Errorf("delete session: remove prompts: %w", err)
-	}
+		res, err := s.execHook(tx, `DELETE FROM sessions WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("delete session: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
+		}
 
-	res, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete session: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
-	}
-
-	return tx.Commit()
+		return nil
+	})
 }
 
 // ─── Delete Prompt ───────────────────────────────────────────────────────────
@@ -1301,7 +1297,7 @@ func (s *Store) DeleteSession(id string) error {
 // DeletePrompt hard-deletes a single prompt by ID.
 // It returns ErrPromptNotFound if no prompt with that ID exists.
 func (s *Store) DeletePrompt(id int64) error {
-	res, err := s.db.Exec(`DELETE FROM user_prompts WHERE id = ?`, id)
+	res, err := s.execHook(s.db, `DELETE FROM user_prompts WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete prompt: %w", err)
 	}

@@ -450,6 +450,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.notifyWrite()
 	jsonResponse(w, http.StatusOK, map[string]string{"id": id, "status": "deleted"})
 }
 
@@ -470,6 +471,7 @@ func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.notifyWrite()
 	jsonResponse(w, http.StatusOK, map[string]any{"id": id, "status": "deleted"})
 }
 
