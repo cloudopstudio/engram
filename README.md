@@ -154,5 +154,5 @@ MIT
 ## Contributors
 
 <a href="https://github.com/Gentleman-Programming/engram/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Gentleman-Programming/engram" />
+  <img src="https://contrib.rocks/image?repo=Gentleman-Programming/engram&max=100" />
 </a>
