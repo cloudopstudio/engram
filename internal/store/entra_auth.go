@@ -298,7 +298,10 @@ func openBrowser(rawURL string) error {
 	case "linux":
 		return exec.Command("xdg-open", rawURL).Start()
 	case "windows":
-		return exec.Command("cmd", "/c", "start", rawURL).Start()
+		// Windows cmd.exe treats & as a command separator. The URL must be
+		// quoted, and `start` requires an empty title ("") when the target
+		// is quoted, otherwise it interprets the quoted URL as the title.
+		return exec.Command("cmd", "/c", "start", "", rawURL).Start()
 	default:
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
