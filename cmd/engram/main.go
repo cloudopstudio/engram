@@ -82,6 +82,12 @@ var (
 	storeExport        = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
 	jsonMarshalIndent  = json.MarshalIndent
 
+	storeListProjects     = func(s *store.Store) ([]store.ProjectStats, error) { return s.ListProjects() }
+	storePromote          = func(s *store.Store, id int64, identity string) error { return s.PromoteObservation(id, identity) }
+	storeListContributors = func(s *store.Store, project string) ([]store.ContributorStats, error) {
+		return s.ListContributors(project)
+	}
+
 	syncStatus = func(sy *engramsync.Syncer) (localChunks int, remoteChunks int, pendingImport int, err error) {
 		return sy.Status()
 	}
@@ -179,6 +185,12 @@ func main() {
 		cmdLogin(cfg)
 	case "migrate":
 		cmdMigrate(cfg)
+	case "projects":
+		cmdProjects(cfg)
+	case "promote":
+		cmdPromote(cfg)
+	case "who":
+		cmdWho(cfg)
 	case "version", "--version", "-v":
 		fmt.Printf("engram %s\n", version)
 	case "help", "--help", "-h":
@@ -279,7 +291,7 @@ func cmdTUI(cfg store.Config) {
 
 func cmdSearch(cfg store.Config) {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: engram search <query> [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]")
+		fmt.Fprintln(os.Stderr, "usage: engram search <query> [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N] [--user USER] [--since today|yesterday|week|month|YYYY-MM-DD]")
 		exitFunc(1)
 	}
 
@@ -309,6 +321,16 @@ func cmdSearch(cfg store.Config) {
 		case "--scope":
 			if i+1 < len(os.Args) {
 				opts.Scope = os.Args[i+1]
+				i++
+			}
+		case "--user":
+			if i+1 < len(os.Args) {
+				opts.User = os.Args[i+1]
+				i++
+			}
+		case "--since":
+			if i+1 < len(os.Args) {
+				opts.Since = os.Args[i+1]
 				i++
 			}
 		default:
@@ -588,6 +610,90 @@ func cmdExport(cfg store.Config) {
 	fmt.Printf("  Prompts:      %d\n", len(data.Prompts))
 }
 
+func cmdProjects(cfg store.Config) {
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+	}
+	defer s.Close()
+
+	projects, err := storeListProjects(s)
+	if err != nil {
+		fatal(err)
+	}
+
+	if len(projects) == 0 {
+		fmt.Println("No projects found.")
+		return
+	}
+
+	fmt.Printf("%-40s  %12s  %12s  %s\n", "PROJECT", "OBSERVATIONS", "CONTRIBUTORS", "LAST ACTIVITY")
+	fmt.Printf("%-40s  %12s  %12s  %s\n", strings.Repeat("-", 40), strings.Repeat("-", 12), strings.Repeat("-", 12), strings.Repeat("-", 19))
+	for _, p := range projects {
+		fmt.Printf("%-40s  %12d  %12d  %s\n", p.Project, p.Observations, p.Contributors, p.LastActivity)
+	}
+}
+
+func cmdPromote(cfg store.Config) {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: engram promote <observation_id>")
+		exitFunc(1)
+	}
+
+	id, err := strconv.ParseInt(os.Args[2], 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid observation id %q\n", os.Args[2])
+		exitFunc(1)
+	}
+
+	s, sErr := storeNew(cfg)
+	if sErr != nil {
+		fatal(sErr)
+	}
+	defer s.Close()
+
+	if err := storePromote(s, id, s.Identity()); err != nil {
+		fatal(err)
+	}
+
+	fmt.Printf("Observation #%d promoted to project scope.\n", id)
+}
+
+func cmdWho(cfg store.Config) {
+	project := ""
+	for i := 2; i < len(os.Args); i++ {
+		if !strings.HasPrefix(os.Args[i], "--") {
+			project = os.Args[i]
+		}
+	}
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+	}
+	defer s.Close()
+
+	contributors, err := storeListContributors(s, project)
+	if err != nil {
+		fatal(err)
+	}
+
+	if len(contributors) == 0 {
+		fmt.Println("No contributors found.")
+		return
+	}
+
+	fmt.Printf("%-40s  %12s  %8s  %s\n", "IDENTITY", "OBSERVATIONS", "PROMPTS", "LAST ACTIVE")
+	fmt.Printf("%-40s  %12s  %8s  %s\n", strings.Repeat("-", 40), strings.Repeat("-", 12), strings.Repeat("-", 8), strings.Repeat("-", 19))
+	for _, c := range contributors {
+		topTypes := strings.Join(c.TopTypes, ", ")
+		if topTypes != "" {
+			topTypes = " [" + topTypes + "]"
+		}
+		fmt.Printf("%-40s  %12d  %8d  %s%s\n", c.Identity, c.Observations, c.Prompts, c.LastActive, topTypes)
+	}
+}
+
 func cmdImport(cfg store.Config) {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: engram import <file.json>")
@@ -782,8 +888,9 @@ func printPostInstall(agent string) {
 	switch agent {
 	case "opencode":
 		fmt.Println("\nNext steps:")
-		fmt.Println("  1. Restart OpenCode — plugin + MCP server are ready")
-		fmt.Println("  2. Run 'engram serve &' for session tracking (HTTP API)")
+		fmt.Println("  1. Restart OpenCode — plugin + MCP server + /engram-login are ready")
+		fmt.Println("  2. For Azure auth: run /engram-login inside OpenCode")
+		fmt.Println("  3. Run 'engram serve &' for session tracking (HTTP API)")
 	case "claude-code":
 		// Offer to add engram tools to the permissions allowlist
 		fmt.Print("\nAdd engram tools to ~/.claude/settings.json allowlist?\n")
@@ -841,10 +948,14 @@ Commands:
                        Example: engram mcp --tools=agent
   tui                Launch interactive terminal UI
   search <query>     Search memories [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]
+                       [--user USER] [--since today|yesterday|week|month|YYYY-MM-DD]
   save <title> <msg> Save a memory  [--type TYPE] [--project PROJECT] [--scope SCOPE]
   timeline <obs_id>  Show chronological context around an observation [--before N] [--after N]
   context [project]  Show recent context from previous sessions
   stats              Show memory system statistics
+  projects           List all projects with observation counts and last activity
+  promote <obs_id>   Promote a personal observation to project scope (irreversible)
+  who [project]      List contributors with activity stats
   export [file]      Export all memories to JSON (default: engram-export.json)
   import <file>      Import memories from a JSON export file
   login              Authenticate with Azure (device code flow)

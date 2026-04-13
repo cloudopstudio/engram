@@ -6,8 +6,8 @@
 //
 // Tool profiles allow agents to load only the tools they need:
 //
-//	engram mcp                    → all 14 tools (default)
-//	engram mcp --tools=agent      → 11 tools agents actually use (per skill files)
+//	engram mcp                    → all 17 tools (default)
+//	engram mcp --tools=agent      → 14 tools agents actually use (per skill files)
 //	engram mcp --tools=admin      → 3 tools for TUI/CLI (delete, stats, timeline)
 //	engram mcp --tools=agent,admin → combine profiles
 //	engram mcp --tools=mem_save,mem_search → individual tool names
@@ -15,6 +15,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -56,6 +57,9 @@ var ProfileAgent = map[string]bool{
 	"mem_capture_passive":   true, // extract learnings from text — referenced in Gemini/Codex protocol
 	"mem_save_prompt":       true, // save user prompts
 	"mem_update":            true, // update observation by ID — skills say "use mem_update when you have an exact ID to correct"
+	"mem_projects":          true, // list projects with stats — team collaboration
+	"mem_promote":           true, // promote personal observation to project scope
+	"mem_who":               true, // list contributors with stats
 }
 
 // ProfileAdmin contains tools for TUI, dashboards, and manual curation
@@ -126,7 +130,8 @@ CORE TOOLS (always available — use without ToolSearch):
 
 DEFERRED TOOLS (use ToolSearch when needed):
   mem_update, mem_suggest_topic_key, mem_session_start, mem_session_end,
-  mem_stats, mem_delete, mem_timeline, mem_capture_passive
+  mem_stats, mem_delete, mem_timeline, mem_capture_passive,
+  mem_projects, mem_promote, mem_who
 
 PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.`
 
@@ -179,6 +184,12 @@ func registerTools(srv *server.MCPServer, s *store.Store, allowlist map[string]b
 				),
 				mcp.WithNumber("limit",
 					mcp.Description("Max results (default: 10, max: 20)"),
+				),
+				mcp.WithString("user",
+					mcp.Description("Filter by creator identity (email/UPN)"),
+				),
+				mcp.WithString("since",
+					mcp.Description("Filter by time: today, yesterday, week, month, or ISO date (YYYY-MM-DD)"),
 				),
 			),
 			handleSearch(s),
@@ -549,6 +560,61 @@ GUIDELINES:
 		)
 	}
 
+	// ─── mem_projects (profile: agent, deferred) ────────────────────────
+	if shouldRegister("mem_projects", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_projects",
+				mcp.WithDescription("List all projects with stats (observation count, unique contributors, last activity date). Use this to discover which projects have memories stored in Engram."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("List Projects"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+			),
+			handleProjects(s),
+		)
+	}
+
+	// ─── mem_promote (profile: agent, deferred) ──────────────────────────
+	if shouldRegister("mem_promote", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_promote",
+				mcp.WithDescription("Promote a personal observation to project scope, making it visible to all team members. This is IRREVERSIBLE — once promoted, the observation stays project-visible. Validates that you are the creator."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Promote Observation"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("id",
+					mcp.Required(),
+					mcp.Description("Observation ID to promote (must be personal scope, owned by you)"),
+				),
+			),
+			handlePromote(s),
+		)
+	}
+
+	// ─── mem_who (profile: agent, deferred) ──────────────────────────────
+	if shouldRegister("mem_who", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_who",
+				mcp.WithDescription("List contributors with activity stats (observation count, prompt count, last active date, top types). Use this to see who is using Engram in your team."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("List Contributors"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("project",
+					mcp.Description("Filter by project name (optional)"),
+				),
+			),
+			handleWho(s),
+		)
+	}
+
 	// ─── mem_capture_passive (profile: agent, deferred) ─────────────────
 	if shouldRegister("mem_capture_passive", allowlist) {
 		srv.AddTool(
@@ -591,6 +657,8 @@ func handleSearch(s *store.Store) server.ToolHandlerFunc {
 		typ, _ := req.GetArguments()["type"].(string)
 		project, _ := req.GetArguments()["project"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
+		user, _ := req.GetArguments()["user"].(string)
+		since, _ := req.GetArguments()["since"].(string)
 		limit := intArg(req, "limit", 10)
 
 		results, err := s.Search(query, store.SearchOptions{
@@ -598,6 +666,8 @@ func handleSearch(s *store.Store) server.ToolHandlerFunc {
 			Project: project,
 			Scope:   scope,
 			Limit:   limit,
+			User:    user,
+			Since:   since,
 		})
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Search error: %s. Try simpler keywords.", err)), nil
@@ -1024,6 +1094,70 @@ func handleCapturePassive(s *store.Store) server.ToolHandlerFunc {
 			"Passive capture complete: extracted=%d saved=%d duplicates=%d",
 			result.Extracted, result.Saved, result.Duplicates,
 		)), nil
+	}
+}
+
+func handleProjects(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		projects, err := s.ListProjects()
+		if err != nil {
+			return mcp.NewToolResultError("Failed to list projects: " + err.Error()), nil
+		}
+
+		if len(projects) == 0 {
+			return mcp.NewToolResultText("No projects found."), nil
+		}
+
+		out, err := json.MarshalIndent(projects, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError("Failed to encode projects: " + err.Error()), nil
+		}
+
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+func handlePromote(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id := int64(intArg(req, "id", 0))
+		if id == 0 {
+			return mcp.NewToolResultError("id is required"), nil
+		}
+
+		obs, err := s.GetObservation(id)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Observation #%d not found", id)), nil
+		}
+
+		if err := s.PromoteObservation(id, s.Identity()); err != nil {
+			return mcp.NewToolResultError("Failed to promote: " + err.Error()), nil
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Observation #%d %q promoted to project scope (irreversible).", obs.ID, obs.Title,
+		)), nil
+	}
+}
+
+func handleWho(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		project, _ := req.GetArguments()["project"].(string)
+
+		contributors, err := s.ListContributors(project)
+		if err != nil {
+			return mcp.NewToolResultError("Failed to list contributors: " + err.Error()), nil
+		}
+
+		if len(contributors) == 0 {
+			return mcp.NewToolResultText("No contributors found."), nil
+		}
+
+		out, err := json.MarshalIndent(contributors, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError("Failed to encode contributors: " + err.Error()), nil
+		}
+
+		return mcp.NewToolResultText(string(out)), nil
 	}
 }
 

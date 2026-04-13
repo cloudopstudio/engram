@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -110,6 +111,25 @@ type SearchOptions struct {
 	Project string `json:"project,omitempty"`
 	Scope   string `json:"scope,omitempty"`
 	Limit   int    `json:"limit,omitempty"`
+	User    string `json:"user,omitempty"`
+	Since   string `json:"since,omitempty"`
+}
+
+// ProjectStats holds aggregated stats for a single project.
+type ProjectStats struct {
+	Project      string `json:"project"`
+	Observations int    `json:"observations"`
+	Contributors int    `json:"contributors"`
+	LastActivity string `json:"last_activity"`
+}
+
+// ContributorStats holds activity stats for a single contributor.
+type ContributorStats struct {
+	Identity     string   `json:"identity"`
+	Observations int      `json:"observations"`
+	Prompts      int      `json:"prompts"`
+	LastActive   string   `json:"last_active"`
+	TopTypes     []string `json:"top_types,omitempty"`
 }
 
 type AddObservationParams struct {
@@ -327,21 +347,55 @@ func New(cfg Config) (*Store, error) {
 	var tp *TokenProvider
 	var identity string
 	if authMethod != "password" {
-		var err error
 		if cfg.AuthInteractive {
-			// Device code flow with file-based token cache.
-			tenantID, clientID, resolveErr := resolveInteractiveAuth(cfg.DataDir, cfg.Profile)
-			if resolveErr != nil {
-				return nil, fmt.Errorf("engram: %w", resolveErr)
+			// Explicit --auth-interactive: use cached token only — never block
+			// with device code. The device code flow is reserved for `engram login`.
+			if err := ValidateCachedToken(cfg.DataDir, cfg.Profile); err != nil {
+				return nil, fmt.Errorf("engram: %v", err)
 			}
-			tp, err = NewDeviceCodeTokenProvider(tenantID, clientID, cfg.DataDir)
-			if err != nil {
-				return nil, fmt.Errorf("engram: device code auth failed: %w", err)
+			cached, _ := loadCachedToken(cfg.DataDir)
+			cred := &staticCredential{token: cached.AccessToken, expiresOn: cached.ExpiresOn}
+			tp = &TokenProvider{
+				cred:    cred,
+				scope:   pgTokenScope,
+				dataDir: cfg.DataDir,
+				token:   &azcore.AccessToken{Token: cached.AccessToken, ExpiresOn: cached.ExpiresOn},
 			}
 		} else {
-			tp, err = NewTokenProvider()
-			if err != nil {
-				return nil, fmt.Errorf("engram: entra auth failed (set ENGRAM_AUTH_METHOD=password to use password): %w", err)
+			// Credential chain: try DefaultAzureCredential first (az login,
+			// managed identity, env vars), then fall back to token-cache.json
+			// (from `engram login` / `/engram-login`). This lets both technical
+			// users (az login) and non-technical users (/engram-login in OpenCode)
+			// work with the same MCP configuration — no flags needed.
+			var defaultCredErr error
+			tp, defaultCredErr = NewTokenProvider()
+			if defaultCredErr == nil {
+				// Verify DefaultAzureCredential actually works (az login may be expired).
+				if _, err := tp.Token(context.Background()); err != nil {
+					log.Printf("[engram] DefaultAzureCredential failed, trying token cache: %v", err)
+					tp = nil // fall through to cache path
+				}
+			} else {
+				log.Printf("[engram] DefaultAzureCredential unavailable, trying token cache: %v", defaultCredErr)
+			}
+
+			// Fallback: token-cache.json from `engram login` or `/engram-login`.
+			if tp == nil {
+				if err := ValidateCachedToken(cfg.DataDir, cfg.Profile); err != nil {
+					return nil, fmt.Errorf("engram: no valid Azure credentials found.\n\n"+
+						"  Option A (recommended): az login --scope %q\n"+
+						"  Option B (OpenCode):    /engram-login\n\n"+
+						"Details — DefaultAzureCredential: %v", pgTokenScope, defaultCredErr)
+				}
+				cached, _ := loadCachedToken(cfg.DataDir)
+				cred := &staticCredential{token: cached.AccessToken, expiresOn: cached.ExpiresOn}
+				tp = &TokenProvider{
+					cred:    cred,
+					scope:   pgTokenScope,
+					dataDir: cfg.DataDir,
+					token:   &azcore.AccessToken{Token: cached.AccessToken, ExpiresOn: cached.ExpiresOn},
+				}
+				log.Printf("[engram] using cached token (expires %s)", cached.ExpiresOn.Format("15:04:05"))
 			}
 		}
 		// Acquire an initial token to populate identity.
@@ -386,6 +440,11 @@ func New(cfg Config) (*Store, error) {
 func (s *Store) Close() error {
 	s.pool.Close()
 	return nil
+}
+
+// Identity returns the Entra ID identity (UPN) associated with the store.
+func (s *Store) Identity() string {
+	return s.identity
 }
 
 func (s *Store) MaxObservationLength() int {
@@ -1072,6 +1131,12 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	ctx := context.Background()
 	lang := ftsLanguage()
 
+	// Resolve since filter once.
+	sinceTS := ""
+	if opts.Since != "" {
+		sinceTS = resolveSince(opts.Since)
+	}
+
 	// ── Topic key direct lookup ──
 	var directResults []SearchResult
 	if strings.Contains(query, "/") {
@@ -1097,6 +1162,16 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		if opts.Scope != "" {
 			tkSQL += fmt.Sprintf(" AND scope = $%d", argN)
 			tkArgs = append(tkArgs, normalizeScope(opts.Scope))
+			argN++
+		}
+		if opts.User != "" {
+			tkSQL += fmt.Sprintf(" AND created_by = $%d", argN)
+			tkArgs = append(tkArgs, opts.User)
+			argN++
+		}
+		if sinceTS != "" {
+			tkSQL += fmt.Sprintf(" AND created_at >= $%d", argN)
+			tkArgs = append(tkArgs, sinceTS)
 			argN++
 		}
 		tkSQL += fmt.Sprintf(" ORDER BY updated_at DESC LIMIT $%d", argN)
@@ -1137,6 +1212,16 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		args = append(args, normalizeScope(opts.Scope))
 		argN++
 	}
+	if opts.User != "" {
+		ftsSQL += fmt.Sprintf(" AND o.created_by = $%d", argN)
+		args = append(args, opts.User)
+		argN++
+	}
+	if sinceTS != "" {
+		ftsSQL += fmt.Sprintf(" AND o.created_at >= $%d", argN)
+		args = append(args, sinceTS)
+		argN++
+	}
 	ftsSQL += fmt.Sprintf(" ORDER BY rank DESC LIMIT $%d", argN)
 	args = append(args, limit)
 
@@ -1166,6 +1251,16 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		if opts.Scope != "" {
 			ftsSQL2 += fmt.Sprintf(" AND o.scope = $%d", argN2)
 			args2 = append(args2, normalizeScope(opts.Scope))
+			argN2++
+		}
+		if opts.User != "" {
+			ftsSQL2 += fmt.Sprintf(" AND o.created_by = $%d", argN2)
+			args2 = append(args2, opts.User)
+			argN2++
+		}
+		if sinceTS != "" {
+			ftsSQL2 += fmt.Sprintf(" AND o.created_at >= $%d", argN2)
+			args2 = append(args2, sinceTS)
 			argN2++
 		}
 		ftsSQL2 += fmt.Sprintf(" ORDER BY rank DESC LIMIT $%d", argN2)
@@ -1932,6 +2027,205 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 	return result, nil
 }
 
+// ─── Projects ────────────────────────────────────────────────────────────────
+
+// ListProjects returns all projects with observation counts, contributor counts,
+// and last activity date, ordered by most recently active first.
+func (s *Store) ListProjects() ([]ProjectStats, error) {
+	ctx := context.Background()
+	rows, err := s.pool.Query(ctx, `
+		SELECT project,
+		       COUNT(*) AS observations,
+		       COUNT(DISTINCT created_by) AS contributors,
+		       MAX(updated_at) AS last_activity
+		FROM observations
+		WHERE deleted_at IS NULL
+		  AND project IS NOT NULL
+		  AND project != ''
+		GROUP BY project
+		ORDER BY last_activity DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list projects: %w", err)
+	}
+	defer rows.Close()
+
+	var results []ProjectStats
+	for rows.Next() {
+		var ps ProjectStats
+		var lastActivity time.Time
+		if err := rows.Scan(&ps.Project, &ps.Observations, &ps.Contributors, &lastActivity); err != nil {
+			return nil, err
+		}
+		ps.LastActivity = formatTS(lastActivity)
+		results = append(results, ps)
+	}
+	return results, rows.Err()
+}
+
+// PromoteObservation changes an observation's scope from 'personal' to 'project'.
+// It validates that the observation exists, is personal, and is owned by identity.
+// This operation is irreversible by design.
+func (s *Store) PromoteObservation(id int64, identity string) error {
+	ctx := context.Background()
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE observations
+		 SET scope = 'project', updated_at = NOW(), revision_count = revision_count + 1
+		 WHERE id = $1 AND scope = 'personal' AND created_by = $2 AND deleted_at IS NULL`,
+		id, identity,
+	)
+	if err != nil {
+		return fmt.Errorf("promote observation: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("observation not found, not personal scope, or not owned by you")
+	}
+	return nil
+}
+
+// ListContributors returns contributor activity stats, optionally filtered by project.
+func (s *Store) ListContributors(project string) ([]ContributorStats, error) {
+	ctx := context.Background()
+
+	// Build the observations aggregation.
+	obsQuery := `
+		SELECT created_by,
+		       COUNT(*) AS obs_count,
+		       MAX(updated_at) AS last_obs,
+		       array_agg(DISTINCT type ORDER BY type) AS types
+		FROM observations
+		WHERE deleted_at IS NULL
+		  AND created_by IS NOT NULL
+		  AND created_by != ''`
+	obsArgs := []any{}
+	argN := 1
+	if project != "" {
+		obsQuery += fmt.Sprintf(" AND project = $%d", argN)
+		obsArgs = append(obsArgs, project)
+		argN++
+	}
+	obsQuery += " GROUP BY created_by"
+
+	obsRows, err := s.pool.Query(ctx, obsQuery, obsArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("list contributors observations: %w", err)
+	}
+	defer obsRows.Close()
+
+	type obsAgg struct {
+		obsCount   int
+		lastActive time.Time
+		types      []string
+	}
+	obsMap := make(map[string]obsAgg)
+	for obsRows.Next() {
+		var identity string
+		var count int
+		var lastObs time.Time
+		var types []string
+		if err := obsRows.Scan(&identity, &count, &lastObs, &types); err != nil {
+			return nil, err
+		}
+		obsMap[identity] = obsAgg{obsCount: count, lastActive: lastObs, types: types}
+	}
+	if err := obsRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Build the prompts aggregation.
+	pQuery := `
+		SELECT created_by,
+		       COUNT(*) AS prompt_count,
+		       MAX(created_at) AS last_prompt
+		FROM user_prompts
+		WHERE created_by IS NOT NULL
+		  AND created_by != ''`
+	pArgs := []any{}
+	pArgN := 1
+	if project != "" {
+		pQuery += fmt.Sprintf(" AND project = $%d", pArgN)
+		pArgs = append(pArgs, project)
+		pArgN++
+	}
+	pQuery += " GROUP BY created_by"
+
+	pRows, err := s.pool.Query(ctx, pQuery, pArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("list contributors prompts: %w", err)
+	}
+	defer pRows.Close()
+
+	type promptAgg struct {
+		count      int
+		lastActive time.Time
+	}
+	promptMap := make(map[string]promptAgg)
+	for pRows.Next() {
+		var identity string
+		var count int
+		var lastPrompt time.Time
+		if err := pRows.Scan(&identity, &count, &lastPrompt); err != nil {
+			return nil, err
+		}
+		promptMap[identity] = promptAgg{count: count, lastActive: lastPrompt}
+	}
+	if err := pRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Merge results — build a union of identities from both maps.
+	seen := make(map[string]bool)
+	var identities []string
+	for id := range obsMap {
+		if !seen[id] {
+			seen[id] = true
+			identities = append(identities, id)
+		}
+	}
+	for id := range promptMap {
+		if !seen[id] {
+			seen[id] = true
+			identities = append(identities, id)
+		}
+	}
+
+	var results []ContributorStats
+	for _, identity := range identities {
+		cs := ContributorStats{Identity: identity}
+		var lastActive time.Time
+		if oa, ok := obsMap[identity]; ok {
+			cs.Observations = oa.obsCount
+			if oa.lastActive.After(lastActive) {
+				lastActive = oa.lastActive
+			}
+			// Limit top types to first 3.
+			types := oa.types
+			if len(types) > 3 {
+				types = types[:3]
+			}
+			cs.TopTypes = types
+		}
+		if pa, ok := promptMap[identity]; ok {
+			cs.Prompts = pa.count
+			if pa.lastActive.After(lastActive) {
+				lastActive = pa.lastActive
+			}
+		}
+		if !lastActive.IsZero() {
+			cs.LastActive = formatTS(lastActive)
+		}
+		results = append(results, cs)
+	}
+
+	// Sort by last active descending.
+	for i := 1; i < len(results); i++ {
+		for j := i; j > 0 && results[j].LastActive > results[j-1].LastActive; j-- {
+			results[j], results[j-1] = results[j-1], results[j]
+		}
+	}
+
+	return results, nil
+}
+
 // ─── Passive Capture ─────────────────────────────────────────────────────────
 
 func (s *Store) PassiveCapture(p PassiveCaptureParams) (*PassiveCaptureResult, error) {
@@ -2564,6 +2858,37 @@ var privateTagRegex = regexp.MustCompile(`(?is)<private>.*?</private>`)
 func stripPrivateTags(s string) string {
 	result := privateTagRegex.ReplaceAllString(s, "[REDACTED]")
 	return strings.TrimSpace(result)
+}
+
+// resolveSince converts a human-readable time filter to a UTC timestamp string
+// suitable for SQL comparison. Accepts "today", "yesterday", "week", "month",
+// or an ISO date like "2026-01-15".
+func resolveSince(since string) string {
+	now := time.Now().UTC()
+	switch strings.TrimSpace(strings.ToLower(since)) {
+	case "today":
+		y, m, d := now.Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Format(tsFormat)
+	case "yesterday":
+		y, m, d := now.AddDate(0, 0, -1).Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Format(tsFormat)
+	case "week":
+		y, m, d := now.AddDate(0, 0, -7).Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Format(tsFormat)
+	case "month":
+		y, m, d := now.AddDate(0, -1, 0).Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Format(tsFormat)
+	default:
+		// Try ISO date.
+		if t, err := time.Parse("2006-01-02", strings.TrimSpace(since)); err == nil {
+			return t.UTC().Format(tsFormat)
+		}
+		// Try full timestamp.
+		if t, err := time.Parse(tsFormat, strings.TrimSpace(since)); err == nil {
+			return t.UTC().Format(tsFormat)
+		}
+	}
+	return ""
 }
 
 func sanitizeFTS(query string) string {

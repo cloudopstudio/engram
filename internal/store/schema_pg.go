@@ -274,6 +274,85 @@ func migratePG(pool *pgxpool.Pool) error {
 					USING (created_by = current_user);
 			`,
 		},
+		{
+			version:     6,
+			description: "RLS policies use engram.identity GUC instead of current_user",
+			sql: `
+				-- The engram.identity GUC is set per-connection via AfterConnect
+				-- with the Entra ID UPN (e.g. user@company.com). This allows RLS
+				-- to distinguish users even when they share the same PG role.
+				--
+				-- current_setting('engram.identity', true) returns NULL if the GUC
+				-- is not set (e.g. password auth without Entra), which makes the
+				-- COALESCE fall back to current_user for backward compatibility.
+
+				-- Helper: resolve the effective identity for RLS.
+				CREATE OR REPLACE FUNCTION engram_current_identity() RETURNS TEXT AS $$
+					SELECT COALESCE(
+						NULLIF(current_setting('engram.identity', true), ''),
+						current_user
+					);
+				$$ LANGUAGE sql STABLE;
+
+				-- ── Observations policies ──
+
+				DROP POLICY IF EXISTS obs_visibility ON observations;
+				CREATE POLICY obs_visibility ON observations
+					FOR SELECT
+					USING (
+						scope = 'project'
+						OR scope IS NULL
+						OR (scope = 'personal' AND created_by = engram_current_identity())
+					);
+
+				DROP POLICY IF EXISTS obs_insert ON observations;
+				CREATE POLICY obs_insert ON observations
+					FOR INSERT
+					WITH CHECK (true);
+
+				DROP POLICY IF EXISTS obs_modify ON observations;
+				CREATE POLICY obs_modify ON observations
+					FOR UPDATE
+					USING (
+						scope = 'project'
+						OR (scope = 'personal' AND created_by = engram_current_identity())
+					);
+
+				DROP POLICY IF EXISTS obs_delete ON observations;
+				CREATE POLICY obs_delete ON observations
+					FOR DELETE
+					USING (
+						scope = 'project'
+						OR (scope = 'personal' AND created_by = engram_current_identity())
+					);
+
+				-- ── User prompts policies ──
+
+				DROP POLICY IF EXISTS prompts_visibility ON user_prompts;
+				CREATE POLICY prompts_visibility ON user_prompts
+					FOR SELECT
+					USING (created_by = engram_current_identity());
+
+				DROP POLICY IF EXISTS prompts_insert ON user_prompts;
+				CREATE POLICY prompts_insert ON user_prompts
+					FOR INSERT
+					WITH CHECK (true);
+
+				DROP POLICY IF EXISTS prompts_modify ON user_prompts;
+				CREATE POLICY prompts_modify ON user_prompts
+					FOR UPDATE
+					USING (created_by = engram_current_identity());
+
+				DROP POLICY IF EXISTS prompts_delete ON user_prompts;
+				CREATE POLICY prompts_delete ON user_prompts
+					FOR DELETE
+					USING (created_by = engram_current_identity());
+
+				-- Backfill: update empty created_by with current_user as best effort.
+				UPDATE observations SET created_by = current_user WHERE created_by = '';
+				UPDATE user_prompts SET created_by = current_user WHERE created_by = '';
+			`,
+		},
 	}
 
 	for _, m := range migrations {

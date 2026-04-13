@@ -23,6 +23,9 @@ func resetSetupSeams(t *testing.T) {
 	oldJSONMarshalFn := jsonMarshalFn
 	oldJSONMarshalIndentFn := jsonMarshalIndentFn
 	oldInjectOpenCodeMCPFn := injectOpenCodeMCPFn
+	oldInjectOpenCodeServerPluginFn := injectOpenCodeServerPluginFn
+	oldInjectOpenCodeTUIPluginFn := injectOpenCodeTUIPluginFn
+	oldInstallNPMDependenciesFn := installNPMDependenciesFn
 	oldInjectGeminiMCPFn := injectGeminiMCPFn
 	oldWriteGeminiSystemPromptFn := writeGeminiSystemPromptFn
 	oldWriteCodexMemoryInstructionFilesFn := writeCodexMemoryInstructionFilesFn
@@ -45,6 +48,9 @@ func resetSetupSeams(t *testing.T) {
 		jsonMarshalFn = oldJSONMarshalFn
 		jsonMarshalIndentFn = oldJSONMarshalIndentFn
 		injectOpenCodeMCPFn = oldInjectOpenCodeMCPFn
+		injectOpenCodeServerPluginFn = oldInjectOpenCodeServerPluginFn
+		injectOpenCodeTUIPluginFn = oldInjectOpenCodeTUIPluginFn
+		installNPMDependenciesFn = oldInstallNPMDependenciesFn
 		injectGeminiMCPFn = oldInjectGeminiMCPFn
 		writeGeminiSystemPromptFn = oldWriteGeminiSystemPromptFn
 		writeCodexMemoryInstructionFilesFn = oldWriteCodexMemoryInstructionFilesFn
@@ -306,13 +312,16 @@ func TestInstallOpenCodeSuccessAndMCPRegistered(t *testing.T) {
 	runtimeGOOS = "linux"
 	xdg := filepath.Join(home, "xdg")
 	t.Setenv("XDG_CONFIG_HOME", xdg)
+	// Stub npm install so it doesn't actually run in the test environment.
+	installNPMDependenciesFn = func(string) error { return nil }
 
 	result, err := installOpenCode()
 	if err != nil {
 		t.Fatalf("installOpenCode failed: %v", err)
 	}
-	if result.Files != 2 {
-		t.Fatalf("expected 2 files after MCP registration, got %d", result.Files)
+	// 1 (engram.ts) + 1 (opencode.json MCP) + 4 (TUI plugin files) + 1 (tui.json) = 7
+	if result.Files != 7 {
+		t.Fatalf("expected 7 files after full install, got %d", result.Files)
 	}
 
 	pluginPath := filepath.Join(xdg, "opencode", "plugins", "engram.ts")
@@ -320,6 +329,7 @@ func TestInstallOpenCodeSuccessAndMCPRegistered(t *testing.T) {
 		t.Fatalf("expected plugin file to exist: %v", err)
 	}
 
+	// Verify MCP registration in opencode.json
 	raw, err := os.ReadFile(filepath.Join(xdg, "opencode", "opencode.json"))
 	if err != nil {
 		t.Fatalf("read opencode config: %v", err)
@@ -334,6 +344,33 @@ func TestInstallOpenCodeSuccessAndMCPRegistered(t *testing.T) {
 	}
 	if _, ok := mcp["engram"]; !ok {
 		t.Fatalf("expected mcp.engram registration")
+	}
+
+	// Verify TUI plugin files were installed
+	tuiPluginDir := filepath.Join(xdg, "opencode", "plugins", "opencode-azure-entra-auth")
+	for _, f := range []string{"index.ts", "tui.tsx", "package.json", "README.md"} {
+		if _, err := os.Stat(filepath.Join(tuiPluginDir, f)); err != nil {
+			t.Fatalf("expected TUI plugin file %s to exist: %v", f, err)
+		}
+	}
+
+	// Verify tui.json was created with plugin registration
+	tuiConfigPath := filepath.Join(xdg, "opencode", "tui.json")
+	tuiRaw, err := os.ReadFile(tuiConfigPath)
+	if err != nil {
+		t.Fatalf("expected tui.json to exist: %v", err)
+	}
+	var tuiCfg map[string]any
+	if err := json.Unmarshal(tuiRaw, &tuiCfg); err != nil {
+		t.Fatalf("parse tui.json: %v", err)
+	}
+	plugins, ok := tuiCfg["plugin"].([]any)
+	if !ok || len(plugins) == 0 {
+		t.Fatalf("expected plugin array in tui.json")
+	}
+	pluginURI := plugins[0].(string)
+	if !strings.Contains(pluginURI, "opencode-azure-entra-auth") {
+		t.Fatalf("expected TUI plugin URI in tui.json, got %q", pluginURI)
 	}
 }
 
@@ -375,13 +412,18 @@ func TestInstallOpenCodeMCPInjectionFailureIsNonFatal(t *testing.T) {
 	injectOpenCodeMCPFn = func() error {
 		return errors.New("cannot write config")
 	}
+	// Stub TUI functions so only the core engram.ts counts when MCP injection fails.
+	injectOpenCodeTUIPluginFn = func(string) error { return nil }
+	injectOpenCodeServerPluginFn = func(string) error { return nil }
+	installNPMDependenciesFn = func(string) error { return nil }
 
 	result, err := installOpenCode()
 	if err != nil {
 		t.Fatalf("expected non-fatal MCP injection failure, got %v", err)
 	}
-	if result.Files != 1 {
-		t.Fatalf("expected only plugin file counted when MCP injection fails, got %d", result.Files)
+	// 1 (engram.ts) + MCP injection failed (0) + 4 (TUI plugin files) + 1 (tui.json) = 6
+	if result.Files != 6 {
+		t.Fatalf("expected 6 files (TUI still installed) when MCP injection fails, got %d", result.Files)
 	}
 }
 

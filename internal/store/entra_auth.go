@@ -109,6 +109,33 @@ func saveCachedToken(dataDir, accessToken string, expiresOn time.Time) error {
 	return nil
 }
 
+// ValidateCachedToken checks if a valid (non-expired) cached token exists.
+// Returns nil if valid, error explaining what to do if not.
+// The profile parameter is included in the error message to guide the user.
+func ValidateCachedToken(dataDir, profile string) error {
+	token, err := loadCachedToken(dataDir)
+	if err != nil || token == nil {
+		return fmt.Errorf("no cached Azure token found. Run:\n\n  engram login%s\n\nIf using OpenCode, the azure-entra-auth plugin handles this automatically.", profileFlag(profile))
+	}
+	if time.Now().After(token.ExpiresOn.Add(-tokenRefreshBuffer)) {
+		return fmt.Errorf("cached Azure token has expired. Run:\n\n  engram login%s\n\nIf using OpenCode, the azure-entra-auth plugin handles this automatically.", profileFlag(profile))
+	}
+	return nil
+}
+
+// ValidateCachedTokenExported exposes ValidateCachedToken for non-pgstore callers.
+func ValidateCachedTokenExported(dataDir, profile string) error {
+	return ValidateCachedToken(dataDir, profile)
+}
+
+// profileFlag returns " --profile <name>" if profile is non-empty, or "".
+func profileFlag(profile string) string {
+	if profile == "" {
+		return ""
+	}
+	return " --profile " + profile
+}
+
 // staticCredential implements azcore.TokenCredential for pre-cached tokens.
 type staticCredential struct {
 	token     string
@@ -315,7 +342,8 @@ func resolveAuthMethod(connStr string, dataDir string, profile string) string {
 }
 
 // configurePGPool creates a pgxpool.Config from a connection string, optionally
-// injecting Entra ID tokens via the BeforeConnect hook.
+// injecting Entra ID tokens via the BeforeConnect hook and setting the
+// engram.identity GUC variable via AfterConnect for RLS policies.
 func configurePGPool(connStr string, tp *TokenProvider) (*pgxpool.Config, error) {
 	pgxCfg, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
@@ -339,6 +367,22 @@ func configurePGPool(connStr string, tp *TokenProvider) (*pgxpool.Config, error)
 				return fmt.Errorf("entra token for pg connection: %w", err)
 			}
 			cfg.Password = token
+			return nil
+		}
+
+		// Set engram.identity GUC on each new connection so RLS policies
+		// can identify the real user even when multiple Entra users share
+		// the same PostgreSQL role. The identity is extracted from the JWT
+		// token's UPN/email claim.
+		pgxCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			identity := tp.Identity()
+			if identity != "" {
+				if _, err := conn.Exec(ctx,
+					"SELECT set_config('engram.identity', $1, false)", identity,
+				); err != nil {
+					return fmt.Errorf("set engram.identity GUC: %w", err)
+				}
+			}
 			return nil
 		}
 	}

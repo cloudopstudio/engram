@@ -1,0 +1,44 @@
+{
+  "name": "opencode-azure-entra-auth",
+  "version": "4.0.0",
+  "description": "Azure Entra ID auth plugin for OpenCode — server (token refresh) + TUI (slash command login)",
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    "./server": "./index.ts",
+    "./tui": "./tui.tsx"
+  },
+  "files": [
+    "index.ts",
+    "tui.tsx"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gentleman-Programming/engram.git",
+    "directory": "plugins/opencode-azure-entra-auth"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.9.1"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.3.8",
+    "@opentui/core": ">=0.1.92",
+    "@opentui/solid": ">=0.1.92"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": { "optional": true },
+    "@opentui/solid": { "optional": true }
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "azure",
+    "entra-id",
+    "authentication",
+    "engram",
+    "postgresql",
+    "azure-identity",
+    "tui",
+    "slash-command"
+  ]
+}

@@ -1,10 +1,12 @@
 // Package setup handles agent plugin installation.
 //
-//   - OpenCode: copies embedded plugin file to ~/.config/opencode/plugins/
+//   - OpenCode: copies embedded plugin files to ~/.config/opencode/plugins/
 //     (patching ENGRAM_BIN to bake in the absolute binary path as a final
 //     fallback) and injects MCP registration in opencode.json using the
 //     resolved absolute binary path so child processes never require PATH
 //     resolution in headless/systemd environments.
+//     Also installs the TUI plugin (opencode-azure-entra-auth) which provides
+//     the /engram-login slash command, and registers it in tui.json.
 //   - Claude Code: runs `claude plugin marketplace add` + `claude plugin install`,
 //     then writes a durable MCP config to ~/.claude/mcp/engram.json using the
 //     absolute binary path so the subprocess never needs PATH resolution.
@@ -41,6 +43,9 @@ var (
 	jsonMarshalFn                      = json.Marshal
 	jsonMarshalIndentFn                = json.MarshalIndent
 	injectOpenCodeMCPFn                = injectOpenCodeMCP
+	injectOpenCodeServerPluginFn       = injectOpenCodeServerPlugin
+	injectOpenCodeTUIPluginFn          = injectOpenCodeTUIPlugin
+	installNPMDependenciesFn           = installNPMDependencies
 	injectGeminiMCPFn                  = injectGeminiMCP
 	writeGeminiSystemPromptFn          = writeGeminiSystemPrompt
 	writeCodexMemoryInstructionFilesFn = writeCodexMemoryInstructionFiles
@@ -52,6 +57,9 @@ var (
 
 //go:embed plugins/opencode/*
 var openCodeFS embed.FS
+
+//go:embed plugins/opencode-azure-entra-auth/*
+var tuiPluginFS embed.FS
 
 // Agent represents a supported AI coding agent.
 type Agent struct {
@@ -325,11 +333,281 @@ func installOpenCode() (*Result, error) {
 		files = 2
 	}
 
+	// Install TUI plugin (opencode-azure-entra-auth) for /engram-login slash command.
+	tuiPluginDir := filepath.Join(dir, "opencode-azure-entra-auth")
+	tuiFiles, tuiErr := installTUIPlugin(tuiPluginDir)
+	if tuiErr != nil {
+		// Non-fatal: base plugin still works without TUI login
+		fmt.Fprintf(os.Stderr, "warning: could not install TUI plugin: %v\n", tuiErr)
+	} else {
+		files += tuiFiles
+	}
+
+	// Register TUI plugin in tui.json (idempotent).
+	if tuiErr == nil {
+		if err := injectOpenCodeTUIPluginFn(tuiPluginDir); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not register TUI plugin in tui.json: %v\n", err)
+		} else {
+			files++ // tui.json
+		}
+	}
+
+	// Register server plugin (index.ts) in opencode.json plugin array (idempotent).
+	if tuiErr == nil {
+		if err := injectOpenCodeServerPluginFn(tuiPluginDir); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not register server plugin in opencode.json: %v\n", err)
+		}
+		// Note: injectOpenCodeServerPlugin is idempotent and doesn't change file
+		// count since opencode.json may already be counted above.
+	}
+
+	// Install npm dependencies in the TUI plugin directory (best-effort).
+	if tuiErr == nil {
+		if err := installNPMDependenciesFn(tuiPluginDir); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not install TUI plugin dependencies: %v\n", err)
+			fmt.Fprintf(os.Stderr, "  Run manually: cd %s && npm install --production\n", tuiPluginDir)
+		}
+	}
+
 	return &Result{
 		Agent:       "opencode",
 		Destination: dir,
 		Files:       files,
 	}, nil
+}
+
+// installTUIPlugin copies the embedded opencode-azure-entra-auth plugin files
+// to the destination directory and returns the number of files written.
+func installTUIPlugin(destDir string) (int, error) {
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return 0, fmt.Errorf("create TUI plugin dir %s: %w", destDir, err)
+	}
+
+	absBin := resolveEngramCommand()
+	files := []string{"index.ts", "tui.tsx", "package.json", "README.md"}
+	written := 0
+
+	for _, name := range files {
+		data, err := tuiPluginFS.ReadFile("plugins/opencode-azure-entra-auth/" + name)
+		if err != nil {
+			return written, fmt.Errorf("read embedded %s: %w", name, err)
+		}
+
+		// Patch tui.tsx: apply the same ENGRAM_BIN baking as engram.ts.
+		if name == "tui.tsx" {
+			data = patchTuiTsxEngramBin(data, absBin)
+		}
+
+		dest := filepath.Join(destDir, name)
+		if err := openCodeWriteFileFn(dest, data, 0644); err != nil {
+			return written, fmt.Errorf("write %s: %w", dest, err)
+		}
+		written++
+	}
+
+	return written, nil
+}
+
+// patchTuiTsxEngramBin patches the resolveEngramBin() fallback in tui.tsx
+// to bake in the absolute binary path.
+//
+// The source file has a final fallback:
+//
+//	return "engram";
+//
+// The patched installed copy gets:
+//
+//	return Bun.which("engram") ?? "/abs/path/engram";
+//
+// This mirrors the strategy used by patchEngramBINLine for engram.ts.
+func patchTuiTsxEngramBin(src []byte, absBin string) []byte {
+	// The resolveEngramBin() function ends with a bare "engram" fallback.
+	// Match the specific return statement inside that function.
+	const marker = `  // Fall back to whatever "engram" resolves to on PATH.
+  return "engram";`
+
+	var replacement string
+	if absBin == "engram" {
+		// os.Executable failed — only add Bun.which, no absolute path
+		replacement = `  // Fall back to whatever "engram" resolves to on PATH.
+  return Bun.which("engram") ?? "engram";`
+	} else {
+		replacement = fmt.Sprintf(`  // Fall back to whatever "engram" resolves to on PATH.
+  return Bun.which("engram") ?? %q;`, absBin)
+	}
+
+	return []byte(strings.Replace(string(src), marker, replacement, 1))
+}
+
+// injectOpenCodeTUIPlugin creates or updates ~/.config/opencode/tui.json to
+// include the TUI plugin. Idempotent — skips if already registered.
+func injectOpenCodeTUIPlugin(tuiPluginDir string) error {
+	tuiConfigPath := filepath.Join(openCodeConfigDir(), "tui.json")
+
+	// Build the file:// URI with forward slashes (required even on Windows).
+	pluginURI := "file:///" + filepath.ToSlash(strings.TrimPrefix(tuiPluginDir, string(filepath.Separator)))
+	// On Unix, filepath.ToSlash("/home/...") → "/home/...", so "file:///home/..."
+	// is correct. On Windows "C:\Users\..." → "C:/Users/...", "file:///C:/Users/..."
+	// On Unix the path already starts with "/" so TrimPrefix has no effect;
+	// we need "file://" + absolute path = "file:///..." (three slashes total).
+	if tuiPluginDir != "" && tuiPluginDir[0] == '/' {
+		// Unix absolute path — use full path directly
+		pluginURI = "file://" + filepath.ToSlash(tuiPluginDir)
+	} else if len(tuiPluginDir) >= 2 && tuiPluginDir[1] == ':' {
+		// Windows drive letter path (e.g. C:\...)
+		pluginURI = "file:///" + filepath.ToSlash(tuiPluginDir)
+	}
+
+	// Read existing tui.json (or start fresh).
+	var config map[string]json.RawMessage
+	data, err := readFileFn(tuiConfigPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			config = make(map[string]json.RawMessage)
+		} else {
+			return fmt.Errorf("read tui.json: %w", err)
+		}
+	} else {
+		cleaned := stripJSONC(data)
+		if err := json.Unmarshal(cleaned, &config); err != nil {
+			return fmt.Errorf("parse tui.json: %w", err)
+		}
+	}
+
+	// Parse or create the "plugin" array.
+	var plugins []string
+	if raw, exists := config["plugin"]; exists {
+		if err := json.Unmarshal(raw, &plugins); err != nil {
+			return fmt.Errorf("parse plugin array: %w", err)
+		}
+	}
+
+	// Check if already registered (idempotent).
+	for _, p := range plugins {
+		if p == pluginURI {
+			return nil // already present
+		}
+	}
+
+	plugins = append(plugins, pluginURI)
+
+	pluginsJSON, err := jsonMarshalFn(plugins)
+	if err != nil {
+		return fmt.Errorf("marshal plugin array: %w", err)
+	}
+	config["plugin"] = json.RawMessage(pluginsJSON)
+
+	// Add $schema if not present.
+	if _, exists := config["$schema"]; !exists {
+		schemaJSON, _ := jsonMarshalFn("https://opencode.ai/tui.json")
+		config["$schema"] = json.RawMessage(schemaJSON)
+	}
+
+	output, err := jsonMarshalIndentFn(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal tui.json: %w", err)
+	}
+
+	if err := writeFileFn(tuiConfigPath, output, 0644); err != nil {
+		return fmt.Errorf("write tui.json: %w", err)
+	}
+
+	return nil
+}
+
+// injectOpenCodeServerPlugin adds the TUI plugin path to the "plugin" array
+// in opencode.json so the server plugin (index.ts) is also loaded. Idempotent.
+func injectOpenCodeServerPlugin(tuiPluginDir string) error {
+	configPath := openCodeConfigPath()
+
+	// Build the file:// URI with forward slashes.
+	var pluginURI string
+	if tuiPluginDir != "" && tuiPluginDir[0] == '/' {
+		pluginURI = "file://" + filepath.ToSlash(tuiPluginDir)
+	} else if len(tuiPluginDir) >= 2 && tuiPluginDir[1] == ':' {
+		pluginURI = "file:///" + filepath.ToSlash(tuiPluginDir)
+	} else {
+		pluginURI = "file:///" + filepath.ToSlash(tuiPluginDir)
+	}
+
+	// Read existing config (or start with empty object).
+	var config map[string]json.RawMessage
+	data, err := readFileFn(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			config = make(map[string]json.RawMessage)
+		} else {
+			return fmt.Errorf("read config: %w", err)
+		}
+	} else {
+		cleaned := stripJSONC(data)
+		if err := json.Unmarshal(cleaned, &config); err != nil {
+			return fmt.Errorf("parse config: %w", err)
+		}
+	}
+
+	// Parse or create the "plugin" array.
+	var plugins []string
+	if raw, exists := config["plugin"]; exists {
+		if err := json.Unmarshal(raw, &plugins); err != nil {
+			return fmt.Errorf("parse plugin array: %w", err)
+		}
+	}
+
+	// Check if already registered (idempotent).
+	for _, p := range plugins {
+		if p == pluginURI {
+			return nil // already present
+		}
+	}
+
+	plugins = append(plugins, pluginURI)
+
+	pluginsJSON, err := jsonMarshalFn(plugins)
+	if err != nil {
+		return fmt.Errorf("marshal plugin array: %w", err)
+	}
+	config["plugin"] = json.RawMessage(pluginsJSON)
+
+	output, err := jsonMarshalIndentFn(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+
+	if err := writeFileFn(configPath, output, 0644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+
+	return nil
+}
+
+// installNPMDependencies runs `bun install --production` (or npm install) in
+// the given directory to install @azure/identity. Best-effort — prefers bun
+// (which OpenCode ships with) and falls back to npm. Returns an error only if
+// no package manager is found or the install command fails.
+func installNPMDependencies(dir string) error {
+	// Try bun first (OpenCode's bundled runtime), then npm.
+	pkgManager := ""
+	for _, candidate := range []string{"bun", "npm"} {
+		if _, err := lookPathFn(candidate); err == nil {
+			pkgManager = candidate
+			break
+		}
+	}
+
+	if pkgManager == "" {
+		return fmt.Errorf("neither bun nor npm found in PATH — install dependencies manually")
+	}
+
+	// Use exec.Command directly so we can set the working directory.
+	// We don't use the runCommand var here because it doesn't support CWD.
+	cmd := exec.Command(pkgManager, "install", "--production")
+	cmd.Dir = dir
+	combined, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s install failed: %s", pkgManager, strings.TrimSpace(string(combined)))
+	}
+	return nil
 }
 
 // injectOpenCodeMCP adds the engram MCP server entry to opencode.json.
