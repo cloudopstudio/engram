@@ -14,7 +14,7 @@ This is the complete technical reference for Engram. For getting started, see th
 |---------|-----------------|
 | [Database Schema](#database-schema) | Tables, FTS5, SQLite config |
 | [HTTP API](#http-api-endpoints) | All REST endpoints with request/response details |
-| [MCP Tools](#mcp-tools-15-tools) | Detailed reference for all 15 memory tools |
+| [MCP Tools](#mcp-tools-18-tools) | Detailed reference for all 18 memory tools |
 | [Memory Protocol](#memory-protocol) | When/how agents should use the tools |
 | [Project Name Normalization](#project-name-normalization) | Auto-detection, normalization, similar-project warnings |
 | [Features](#features) | FTS5 search, timeline, privacy, git sync, compression |
@@ -125,11 +125,16 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 
 ---
 
-## MCP Tools (15 tools)
+## MCP Tools (18 tools)
 
 ### mem_search
 
 Search persistent memory across all sessions. Supports FTS5 full-text search with type/project/scope/limit filters.
+
+Additional filter parameters available when connected to a PostgreSQL-backed instance:
+
+- **`user`** — filter by creator identity (Entra ID email/UPN). Example: `user: "alice@company.com"`
+- **`since`** — filter by recency. Accepts: `"today"`, `"yesterday"`, `"week"`, `"month"`, or an ISO date string (`"2026-01-15"`)
 
 ### mem_save
 
@@ -203,6 +208,78 @@ Extract structured learnings from text output. Looks for `## Key Learnings:` sec
 ### mem_merge_projects
 
 **Admin tool.** Merge multiple project name variants into a single canonical name. Accepts an array of source project names and a target canonical name. All observations, sessions, and prompts from the source projects are reassigned to the canonical project.
+
+### mem_projects
+
+List all projects tracked in Engram with statistics: observation count, unique contributor count, and last activity date. Available on PostgreSQL-backed instances.
+
+```
+mem_projects()
+```
+
+Returns a summary table of every project the team has been working on.
+
+### mem_promote
+
+Promote a personal observation to project scope, making it visible to all team members. Available on PostgreSQL-backed instances.
+
+```
+mem_promote(id: 1234)
+```
+
+**Important notes:**
+- This action is **irreversible** — once promoted, the observation stays project-visible
+- Only the original creator of the observation can promote it
+- The tool validates ownership before allowing the promotion
+
+### mem_who
+
+List contributors with activity stats — team members who are using Engram, how many observations they've saved, and when they were last active. Available on PostgreSQL-backed instances.
+
+```
+mem_who()
+mem_who(project: "my-project")    # filter to a specific project
+```
+
+Returns: contributor identity (Entra UPN), observation count, prompt count, last active date, top observation types.
+
+---
+
+## Team Collaboration
+
+When connected to a PostgreSQL-backed Engram instance, the following collaboration features become available.
+
+### Personal vs Project Scope
+
+Every observation has a `scope` field that controls visibility:
+
+| Scope | Who Can See It | Use For |
+|-------|---------------|---------|
+| `project` | All team members | Architecture decisions, bug fixes, shared conventions |
+| `personal` | Only the creator | Private notes, sensitive context, work in progress |
+
+The default scope is `project`. Specify explicitly:
+
+```
+mem_save(title: "...", scope: "personal", ...)   # private
+mem_save(title: "...", scope: "project", ...)    # shared (default)
+```
+
+Scope is enforced at the **database level** via Row Level Security (RLS). The `engram.identity` PostgreSQL GUC is set to the authenticated user's Entra ID UPN on each connection — personal observations are invisible to all other users regardless of their PG role.
+
+### Promoting Observations
+
+To share a personal observation with the team:
+
+```
+mem_promote(id: 1234)
+```
+
+This is irreversible — once visible to the team, it cannot be made private again.
+
+### Contributor Tracking
+
+Every observation is stamped with `created_by` = the creator's Entra ID UPN at write time. Use `mem_who` to see contributor activity, and the `user` filter in `mem_search` to find memories from a specific teammate.
 
 ---
 

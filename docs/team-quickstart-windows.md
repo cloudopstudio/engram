@@ -1,11 +1,13 @@
 # Engram Cloud — Guia de Inicio Rapido (Windows)
 
-> Tu equipo ya tiene engram configurado. Esta guia te ayuda a actualizar a la version cloud con autenticacion Azure.
+> Tu equipo ya tiene engram configurado. Esta guia te ayuda a conectarte a la base de datos compartida con autenticacion Azure.
 
 ## Paso 1: Descargar la nueva version
 
-1. Descarga `engram_1.10.14-pg_windows_amd64.zip` desde:
-   https://github.com/White-Lion-Technology/engram/releases/tag/v1.10.14-pg
+1. Descarga el archivo ZIP de la ultima version desde:
+   https://github.com/Gentleman-Programming/engram/releases/latest
+
+   Busca `engram_windows_amd64.zip` (o `arm64` si tienes un procesador ARM).
 
 2. Descomprime el archivo
 
@@ -21,81 +23,110 @@
 4. Verifica:
    ```powershell
    engram version
-   # Deberia mostrar: engram 1.10.14-pg
    ```
 
 ## Paso 2: Configurar la conexion a Azure
 
-Ejecuta estos comandos en PowerShell (reemplaza `<TU-EMAIL>` con tu correo corporativo):
+Ejecuta estos comandos en PowerShell. Tu lider te proporcionara los valores de `TENANT-ID`, `CLIENT-ID`, y la URL de la base de datos:
 
 ```powershell
-engram config set database-url "postgres://<TU-EMAIL>@whitelion-context-psqlserver-prod.postgres.database.azure.com:5432/engram?sslmode=require"
-engram config set auth-method entra
+engram config set database-url "postgres://<TU-EMAIL>@<SERVIDOR>.postgres.database.azure.com:5432/engram?sslmode=require"
 engram config set tenant-id "<TENANT-ID>"
 engram config set client-id "<CLIENT-ID>"
 ```
 
-> Tu lider te proporcionara los valores de TENANT-ID y CLIENT-ID.
+Reemplaza:
+- `<TU-EMAIL>` — tu correo corporativo (ej. `juan@empresa.com`)
+- `<SERVIDOR>` — el nombre del servidor PostgreSQL que te de tu lider
+- `<TENANT-ID>` y `<CLIENT-ID>` — los UUIDs que te de tu lider
 
-## Paso 3: Instalar el plugin de autenticacion en OpenCode
+## Paso 3: Autenticarte
 
-1. Abre el archivo de configuracion de OpenCode:
-   ```powershell
-   notepad $env:USERPROFILE\.config\opencode\opencode.json
-   ```
+```powershell
+engram login
+```
 
-2. Busca la linea `"plugin"` y agrega el plugin de Azure:
-   ```json
-   "plugin": [
-     "opencode-gemini-auth@latest",
-     "opencode-anthropic-login-via-cli",
-     "file://C:/ruta/al/repo/engram/plugins/opencode-azure-entra-auth"
-   ],
-   ```
+Se abrira tu navegador automaticamente con la pagina de login de Microsoft. Inicia sesion con tu correo corporativo.
 
-   > Pregunta a tu lider la ruta exacta del plugin, o si esta publicado como paquete npm.
-
-3. En la seccion `"mcp"`, verifica que engram tenga esta configuracion:
-   ```json
-   "engram": {
-     "command": ["engram", "mcp"],
-     "enabled": true,
-     "type": "local"
-   }
-   ```
-
-4. Guarda y cierra el archivo.
-
-## Paso 4: Primera autenticacion
-
-1. Abre OpenCode
-2. Se abrira tu navegador automaticamente con la pagina de login de Microsoft
-3. Inicia sesion con tu correo corporativo (@whiteliontechnology.com)
-4. Si te pide permisos, acepta
-5. Veras un mensaje: **"Authenticated! You can close this tab."**
-6. Vuelve a OpenCode — engram estara en verde
+> **Si el navegador no se abre:** Aparecera una URL y un codigo corto en la terminal. Copia la URL, pégala en cualquier navegador, e ingresa el codigo.
 
 > **Solo necesitas hacer esto UNA VEZ.** El token se renueva automaticamente por ~90 dias.
 
-## Verificar que funciona
+> **Problema con URLs largas en Windows:** Si la URL se corta en la terminal, usa **Windows Terminal** o **PowerShell 7** (pwsh). Tambien puedes copiar la parte de la URL que empieza con `https://login.microsoftonline.com/...` y pegarla manualmente en el navegador.
 
-En OpenCode, prueba escribir:
+## Paso 4: Configurar OpenCode
+
+```powershell
+engram setup opencode
+```
+
+Este comando configura OpenCode automaticamente para usar engram. Reinicia OpenCode despues de ejecutarlo.
+
+Si prefieres configurar manualmente, abre el archivo de configuracion de OpenCode:
+
+```powershell
+notepad $env:APPDATA\opencode\opencode.json
+```
+
+Y verifica que la seccion `"mcp"` tenga esta entrada:
+
+```json
+"engram": {
+  "command": ["engram", "mcp"],
+  "enabled": true,
+  "type": "local"
+}
+```
+
+> **Nota:** Si usas OpenCode como aplicacion de escritorio (no en terminal), el comando `engram login` debe ejecutarse desde PowerShell, no desde dentro de OpenCode.
+
+## Paso 5: Verificar que funciona
+
+Reinicia OpenCode y luego escribe:
+
 ```
 Busca en mi memoria algo sobre arquitectura
 ```
 
 Si el agente usa `mem_search` y devuelve resultados, esta funcionando!
 
+## Uso diario
+
+Una vez configurado, no necesitas hacer nada especial:
+
+- Abre OpenCode normalmente
+- El agente usa engram automaticamente
+- Tus memorias se guardan en la base de datos compartida del equipo
+- Despues de ~90 dias, ejecuta `engram login` de nuevo cuando se te pida
+
+## Memorias personales vs del equipo
+
+Cuando el agente guarda una memoria, puede ser:
+
+- **`scope: project`** — visible para todo el equipo (valor por defecto)
+- **`scope: personal`** — solo visible para ti (protegido a nivel de base de datos)
+
+Si quieres compartir una memoria personal con el equipo:
+
+```
+mem_promote(id: <ID de la memoria>)
+```
+
+> Esto es **irreversible** — una vez compartida, no puede volver a ser privada.
+
 ## Problemas comunes
 
 | Problema | Solucion |
 |----------|----------|
-| "engram" no es un comando reconocido | Verifica que engram.exe esta en tu PATH |
-| El browser no se abre | Ejecuta `engram login` manualmente en PowerShell |
+| `engram` no es un comando reconocido | Verifica que `engram.exe` esta en una carpeta en tu PATH (ej. `%USERPROFILE%\go\bin`) |
+| El browser no se abre | Ejecuta `engram login` en PowerShell; si sigue sin abrirse, usa el codigo Device Code que aparece |
+| URL cortada en la terminal | Usa Windows Terminal o PowerShell 7 (pwsh) |
+| `unknown key: tenant-id` | Actualiza a la ultima version de engram |
+| `AADSTS900144: scope missing` | Verifica que `tenant-id` y `client-id` esten configurados correctamente |
 | engram aparece en rojo en OpenCode | Cierra y vuelve a abrir OpenCode |
 | "no cached Azure token" | Ejecuta `engram login` en PowerShell |
 | "connection refused" | Verifica con tu lider que tu IP esta en la lista de Azure |
 
 ## Necesitas ayuda?
 
-Contacta a tu lider de arquitectura.
+Contacta a tu lider de arquitectura o consulta la guia completa: [engram-cloud-setup.md](engram-cloud-setup.md)
