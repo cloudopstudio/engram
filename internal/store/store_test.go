@@ -4250,7 +4250,7 @@ func TestListProjectsWithStats(t *testing.T) {
 	}
 
 	// Find proj-a and proj-b in results
-	statsMap := make(map[string]ProjectStats)
+	statsMap := make(map[string]ProjectDetailStats)
 	for _, ps := range stats {
 		statsMap[ps.Name] = ps
 	}

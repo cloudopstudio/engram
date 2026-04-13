@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -26,6 +27,13 @@ import (
 	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Sentinel errors returned by delete operations so callers can use errors.Is.
+var (
+	ErrSessionNotFound        = errors.New("session not found")
+	ErrSessionHasObservations = errors.New("session still has observations")
+	ErrPromptNotFound         = errors.New("prompt not found")
 )
 
 // ─── Types (duplicated from store.go for build-tag isolation) ────────────────
@@ -2224,6 +2232,347 @@ func (s *Store) ListContributors(project string) ([]ContributorStats, error) {
 	}
 
 	return results, nil
+}
+
+// ─── Delete Session ──────────────────────────────────────────────────────────
+
+// DeleteSession hard-deletes a session and its prompts.
+// Returns ErrSessionHasObservations if the session has any observations,
+// and ErrSessionNotFound if no session with that ID exists.
+func (s *Store) DeleteSession(id string) error {
+	ctx := context.Background()
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		// Count ALL observations for the session (including soft-deleted).
+		var count int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM observations WHERE session_id = $1`, id).Scan(&count); err != nil {
+			return fmt.Errorf("delete session: count observations: %w", err)
+		}
+		if count > 0 {
+			return fmt.Errorf("%w: session %q has %d observation(s)", ErrSessionHasObservations, id, count)
+		}
+
+		if _, err := tx.Exec(ctx, `DELETE FROM user_prompts WHERE session_id = $1`, id); err != nil {
+			return fmt.Errorf("delete session: remove prompts: %w", err)
+		}
+
+		tag, err := tx.Exec(ctx, `DELETE FROM sessions WHERE id = $1`, id)
+		if err != nil {
+			return fmt.Errorf("delete session: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
+		}
+		return nil
+	})
+}
+
+// ─── Delete Prompt ───────────────────────────────────────────────────────────
+
+// DeletePrompt hard-deletes a single prompt by ID.
+// Returns ErrPromptNotFound if no prompt with that ID exists.
+func (s *Store) DeletePrompt(id int64) error {
+	ctx := context.Background()
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `DELETE FROM user_prompts WHERE id = $1`, id)
+		if err != nil {
+			return fmt.Errorf("delete prompt: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
+		}
+		return nil
+	})
+}
+
+// ─── Project Queries ──────────────────────────────────────────────────────────
+
+// NormalizeProject applies canonical project name normalization:
+// lowercase + trim whitespace + collapse consecutive hyphens/underscores.
+// Returns the normalized name and a warning message if the name was changed.
+// Exported so MCP and CLI handlers can surface the warning to users.
+func NormalizeProject(project string) (normalized string, warning string) {
+	if project == "" {
+		return "", ""
+	}
+	n := strings.TrimSpace(strings.ToLower(project))
+	// Collapse multiple consecutive hyphens
+	for strings.Contains(n, "--") {
+		n = strings.ReplaceAll(n, "--", "-")
+	}
+	// Collapse multiple consecutive underscores
+	for strings.Contains(n, "__") {
+		n = strings.ReplaceAll(n, "__", "_")
+	}
+	if n == project {
+		return n, ""
+	}
+	return n, fmt.Sprintf("⚠️ Project name normalized: %q → %q", project, n)
+}
+
+// ListProjectNames returns all distinct project names from observations,
+// ordered alphabetically. Used for fuzzy matching and consolidation.
+func (s *Store) ListProjectNames() ([]string, error) {
+	ctx := context.Background()
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT project FROM observations
+		 WHERE project IS NOT NULL AND project != '' AND deleted_at IS NULL
+		 ORDER BY project`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		results = append(results, name)
+	}
+	return results, rows.Err()
+}
+
+// CountObservationsForProject returns the number of non-deleted observations
+// for the given project name.
+func (s *Store) CountObservationsForProject(name string) (int, error) {
+	ctx := context.Background()
+	var count int
+	err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM observations WHERE project = $1 AND deleted_at IS NULL`, name,
+	).Scan(&count)
+	return count, err
+}
+
+// ProjectDetailStats holds aggregate statistics for a single project including
+// session and prompt counts. Used by ListProjectsWithStats and the consolidate CLI.
+type ProjectDetailStats struct {
+	Name             string   `json:"name"`
+	ObservationCount int      `json:"observation_count"`
+	SessionCount     int      `json:"session_count"`
+	PromptCount      int      `json:"prompt_count"`
+	Directories      []string `json:"directories"` // unique directories from sessions
+}
+
+// ListProjectsWithStats returns all projects with aggregated counts.
+// Ordered by observation count descending.
+func (s *Store) ListProjectsWithStats() ([]ProjectDetailStats, error) {
+	ctx := context.Background()
+
+	// Observation counts per project.
+	obsRows, err := s.pool.Query(ctx,
+		`SELECT project, COUNT(*) AS cnt
+		 FROM observations
+		 WHERE project IS NOT NULL AND project != '' AND deleted_at IS NULL
+		 GROUP BY project`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list projects obs: %w", err)
+	}
+	defer obsRows.Close()
+
+	statsMap := make(map[string]*ProjectDetailStats)
+	for obsRows.Next() {
+		var name string
+		var cnt int
+		if err := obsRows.Scan(&name, &cnt); err != nil {
+			return nil, err
+		}
+		statsMap[name] = &ProjectDetailStats{Name: name, ObservationCount: cnt}
+	}
+	if err := obsRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Session counts + directories per project.
+	sessRows, err := s.pool.Query(ctx,
+		`SELECT project, COUNT(*) AS cnt, directory
+		 FROM sessions
+		 WHERE project IS NOT NULL AND project != ''
+		 GROUP BY project, directory`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list projects sessions: %w", err)
+	}
+	defer sessRows.Close()
+
+	type projDir struct {
+		count int
+		dirs  map[string]bool
+	}
+	sessData := make(map[string]*projDir)
+	for sessRows.Next() {
+		var name, dir string
+		var cnt int
+		if err := sessRows.Scan(&name, &cnt, &dir); err != nil {
+			return nil, err
+		}
+		if sessData[name] == nil {
+			sessData[name] = &projDir{dirs: make(map[string]bool)}
+		}
+		sessData[name].count += cnt
+		if dir != "" {
+			sessData[name].dirs[dir] = true
+		}
+	}
+	if err := sessRows.Err(); err != nil {
+		return nil, err
+	}
+
+	for name, sd := range sessData {
+		if statsMap[name] == nil {
+			statsMap[name] = &ProjectDetailStats{Name: name}
+		}
+		statsMap[name].SessionCount = sd.count
+		for d := range sd.dirs {
+			statsMap[name].Directories = append(statsMap[name].Directories, d)
+		}
+	}
+
+	// Prompt counts per project.
+	promptRows, err := s.pool.Query(ctx,
+		`SELECT project, COUNT(*) AS cnt
+		 FROM user_prompts
+		 WHERE project IS NOT NULL AND project != ''
+		 GROUP BY project`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list projects prompts: %w", err)
+	}
+	defer promptRows.Close()
+
+	for promptRows.Next() {
+		var name string
+		var cnt int
+		if err := promptRows.Scan(&name, &cnt); err != nil {
+			return nil, err
+		}
+		if statsMap[name] == nil {
+			statsMap[name] = &ProjectDetailStats{Name: name}
+		}
+		statsMap[name].PromptCount = cnt
+	}
+	if err := promptRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Convert to slice, sorted by observation count descending.
+	results := make([]ProjectDetailStats, 0, len(statsMap))
+	for _, ps := range statsMap {
+		results = append(results, *ps)
+	}
+	for i := 1; i < len(results); i++ {
+		for j := i; j > 0 && results[j].ObservationCount > results[j-1].ObservationCount; j-- {
+			results[j], results[j-1] = results[j-1], results[j]
+		}
+	}
+	return results, nil
+}
+
+// MergeResult summarizes the result of merging multiple project name variants
+// into a single canonical project name.
+type MergeResult struct {
+	Canonical           string   `json:"canonical"`
+	SourcesMerged       []string `json:"sources_merged"`
+	ObservationsUpdated int64    `json:"observations_updated"`
+	SessionsUpdated     int64    `json:"sessions_updated"`
+	PromptsUpdated      int64    `json:"prompts_updated"`
+}
+
+// PruneResult holds the outcome of pruning a single project.
+type PruneResult struct {
+	Project         string `json:"project"`
+	SessionsDeleted int64  `json:"sessions_deleted"`
+	PromptsDeleted  int64  `json:"prompts_deleted"`
+}
+
+// PruneProject removes all sessions and prompts for a project that has zero
+// (non-deleted) observations. Returns an error if the project still has
+// observations — the caller must verify first.
+func (s *Store) PruneProject(project string) (*PruneResult, error) {
+	if project == "" {
+		return nil, fmt.Errorf("project name must not be empty")
+	}
+
+	count, err := s.CountObservationsForProject(project)
+	if err != nil {
+		return nil, fmt.Errorf("count observations: %w", err)
+	}
+	if count > 0 {
+		return nil, fmt.Errorf("project %q still has %d observations — cannot prune", project, count)
+	}
+
+	ctx := context.Background()
+	result := &PruneResult{Project: project}
+
+	err = s.withTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `DELETE FROM user_prompts WHERE project = $1`, project)
+		if err != nil {
+			return fmt.Errorf("prune prompts: %w", err)
+		}
+		result.PromptsDeleted = tag.RowsAffected()
+
+		tag, err = tx.Exec(ctx, `DELETE FROM sessions WHERE project = $1`, project)
+		if err != nil {
+			return fmt.Errorf("prune sessions: %w", err)
+		}
+		result.SessionsDeleted = tag.RowsAffected()
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// MergeProjects migrates all records from each source project name into the
+// canonical name. Sources that equal the canonical (after normalization) or
+// have no records are silently skipped — the operation is idempotent.
+func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult, error) {
+	canonical, _ = NormalizeProject(canonical)
+	if canonical == "" {
+		return nil, fmt.Errorf("canonical project name must not be empty")
+	}
+
+	ctx := context.Background()
+	result := &MergeResult{Canonical: canonical}
+
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		for _, src := range sources {
+			src, _ = NormalizeProject(src)
+			if src == "" || src == canonical {
+				continue
+			}
+
+			tag, err := tx.Exec(ctx, `UPDATE observations SET project = $1 WHERE project = $2`, canonical, src)
+			if err != nil {
+				return fmt.Errorf("merge observations %q → %q: %w", src, canonical, err)
+			}
+			result.ObservationsUpdated += tag.RowsAffected()
+
+			tag, err = tx.Exec(ctx, `UPDATE sessions SET project = $1 WHERE project = $2`, canonical, src)
+			if err != nil {
+				return fmt.Errorf("merge sessions %q → %q: %w", src, canonical, err)
+			}
+			result.SessionsUpdated += tag.RowsAffected()
+
+			tag, err = tx.Exec(ctx, `UPDATE user_prompts SET project = $1 WHERE project = $2`, canonical, src)
+			if err != nil {
+				return fmt.Errorf("merge prompts %q → %q: %w", src, canonical, err)
+			}
+			result.PromptsUpdated += tag.RowsAffected()
+
+			result.SourcesMerged = append(result.SourcesMerged, src)
+		}
+		// Enqueue sync mutations so cloud sync picks up the merged records.
+		return s.backfillProjectSyncMutationsTx(ctx, tx, canonical)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ─── Passive Capture ─────────────────────────────────────────────────────────

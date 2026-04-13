@@ -2451,8 +2451,9 @@ func (s *Store) ListProjectNames() ([]string, error) {
 	return results, rows.Err()
 }
 
-// ProjectStats holds aggregate statistics for a single project.
-type ProjectStats struct {
+// ProjectDetailStats holds aggregate statistics for a single project including
+// session and prompt counts. Used by ListProjectsWithStats and the consolidate CLI.
+type ProjectDetailStats struct {
 	Name             string   `json:"name"`
 	ObservationCount int      `json:"observation_count"`
 	SessionCount     int      `json:"session_count"`
@@ -2462,7 +2463,7 @@ type ProjectStats struct {
 
 // ListProjectsWithStats returns all projects with aggregated counts.
 // Ordered by observation count descending.
-func (s *Store) ListProjectsWithStats() ([]ProjectStats, error) {
+func (s *Store) ListProjectsWithStats() ([]ProjectDetailStats, error) {
 	// Observation counts per project
 	obsRows, err := s.queryItHook(s.db,
 		`SELECT project, COUNT(*) as cnt
@@ -2475,14 +2476,14 @@ func (s *Store) ListProjectsWithStats() ([]ProjectStats, error) {
 	}
 	defer obsRows.Close()
 
-	statsMap := make(map[string]*ProjectStats)
+	statsMap := make(map[string]*ProjectDetailStats)
 	for obsRows.Next() {
 		var name string
 		var cnt int
 		if err := obsRows.Scan(&name, &cnt); err != nil {
 			return nil, err
 		}
-		statsMap[name] = &ProjectStats{Name: name, ObservationCount: cnt}
+		statsMap[name] = &ProjectDetailStats{Name: name, ObservationCount: cnt}
 	}
 	if err := obsRows.Err(); err != nil {
 		return nil, err
@@ -2525,7 +2526,7 @@ func (s *Store) ListProjectsWithStats() ([]ProjectStats, error) {
 
 	for name, sd := range sessData {
 		if statsMap[name] == nil {
-			statsMap[name] = &ProjectStats{Name: name}
+			statsMap[name] = &ProjectDetailStats{Name: name}
 		}
 		statsMap[name].SessionCount = sd.count
 		for d := range sd.dirs {
@@ -2552,7 +2553,7 @@ func (s *Store) ListProjectsWithStats() ([]ProjectStats, error) {
 			return nil, err
 		}
 		if statsMap[name] == nil {
-			statsMap[name] = &ProjectStats{Name: name}
+			statsMap[name] = &ProjectDetailStats{Name: name}
 		}
 		statsMap[name].PromptCount = cnt
 	}
@@ -2561,7 +2562,7 @@ func (s *Store) ListProjectsWithStats() ([]ProjectStats, error) {
 	}
 
 	// Convert to slice, sorted by observation count descending
-	results := make([]ProjectStats, 0, len(statsMap))
+	results := make([]ProjectDetailStats, 0, len(statsMap))
 	for _, ps := range statsMap {
 		results = append(results, *ps)
 	}

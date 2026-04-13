@@ -198,8 +198,6 @@ func main() {
 		cmdLogin(cfg)
 	case "migrate":
 		cmdMigrate(cfg)
-	case "projects":
-		cmdProjects(cfg)
 	case "promote":
 		cmdPromote(cfg)
 	case "who":
@@ -639,30 +637,6 @@ func cmdExport(cfg store.Config) {
 	fmt.Printf("  Sessions:     %d\n", len(data.Sessions))
 	fmt.Printf("  Observations: %d\n", len(data.Observations))
 	fmt.Printf("  Prompts:      %d\n", len(data.Prompts))
-}
-
-func cmdProjects(cfg store.Config) {
-	s, err := storeNew(cfg)
-	if err != nil {
-		fatal(err)
-	}
-	defer s.Close()
-
-	projects, err := storeListProjects(s)
-	if err != nil {
-		fatal(err)
-	}
-
-	if len(projects) == 0 {
-		fmt.Println("No projects found.")
-		return
-	}
-
-	fmt.Printf("%-40s  %12s  %12s  %s\n", "PROJECT", "OBSERVATIONS", "CONTRIBUTORS", "LAST ACTIVITY")
-	fmt.Printf("%-40s  %12s  %12s  %s\n", strings.Repeat("-", 40), strings.Repeat("-", 12), strings.Repeat("-", 12), strings.Repeat("-", 19))
-	for _, p := range projects {
-		fmt.Printf("%-40s  %12d  %12d  %s\n", p.Project, p.Observations, p.Contributors, p.LastActivity)
-	}
 }
 
 func cmdPromote(cfg store.Config) {
@@ -1113,7 +1087,7 @@ type projectGroup struct {
 
 // groupSimilarProjects groups projects by name similarity and shared directories.
 // Uses a simple union-find approach.
-func groupSimilarProjects(projects []store.ProjectStats) []projectGroup {
+func groupSimilarProjects(projects []store.ProjectDetailStats) []projectGroup {
 	n := len(projects)
 	if n == 0 {
 		return nil
@@ -1257,7 +1231,7 @@ func cmdProjectsConsolidate(cfg store.Config) {
 
 		// Also find candidates by shared directory (catches renames like sdd-agent-team → agent-teams-lite)
 		allStats, _ := s.ListProjectsWithStats()
-		statsMap := make(map[string]store.ProjectStats)
+		statsMap := make(map[string]store.ProjectDetailStats)
 		var cwdDirs []string // directories for the canonical project
 		for _, ps := range allStats {
 			statsMap[ps.Name] = ps
@@ -1373,7 +1347,7 @@ func cmdProjectsConsolidate(cfg store.Config) {
 	fmt.Printf("Found %d group(s) of similar project names:\n\n", len(groups))
 
 	// Build stats map for obs counts
-	projectStatsMap := make(map[string]store.ProjectStats)
+	projectStatsMap := make(map[string]store.ProjectDetailStats)
 	for _, p := range projects {
 		projectStatsMap[p.Name] = p
 	}
@@ -1489,7 +1463,7 @@ func cmdProjectsPrune(cfg store.Config) {
 	}
 
 	// Find projects with 0 observations
-	var candidates []store.ProjectStats
+	var candidates []store.ProjectDetailStats
 	for _, ps := range allStats {
 		if ps.ObservationCount == 0 {
 			candidates = append(candidates, ps)
@@ -1521,7 +1495,7 @@ func cmdProjectsPrune(cfg store.Config) {
 		return
 	}
 
-	var selected []store.ProjectStats
+	var selected []store.ProjectDetailStats
 	if answer == "all" || answer == "a" {
 		selected = candidates
 	} else {
