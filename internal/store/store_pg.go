@@ -128,6 +128,7 @@ type ProjectStats struct {
 	Observations int    `json:"observations"`
 	Contributors int    `json:"contributors"`
 	LastActivity string `json:"last_activity"`
+	Deprecated   bool   `json:"deprecated,omitempty"`
 }
 
 // ContributorStats holds activity stats for a single contributor.
@@ -2032,19 +2033,23 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 
 // ListProjects returns all projects with observation counts, contributor counts,
 // and last activity date, ordered by most recently active first.
-func (s *Store) ListProjects() ([]ProjectStats, error) {
+// When includeDeprecated is false, deprecated projects are excluded.
+func (s *Store) ListProjects(includeDeprecated bool) ([]ProjectStats, error) {
 	ctx := context.Background()
 	rows, err := s.pool.Query(ctx, `
-		SELECT project,
+		SELECT o.project,
 		       COUNT(*) AS observations,
-		       COUNT(DISTINCT created_by) AS contributors,
-		       MAX(updated_at) AS last_activity
-		FROM observations
-		WHERE deleted_at IS NULL
-		  AND project IS NOT NULL
-		  AND project != ''
-		GROUP BY project
-		ORDER BY last_activity DESC`)
+		       COUNT(DISTINCT o.created_by) AS contributors,
+		       MAX(o.updated_at) AS last_activity,
+		       COALESCE(pm.deprecated, false) AS deprecated
+		FROM observations o
+		LEFT JOIN project_metadata pm ON pm.project = o.project
+		WHERE o.deleted_at IS NULL
+		  AND o.project IS NOT NULL
+		  AND o.project != ''
+		  AND ($1 = true OR pm.deprecated IS NULL OR pm.deprecated = false)
+		GROUP BY o.project, pm.deprecated
+		ORDER BY last_activity DESC`, includeDeprecated)
 	if err != nil {
 		return nil, fmt.Errorf("list projects: %w", err)
 	}
@@ -2054,13 +2059,75 @@ func (s *Store) ListProjects() ([]ProjectStats, error) {
 	for rows.Next() {
 		var ps ProjectStats
 		var lastActivity time.Time
-		if err := rows.Scan(&ps.Project, &ps.Observations, &ps.Contributors, &lastActivity); err != nil {
+		if err := rows.Scan(&ps.Project, &ps.Observations, &ps.Contributors, &lastActivity, &ps.Deprecated); err != nil {
 			return nil, err
 		}
 		ps.LastActivity = formatTS(lastActivity)
 		results = append(results, ps)
 	}
 	return results, rows.Err()
+}
+
+// DeprecateProject marks a project as deprecated in project_metadata.
+// It upserts the row setting deprecated=true, deprecated_at=NOW(), deprecated_by=identity.
+func (s *Store) DeprecateProject(project, identity string) error {
+	if project == "" {
+		return fmt.Errorf("project name must not be empty")
+	}
+	ctx := context.Background()
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO project_metadata (project, deprecated, deprecated_at, deprecated_by, updated_at)
+		VALUES ($1, true, NOW(), $2, NOW())
+		ON CONFLICT (project) DO UPDATE
+		  SET deprecated    = true,
+		      deprecated_at = NOW(),
+		      deprecated_by = $2,
+		      updated_at    = NOW()`,
+		project, identity)
+	if err != nil {
+		return fmt.Errorf("deprecate project: %w", err)
+	}
+	return nil
+}
+
+// ActivateProject removes the deprecated flag from a project.
+// If the row doesn't exist, this is a no-op (project is active by default).
+func (s *Store) ActivateProject(project string) error {
+	if project == "" {
+		return fmt.Errorf("project name must not be empty")
+	}
+	ctx := context.Background()
+	_, err := s.pool.Exec(ctx, `
+		UPDATE project_metadata
+		SET deprecated    = false,
+		    deprecated_at = NULL,
+		    deprecated_by = NULL,
+		    updated_at    = NOW()
+		WHERE project = $1`,
+		project)
+	if err != nil {
+		return fmt.Errorf("activate project: %w", err)
+	}
+	return nil
+}
+
+// IsProjectDeprecated returns true if the project exists in project_metadata with deprecated=true.
+func (s *Store) IsProjectDeprecated(project string) (bool, error) {
+	if project == "" {
+		return false, nil
+	}
+	ctx := context.Background()
+	var deprecated bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT deprecated FROM project_metadata WHERE project = $1`, project,
+	).Scan(&deprecated)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("is project deprecated: %w", err)
+	}
+	return deprecated, nil
 }
 
 // PromoteObservation changes an observation's scope from 'personal' to 'project'.
@@ -2346,6 +2413,7 @@ type ProjectDetailStats struct {
 	SessionCount     int      `json:"session_count"`
 	PromptCount      int      `json:"prompt_count"`
 	Directories      []string `json:"directories"` // unique directories from sessions
+	Deprecated       bool     `json:"deprecated,omitempty"`
 }
 
 // ListProjectsWithStats returns all projects with aggregated counts.
@@ -2448,6 +2516,23 @@ func (s *Store) ListProjectsWithStats() ([]ProjectDetailStats, error) {
 	}
 	if err := promptRows.Err(); err != nil {
 		return nil, err
+	}
+
+	// Deprecated status per project.
+	deprRows, err := s.pool.Query(ctx,
+		`SELECT project, deprecated FROM project_metadata WHERE deprecated = true`,
+	)
+	if err == nil {
+		defer deprRows.Close()
+		for deprRows.Next() {
+			var name string
+			var deprecated bool
+			if scanErr := deprRows.Scan(&name, &deprecated); scanErr == nil {
+				if statsMap[name] != nil {
+					statsMap[name].Deprecated = deprecated
+				}
+			}
+		}
 	}
 
 	// Convert to slice, sorted by observation count descending.

@@ -91,7 +91,15 @@ var (
 	storeExport        = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
 	jsonMarshalIndent  = json.MarshalIndent
 
-	storeListProjects     = func(s *store.Store) ([]store.ProjectStats, error) { return s.ListProjects() }
+	storeListProjects = func(s *store.Store, includeDeprecated bool) ([]store.ProjectStats, error) {
+		return s.ListProjects(includeDeprecated)
+	}
+	storeDeprecateProject = func(s *store.Store, project, identity string) error {
+		return s.DeprecateProject(project, identity)
+	}
+	storeActivateProject = func(s *store.Store, project string) error {
+		return s.ActivateProject(project)
+	}
 	storePromote          = func(s *store.Store, id int64, identity string) error { return s.PromoteObservation(id, identity) }
 	storeListContributors = func(s *store.Store, project string) ([]store.ContributorStats, error) {
 		return s.ListContributors(project)
@@ -1023,6 +1031,7 @@ func cmdObsidianExport(cfg store.Config) {
 
 func cmdProjects(cfg store.Config) {
 	// Route: engram projects list | engram projects consolidate [--all] [--dry-run]
+	// Also: engram projects deprecate <name> | engram projects activate <name>
 	subCmd := "list"
 	if len(os.Args) > 2 {
 		subCmd = os.Args[2]
@@ -1034,16 +1043,30 @@ func cmdProjects(cfg store.Config) {
 		cmdProjectsPrune(cfg)
 	case "list", "":
 		cmdProjectsList(cfg)
+	case "deprecate":
+		cmdProjectsDeprecate(cfg)
+	case "activate":
+		cmdProjectsActivate(cfg)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown projects subcommand: %s\n", subCmd)
-		fmt.Fprintln(os.Stderr, "usage: engram projects list")
+		fmt.Fprintln(os.Stderr, "usage: engram projects list [--all]")
 		fmt.Fprintln(os.Stderr, "       engram projects consolidate [--all] [--dry-run]")
 		fmt.Fprintln(os.Stderr, "       engram projects prune [--dry-run]")
+		fmt.Fprintln(os.Stderr, "       engram projects deprecate <project-name>")
+		fmt.Fprintln(os.Stderr, "       engram projects activate <project-name>")
 		exitFunc(1)
 	}
 }
 
 func cmdProjectsList(cfg store.Config) {
+	// Parse --all flag from remaining args (os.Args[3:] when subcommand is "list")
+	showAll := false
+	for _, arg := range os.Args[3:] {
+		if arg == "--all" {
+			showAll = true
+		}
+	}
+
 	s, err := storeNew(cfg)
 	if err != nil {
 		fatal(err)
@@ -1053,6 +1076,17 @@ func cmdProjectsList(cfg store.Config) {
 	projects, err := s.ListProjectsWithStats()
 	if err != nil {
 		fatal(err)
+	}
+
+	// Filter out deprecated unless --all is set
+	if !showAll {
+		filtered := projects[:0]
+		for _, p := range projects {
+			if !p.Deprecated {
+				filtered = append(filtered, p)
+			}
+		}
+		projects = filtered
 	}
 
 	if len(projects) == 0 {
@@ -1070,13 +1104,59 @@ func cmdProjectsList(cfg store.Config) {
 		if p.PromptCount == 1 {
 			promptWord = "prompt"
 		}
-		fmt.Printf("  %-30s %4d obs   %3d %-9s  %3d %s\n",
+		deprecatedMarker := ""
+		if p.Deprecated {
+			deprecatedMarker = " [deprecated]"
+		}
+		fmt.Printf("  %-30s %4d obs   %3d %-9s  %3d %s%s\n",
 			p.Name,
 			p.ObservationCount,
 			p.SessionCount, sessionWord,
 			p.PromptCount, promptWord,
+			deprecatedMarker,
 		)
 	}
+}
+
+func cmdProjectsDeprecate(cfg store.Config) {
+	if len(os.Args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: engram projects deprecate <project-name>")
+		exitFunc(1)
+		return
+	}
+	project := os.Args[3]
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+	}
+	defer s.Close()
+
+	if err := storeDeprecateProject(s, project, s.Identity()); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("Project %q has been deprecated.\n", project)
+	fmt.Println("It will be hidden from listings by default. Use 'engram projects list --all' to show it.")
+}
+
+func cmdProjectsActivate(cfg store.Config) {
+	if len(os.Args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: engram projects activate <project-name>")
+		exitFunc(1)
+		return
+	}
+	project := os.Args[3]
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+	}
+	defer s.Close()
+
+	if err := storeActivateProject(s, project); err != nil {
+		fatal(err)
+	}
+	fmt.Printf("Project %q has been activated (no longer deprecated).\n", project)
 }
 
 // projectGroup represents a set of project names that should be merged.

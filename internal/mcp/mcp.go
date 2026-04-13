@@ -65,6 +65,8 @@ var ProfileAgent = map[string]bool{
 	"mem_save_prompt":       true, // save user prompts
 	"mem_update":            true, // update observation by ID — skills say "use mem_update when you have an exact ID to correct"
 	"mem_projects":          true, // list projects with stats — team collaboration
+	"mem_deprecate_project": true, // deprecate project from default listings
+	"mem_activate_project":  true, // reactivate deprecated project
 	"mem_promote":           true, // promote personal observation to project scope
 	"mem_who":               true, // list contributors with stats
 }
@@ -592,8 +594,51 @@ GUIDELINES:
 				mcp.WithDestructiveHintAnnotation(false),
 				mcp.WithIdempotentHintAnnotation(true),
 				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithBoolean("include_deprecated",
+					mcp.Description("Include deprecated projects in the listing (default: false)"),
+				),
 			),
 			handleProjects(s),
+		)
+	}
+
+	// ─── mem_deprecate_project (profile: agent, deferred) ─────────────────
+	if shouldRegister("mem_deprecate_project", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_deprecate_project",
+				mcp.WithDescription("Mark a project as deprecated so it is hidden from default project listings. Use include_deprecated=true in mem_projects to show it again."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Deprecate Project"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("project",
+					mcp.Required(),
+					mcp.Description("Project name to deprecate"),
+				),
+			),
+			handleDeprecateProject(s),
+		)
+	}
+
+	// ─── mem_activate_project (profile: agent, deferred) ──────────────────
+	if shouldRegister("mem_activate_project", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_activate_project",
+				mcp.WithDescription("Reactivate a deprecated project so it appears again in default project listings."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Activate Project"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("project",
+					mcp.Required(),
+					mcp.Description("Project name to reactivate"),
+				),
+			),
+			handleActivateProject(s),
 		)
 	}
 
@@ -1284,7 +1329,8 @@ func handleMergeProjects(s *store.Store) server.ToolHandlerFunc {
 
 func handleProjects(s *store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		projects, err := s.ListProjects()
+		includeDeprecated, _ := req.GetArguments()["include_deprecated"].(bool)
+		projects, err := s.ListProjects(includeDeprecated)
 		if err != nil {
 			return mcp.NewToolResultError("Failed to list projects: " + err.Error()), nil
 		}
@@ -1299,6 +1345,32 @@ func handleProjects(s *store.Store) server.ToolHandlerFunc {
 		}
 
 		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+func handleDeprecateProject(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		project, _ := req.GetArguments()["project"].(string)
+		if strings.TrimSpace(project) == "" {
+			return mcp.NewToolResultError("project is required"), nil
+		}
+		if err := s.DeprecateProject(project, s.Identity()); err != nil {
+			return mcp.NewToolResultError("Failed to deprecate project: " + err.Error()), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Project %q marked as deprecated.", project)), nil
+	}
+}
+
+func handleActivateProject(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		project, _ := req.GetArguments()["project"].(string)
+		if strings.TrimSpace(project) == "" {
+			return mcp.NewToolResultError("project is required"), nil
+		}
+		if err := s.ActivateProject(project); err != nil {
+			return mcp.NewToolResultError("Failed to activate project: " + err.Error()), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("Project %q reactivated.", project)), nil
 	}
 }
 

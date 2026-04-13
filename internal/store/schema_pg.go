@@ -353,6 +353,21 @@ func migratePG(pool *pgxpool.Pool) error {
 				UPDATE user_prompts SET created_by = current_user WHERE created_by = '';
 			`,
 		},
+		{
+			version:     7,
+			description: "project_metadata table for project deprecation",
+			sql: `
+				CREATE TABLE IF NOT EXISTS project_metadata (
+					project       TEXT PRIMARY KEY,
+					deprecated    BOOLEAN NOT NULL DEFAULT false,
+					deprecated_at TIMESTAMPTZ,
+					deprecated_by TEXT,
+					description   TEXT,
+					created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+					updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+				);
+			`,
+		},
 	}
 
 	for _, m := range migrations {
