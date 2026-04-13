@@ -42,15 +42,15 @@ func TestValidateCachedToken_NoCacheWithProfile(t *testing.T) {
 func TestValidateCachedToken_ExpiredToken(t *testing.T) {
 	dir := t.TempDir()
 
-	// Write a token that expired 10 minutes ago.
+	// Write a token that expired 10 minutes ago — no refresh token.
 	expired := time.Now().Add(-10 * time.Minute)
-	if err := saveCachedToken(dir, "expired-access-token", expired); err != nil {
+	if err := saveCachedToken(dir, "expired-access-token", "", "", "", expired); err != nil {
 		t.Fatalf("saveCachedToken: %v", err)
 	}
 
 	err := ValidateCachedToken(dir, "")
 	if err == nil {
-		t.Fatal("expected error for expired token")
+		t.Fatal("expected error for expired token without refresh token")
 	}
 	if !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("error should mention 'expired': %v", err)
@@ -60,18 +60,33 @@ func TestValidateCachedToken_ExpiredToken(t *testing.T) {
 	}
 }
 
+func TestValidateCachedToken_ExpiredTokenWithRefresh(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a token that expired 10 minutes ago — WITH a refresh token.
+	expired := time.Now().Add(-10 * time.Minute)
+	if err := saveCachedToken(dir, "expired-access-token", "refresh-token-123", "tenant-id", "client-id", expired); err != nil {
+		t.Fatalf("saveCachedToken: %v", err)
+	}
+
+	// Should be considered valid because it has a refresh token.
+	if err := ValidateCachedToken(dir, ""); err != nil {
+		t.Fatalf("expected nil for expired token with refresh token, got: %v", err)
+	}
+}
+
 func TestValidateCachedToken_ExpiringWithinBuffer(t *testing.T) {
 	dir := t.TempDir()
 
-	// Token expires in 3 minutes — within the 5-minute buffer.
+	// Token expires in 3 minutes — within the 5-minute buffer, no refresh token.
 	almostExpired := time.Now().Add(3 * time.Minute)
-	if err := saveCachedToken(dir, "almost-expired-token", almostExpired); err != nil {
+	if err := saveCachedToken(dir, "almost-expired-token", "", "", "", almostExpired); err != nil {
 		t.Fatalf("saveCachedToken: %v", err)
 	}
 
 	err := ValidateCachedToken(dir, "prod")
 	if err == nil {
-		t.Fatal("expected error for token expiring within buffer")
+		t.Fatal("expected error for token expiring within buffer without refresh token")
 	}
 	if !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("error should mention 'expired': %v", err)
@@ -86,7 +101,7 @@ func TestValidateCachedToken_ValidToken(t *testing.T) {
 
 	// Token valid for 1 hour.
 	validUntil := time.Now().Add(1 * time.Hour)
-	if err := saveCachedToken(dir, "valid-access-token", validUntil); err != nil {
+	if err := saveCachedToken(dir, "valid-access-token", "", "", "", validUntil); err != nil {
 		t.Fatalf("saveCachedToken: %v", err)
 	}
 
@@ -99,7 +114,7 @@ func TestValidateCachedToken_ValidTokenWithProfile(t *testing.T) {
 	dir := t.TempDir()
 
 	validUntil := time.Now().Add(1 * time.Hour)
-	if err := saveCachedToken(dir, "valid-access-token", validUntil); err != nil {
+	if err := saveCachedToken(dir, "valid-access-token", "", "", "", validUntil); err != nil {
 		t.Fatalf("saveCachedToken: %v", err)
 	}
 

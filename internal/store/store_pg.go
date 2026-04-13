@@ -23,7 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -358,17 +357,13 @@ func New(cfg Config) (*Store, error) {
 		if cfg.AuthInteractive {
 			// Explicit --auth-interactive: use cached token only — never block
 			// with device code. The device code flow is reserved for `engram login`.
+			// If the token is expired but has a refresh token, use refreshableCredential
+			// so it can silently renew without user interaction.
 			if err := ValidateCachedToken(cfg.DataDir, cfg.Profile); err != nil {
 				return nil, fmt.Errorf("engram: %v", err)
 			}
 			cached, _ := loadCachedToken(cfg.DataDir)
-			cred := &staticCredential{token: cached.AccessToken, expiresOn: cached.ExpiresOn}
-			tp = &TokenProvider{
-				cred:    cred,
-				scope:   pgTokenScope,
-				dataDir: cfg.DataDir,
-				token:   &azcore.AccessToken{Token: cached.AccessToken, ExpiresOn: cached.ExpiresOn},
-			}
+			tp = newTokenProviderFromCache(cached, cfg.DataDir)
 		} else {
 			// Credential chain: try DefaultAzureCredential first (az login,
 			// managed identity, env vars), then fall back to token-cache.json
@@ -396,14 +391,12 @@ func New(cfg Config) (*Store, error) {
 						"Details — DefaultAzureCredential: %v", pgTokenScope, defaultCredErr)
 				}
 				cached, _ := loadCachedToken(cfg.DataDir)
-				cred := &staticCredential{token: cached.AccessToken, expiresOn: cached.ExpiresOn}
-				tp = &TokenProvider{
-					cred:    cred,
-					scope:   pgTokenScope,
-					dataDir: cfg.DataDir,
-					token:   &azcore.AccessToken{Token: cached.AccessToken, ExpiresOn: cached.ExpiresOn},
+				tp = newTokenProviderFromCache(cached, cfg.DataDir)
+				if cached.RefreshToken != "" {
+					log.Printf("[engram] using refreshable cached token (access expires %s)", cached.ExpiresOn.Format("15:04:05"))
+				} else {
+					log.Printf("[engram] using cached token (expires %s)", cached.ExpiresOn.Format("15:04:05"))
 				}
-				log.Printf("[engram] using cached token (expires %s)", cached.ExpiresOn.Format("15:04:05"))
 			}
 		}
 		// Acquire an initial token to populate identity.

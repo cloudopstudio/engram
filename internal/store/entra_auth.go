@@ -7,6 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,8 +65,11 @@ const tokenCacheFile = "token-cache.json"
 
 // cachedToken is the on-disk format for the file-based token cache.
 type cachedToken struct {
-	AccessToken string    `json:"access_token"`
-	ExpiresOn   time.Time `json:"expires_on"`
+	AccessToken  string    `json:"access_token"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
+	ExpiresOn    time.Time `json:"expires_on"`
+	TenantID     string    `json:"tenant_id,omitempty"`
+	ClientID     string    `json:"client_id,omitempty"`
 }
 
 // tokenCachePath returns the full path to the token cache file.
@@ -91,13 +97,17 @@ func loadCachedToken(dataDir string) (*cachedToken, error) {
 
 // saveCachedToken writes the token to the cache file with 0600 permissions.
 // Creates the dataDir if it doesn't exist.
-func saveCachedToken(dataDir, accessToken string, expiresOn time.Time) error {
+// refreshToken, tenantID and clientID are optional — pass empty string to omit.
+func saveCachedToken(dataDir, accessToken, refreshToken, tenantID, clientID string, expiresOn time.Time) error {
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return fmt.Errorf("create data dir for token cache: %w", err)
 	}
 	ct := cachedToken{
-		AccessToken: accessToken,
-		ExpiresOn:   expiresOn,
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		ExpiresOn:    expiresOn,
+		TenantID:     tenantID,
+		ClientID:     clientID,
 	}
 	data, err := json.Marshal(ct)
 	if err != nil {
@@ -109,18 +119,27 @@ func saveCachedToken(dataDir, accessToken string, expiresOn time.Time) error {
 	return nil
 }
 
-// ValidateCachedToken checks if a valid (non-expired) cached token exists.
-// Returns nil if valid, error explaining what to do if not.
+// ValidateCachedToken checks if a usable cached token exists.
+// A token is usable if it is either:
+//   - Still valid (not within tokenRefreshBuffer of expiry), OR
+//   - Expired but has a refresh token that can be used to renew it.
+//
+// Returns nil if usable, error explaining what to do if not.
 // The profile parameter is included in the error message to guide the user.
 func ValidateCachedToken(dataDir, profile string) error {
 	token, err := loadCachedToken(dataDir)
 	if err != nil || token == nil {
 		return fmt.Errorf("no cached Azure token found. Run:\n\n  engram login%s\n\nIf using OpenCode, the azure-entra-auth plugin handles this automatically.", profileFlag(profile))
 	}
-	if time.Now().After(token.ExpiresOn.Add(-tokenRefreshBuffer)) {
-		return fmt.Errorf("cached Azure token has expired. Run:\n\n  engram login%s\n\nIf using OpenCode, the azure-entra-auth plugin handles this automatically.", profileFlag(profile))
+	// Valid (non-expired) token — OK.
+	if time.Until(token.ExpiresOn) > tokenRefreshBuffer {
+		return nil
 	}
-	return nil
+	// Expired but refresh token present — can be renewed silently.
+	if token.RefreshToken != "" && token.TenantID != "" && token.ClientID != "" {
+		return nil
+	}
+	return fmt.Errorf("cached Azure token has expired. Run:\n\n  engram login%s\n\nIf using OpenCode, the azure-entra-auth plugin handles this automatically.", profileFlag(profile))
 }
 
 // ValidateCachedTokenExported exposes ValidateCachedToken for non-pgstore callers.
@@ -146,14 +165,242 @@ func (s *staticCredential) GetToken(_ context.Context, _ policy.TokenRequestOpti
 	return azcore.AccessToken{Token: s.token, ExpiresOn: s.expiresOn}, nil
 }
 
+// ─── Refreshable credential ──────────────────────────────────────────────────
+
+// refreshableCredential implements azcore.TokenCredential and can silently
+// renew an expired access token using the cached refresh token via a direct
+// OAuth2 refresh_token HTTP grant. No CGO required.
+type refreshableCredential struct {
+	accessToken  string
+	refreshToken string
+	expiresOn    time.Time
+	tenantID     string
+	clientID     string
+	scope        string
+	dataDir      string
+	mu           sync.Mutex
+}
+
+// GetToken returns a valid access token, refreshing via the refresh token when
+// the access token is expired or within tokenRefreshBuffer of expiry.
+func (r *refreshableCredential) GetToken(_ context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if time.Until(r.expiresOn) > tokenRefreshBuffer {
+		return azcore.AccessToken{Token: r.accessToken, ExpiresOn: r.expiresOn}, nil
+	}
+
+	if r.refreshToken == "" {
+		return azcore.AccessToken{}, fmt.Errorf("access token expired and no refresh token available — run 'engram login' to re-authenticate")
+	}
+
+	newAccess, newRefresh, newExpiry, err := refreshAccessToken(r.tenantID, r.clientID, r.refreshToken, r.scope)
+	if err != nil {
+		return azcore.AccessToken{}, fmt.Errorf("silent token refresh failed: %w — run 'engram login' to re-authenticate", err)
+	}
+
+	r.accessToken = newAccess
+	r.refreshToken = newRefresh
+	r.expiresOn = newExpiry
+
+	// Persist the new token pair (best-effort).
+	if r.dataDir != "" {
+		if saveErr := saveCachedToken(r.dataDir, newAccess, newRefresh, r.tenantID, r.clientID, newExpiry); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "engram: warning: failed to persist refreshed token: %v\n", saveErr)
+		}
+	}
+
+	return azcore.AccessToken{Token: r.accessToken, ExpiresOn: r.expiresOn}, nil
+}
+
+// ─── Direct OAuth2 HTTP helpers ──────────────────────────────────────────────
+
+// tokenEndpoint returns the Azure OAuth2 v2 token endpoint for a tenant.
+func tokenEndpoint(tenantID string) string {
+	return fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenantID)
+}
+
+// azureTokenResponse is the JSON shape returned by Azure token endpoints.
+type azureTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int64  `json:"expires_in"`
+	TokenType    string `json:"token_type"`
+	Error        string `json:"error"`
+	ErrorDesc    string `json:"error_description"`
+}
+
+// refreshAccessToken exchanges a refresh token for a new access+refresh token
+// pair by making a direct OAuth2 HTTP POST. No third-party dependencies required.
+func refreshAccessToken(tenantID, clientID, refreshToken, scope string) (accessToken, newRefreshToken string, expiresOn time.Time, err error) {
+	data := url.Values{}
+	data.Set("grant_type", "refresh_token")
+	data.Set("client_id", clientID)
+	data.Set("refresh_token", refreshToken)
+	data.Set("scope", scope+" offline_access")
+
+	resp, err := http.PostForm(tokenEndpoint(tenantID), data)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("http post to token endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("read token response: %w", err)
+	}
+
+	var tr azureTokenResponse
+	if err := json.Unmarshal(body, &tr); err != nil {
+		return "", "", time.Time{}, fmt.Errorf("parse token response: %w", err)
+	}
+	if tr.Error != "" {
+		return "", "", time.Time{}, fmt.Errorf("azure token error %s: %s", tr.Error, tr.ErrorDesc)
+	}
+	if tr.AccessToken == "" {
+		return "", "", time.Time{}, fmt.Errorf("azure returned empty access token (status %d)", resp.StatusCode)
+	}
+
+	expiry := time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
+	return tr.AccessToken, tr.RefreshToken, expiry, nil
+}
+
+// deviceCodeResponse is the JSON shape returned by the device code endpoint.
+type deviceCodeResponse struct {
+	DeviceCode      string `json:"device_code"`
+	UserCode        string `json:"user_code"`
+	VerificationURI string `json:"verification_uri"`
+	ExpiresIn       int64  `json:"expires_in"`
+	Interval        int64  `json:"interval"`
+	Message         string `json:"message"`
+	Error           string `json:"error"`
+	ErrorDesc       string `json:"error_description"`
+}
+
+// deviceCodeFlow performs the full Azure Device Code Flow using direct HTTP
+// calls. This gives us full control over the token response, including the
+// refresh token (which azidentity.DeviceCodeCredential does not expose).
+//
+// It writes the user prompt to stderr and blocks until the user completes
+// authentication in their browser or the device code expires.
+//
+// Returns the access token, refresh token, and expiry time on success.
+func deviceCodeFlow(ctx context.Context, tenantID, clientID, scope string) (accessToken, refreshToken string, expiresOn time.Time, err error) {
+	// Step 1: Request device + user code.
+	dcEndpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/devicecode", tenantID)
+	dcData := url.Values{}
+	dcData.Set("client_id", clientID)
+	dcData.Set("scope", scope+" offline_access")
+
+	dcResp, err := http.PostForm(dcEndpoint, dcData)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("request device code: %w", err)
+	}
+	defer dcResp.Body.Close()
+
+	dcBody, err := io.ReadAll(dcResp.Body)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("read device code response: %w", err)
+	}
+
+	var dc deviceCodeResponse
+	if err := json.Unmarshal(dcBody, &dc); err != nil {
+		return "", "", time.Time{}, fmt.Errorf("parse device code response: %w", err)
+	}
+	if dc.Error != "" {
+		return "", "", time.Time{}, fmt.Errorf("device code error %s: %s", dc.Error, dc.ErrorDesc)
+	}
+	if dc.DeviceCode == "" {
+		return "", "", time.Time{}, fmt.Errorf("azure returned empty device code (status %d)", dcResp.StatusCode)
+	}
+
+	// Display the user prompt.
+	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(os.Stderr, "  ┌─────────────────────────────────────────────────┐\n")
+	fmt.Fprintf(os.Stderr, "  │  engram: Azure authentication required           │\n")
+	fmt.Fprintf(os.Stderr, "  │                                                  │\n")
+	fmt.Fprintf(os.Stderr, "  │  %s\n", dc.Message)
+	fmt.Fprintf(os.Stderr, "  │                                                  │\n")
+	fmt.Fprintf(os.Stderr, "  │  Waiting for authentication...                   │\n")
+	fmt.Fprintf(os.Stderr, "  └─────────────────────────────────────────────────┘\n")
+	fmt.Fprintf(os.Stderr, "\n")
+
+	// Step 2: Poll until user authenticates or device code expires.
+	interval := time.Duration(dc.Interval) * time.Second
+	if interval < time.Second {
+		interval = 5 * time.Second
+	}
+
+	tokenData := url.Values{}
+	tokenData.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
+	tokenData.Set("client_id", clientID)
+	tokenData.Set("device_code", dc.DeviceCode)
+
+	deadline := time.Now().Add(time.Duration(dc.ExpiresIn) * time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return "", "", time.Time{}, ctx.Err()
+		case <-time.After(interval):
+		}
+
+		if time.Now().After(deadline) {
+			return "", "", time.Time{}, fmt.Errorf("device code expired — run 'engram login' to try again")
+		}
+
+		pollResp, err := http.PostForm(tokenEndpoint(tenantID), tokenData)
+		if err != nil {
+			return "", "", time.Time{}, fmt.Errorf("poll token endpoint: %w", err)
+		}
+		pollBody, err := io.ReadAll(pollResp.Body)
+		pollResp.Body.Close()
+		if err != nil {
+			return "", "", time.Time{}, fmt.Errorf("read poll response: %w", err)
+		}
+
+		var tr azureTokenResponse
+		if err := json.Unmarshal(pollBody, &tr); err != nil {
+			return "", "", time.Time{}, fmt.Errorf("parse poll response: %w", err)
+		}
+
+		switch tr.Error {
+		case "":
+			// Success.
+			if tr.AccessToken == "" {
+				return "", "", time.Time{}, fmt.Errorf("azure returned empty access token (status %d)", pollResp.StatusCode)
+			}
+			expiry := time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
+			return tr.AccessToken, tr.RefreshToken, expiry, nil
+		case "authorization_pending":
+			// User hasn't completed auth yet — keep polling.
+			continue
+		case "slow_down":
+			// Azure asking us to slow down.
+			interval += 5 * time.Second
+			continue
+		case "authorization_declined":
+			return "", "", time.Time{}, fmt.Errorf("authentication declined by user")
+		case "expired_token":
+			return "", "", time.Time{}, fmt.Errorf("device code expired — run 'engram login' to try again")
+		default:
+			return "", "", time.Time{}, fmt.Errorf("azure token error %s: %s", tr.Error, tr.ErrorDesc)
+		}
+	}
+}
+
 // NewDeviceCodeTokenProvider creates a TokenProvider that uses Azure Device Code
 // Flow with a file-based token cache. This is intended for non-dev users who
 // can't use 'az login' (e.g., running inside OpenCode/Claude/etc.).
 //
-// The file-based cache stores the access token in ~/.engram/token-cache.json
-// (0600 permissions). On startup, if a valid (non-expired) cached token exists,
-// it is used directly — no device code prompt. When expired or missing, a new
-// device code flow is triggered and the cache is updated.
+// The file-based cache stores the access token AND refresh token in
+// ~/.engram/token-cache.json (0600 permissions). On startup the resolution
+// order is:
+//
+//  1. Valid (non-expired) cached access token → used directly, no prompt.
+//  2. Expired cached token with a refresh token → silent renewal via OAuth2
+//     refresh_token grant, no prompt.
+//  3. No usable cache → interactive Device Code Flow prompt on stderr.
 //
 // ALL output goes to stderr — stdout is reserved for the MCP stdio protocol.
 func NewDeviceCodeTokenProvider(tenantID, clientID, dataDir string) (*TokenProvider, error) {
@@ -163,43 +410,103 @@ func NewDeviceCodeTokenProvider(tenantID, clientID, dataDir string) (*TokenProvi
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "engram: warning: failed to read token cache: %v\n", err)
 		}
-		if cached != nil && time.Until(cached.ExpiresOn) > tokenRefreshBuffer {
-			// Valid cached token — wrap in a static credential provider.
-			return &TokenProvider{
-				cred:    &staticCredential{token: cached.AccessToken, expiresOn: cached.ExpiresOn},
-				scope:   pgTokenScope,
-				dataDir: dataDir,
-				token:   &azcore.AccessToken{Token: cached.AccessToken, ExpiresOn: cached.ExpiresOn},
-			}, nil
+
+		if cached != nil {
+			// Case 1: access token still valid.
+			if time.Until(cached.ExpiresOn) > tokenRefreshBuffer {
+				return &TokenProvider{
+					cred:    &staticCredential{token: cached.AccessToken, expiresOn: cached.ExpiresOn},
+					scope:   pgTokenScope,
+					dataDir: dataDir,
+					token:   &azcore.AccessToken{Token: cached.AccessToken, ExpiresOn: cached.ExpiresOn},
+				}, nil
+			}
+
+			// Case 2: access token expired but refresh token present.
+			if cached.RefreshToken != "" && cached.TenantID != "" && cached.ClientID != "" {
+				cred := &refreshableCredential{
+					accessToken:  cached.AccessToken,
+					refreshToken: cached.RefreshToken,
+					expiresOn:    cached.ExpiresOn,
+					tenantID:     cached.TenantID,
+					clientID:     cached.ClientID,
+					scope:        pgTokenScope,
+					dataDir:      dataDir,
+				}
+				return &TokenProvider{
+					cred:    cred,
+					scope:   pgTokenScope,
+					dataDir: dataDir,
+				}, nil
+			}
 		}
 	}
 
-	// No valid cache — do device code flow.
-	cred, err := azidentity.NewDeviceCodeCredential(&azidentity.DeviceCodeCredentialOptions{
-		TenantID: tenantID,
-		ClientID: clientID,
-		UserPrompt: func(ctx context.Context, msg azidentity.DeviceCodeMessage) error {
-			fmt.Fprintf(os.Stderr, "\n")
-			fmt.Fprintf(os.Stderr, "  ┌─────────────────────────────────────────────────┐\n")
-			fmt.Fprintf(os.Stderr, "  │  engram: Azure authentication required           │\n")
-			fmt.Fprintf(os.Stderr, "  │                                                  │\n")
-			fmt.Fprintf(os.Stderr, "  │  %s\n", msg.Message)
-			fmt.Fprintf(os.Stderr, "  │                                                  │\n")
-			fmt.Fprintf(os.Stderr, "  │  Waiting for authentication...                   │\n")
-			fmt.Fprintf(os.Stderr, "  └─────────────────────────────────────────────────┘\n")
-			fmt.Fprintf(os.Stderr, "\n")
-			return nil
-		},
-	})
+	// Case 3: No usable cache — perform interactive Device Code Flow.
+	// We use direct HTTP calls so we can capture the refresh token,
+	// which azidentity.DeviceCodeCredential does not expose.
+	accessToken, refreshToken, expiresOn, err := deviceCodeFlow(context.Background(), tenantID, clientID, pgTokenScope)
 	if err != nil {
-		return nil, fmt.Errorf("entra: create device code credential: %w", err)
+		return nil, fmt.Errorf("entra: device code flow: %w", err)
+	}
+
+	// Persist both tokens immediately.
+	if dataDir != "" {
+		if saveErr := saveCachedToken(dataDir, accessToken, refreshToken, tenantID, clientID, expiresOn); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "engram: warning: failed to cache token: %v\n", saveErr)
+		}
 	}
 
 	return &TokenProvider{
-		cred:    cred,
+		cred:    &staticCredential{token: accessToken, expiresOn: expiresOn},
 		scope:   pgTokenScope,
 		dataDir: dataDir,
+		token:   &azcore.AccessToken{Token: accessToken, ExpiresOn: expiresOn},
 	}, nil
+}
+
+// newTokenProviderFromCache creates a TokenProvider from a cached token.
+// If the token has a refresh token, it uses refreshableCredential so the
+// access token can be silently renewed without user interaction.
+// If the token is still valid, it uses staticCredential for simplicity.
+func newTokenProviderFromCache(cached *cachedToken, dataDir string) *TokenProvider {
+	// If access token still valid — use static (fast path, no refresh needed yet).
+	if time.Until(cached.ExpiresOn) > tokenRefreshBuffer {
+		return &TokenProvider{
+			cred:    &staticCredential{token: cached.AccessToken, expiresOn: cached.ExpiresOn},
+			scope:   pgTokenScope,
+			dataDir: dataDir,
+			token:   &azcore.AccessToken{Token: cached.AccessToken, ExpiresOn: cached.ExpiresOn},
+		}
+	}
+
+	// Access token expired — use refreshable if we have a refresh token.
+	if cached.RefreshToken != "" && cached.TenantID != "" && cached.ClientID != "" {
+		cred := &refreshableCredential{
+			accessToken:  cached.AccessToken,
+			refreshToken: cached.RefreshToken,
+			expiresOn:    cached.ExpiresOn,
+			tenantID:     cached.TenantID,
+			clientID:     cached.ClientID,
+			scope:        pgTokenScope,
+			dataDir:      dataDir,
+		}
+		return &TokenProvider{
+			cred:    cred,
+			scope:   pgTokenScope,
+			dataDir: dataDir,
+		}
+	}
+
+	// Fallback: static credential even though it may be expired.
+	// ValidateCachedToken should have prevented us getting here without a
+	// valid token or refresh token, but be defensive.
+	return &TokenProvider{
+		cred:    &staticCredential{token: cached.AccessToken, expiresOn: cached.ExpiresOn},
+		scope:   pgTokenScope,
+		dataDir: dataDir,
+		token:   &azcore.AccessToken{Token: cached.AccessToken, ExpiresOn: cached.ExpiresOn},
+	}
 }
 
 // resolveInteractiveAuth resolves tenant-id and client-id for device code flow
@@ -260,8 +567,17 @@ func (tp *TokenProvider) Token(ctx context.Context) (string, error) {
 	tp.token = &token
 
 	// Persist to file cache (best-effort — don't fail the token request).
+	// We preserve any existing refresh token, tenant, and client IDs since
+	// TokenProvider.Token() is used for DefaultAzureCredential paths which
+	// don't use the refresh token mechanism.
 	if tp.dataDir != "" {
-		if saveErr := saveCachedToken(tp.dataDir, token.Token, token.ExpiresOn); saveErr != nil {
+		var existingRefresh, existingTenant, existingClient string
+		if existing, _ := loadCachedToken(tp.dataDir); existing != nil {
+			existingRefresh = existing.RefreshToken
+			existingTenant = existing.TenantID
+			existingClient = existing.ClientID
+		}
+		if saveErr := saveCachedToken(tp.dataDir, token.Token, existingRefresh, existingTenant, existingClient, token.ExpiresOn); saveErr != nil {
 			fmt.Fprintf(os.Stderr, "engram: warning: failed to cache token: %v\n", saveErr)
 		}
 	}
