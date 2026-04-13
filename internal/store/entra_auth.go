@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +16,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache"
 	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -32,10 +32,11 @@ const (
 // TokenProvider acquires and refreshes Entra ID access tokens for
 // Azure Database for PostgreSQL authentication. Thread-safe.
 type TokenProvider struct {
-	cred  azcore.TokenCredential
-	scope string
-	token *azcore.AccessToken
-	mu    sync.RWMutex
+	cred    azcore.TokenCredential
+	scope   string
+	token   *azcore.AccessToken
+	dataDir string // for file-based token cache persistence (empty = no persistence)
+	mu      sync.RWMutex
 }
 
 // NewTokenProvider creates a TokenProvider using DefaultAzureCredential.
@@ -52,29 +53,131 @@ func NewTokenProvider() (*TokenProvider, error) {
 	}, nil
 }
 
+// ─── File-based token cache ──────────────────────────────────────────────────
+// Replaces the azidentity/cache package which requires CGO for OS-native
+// credential stores (macOS Keychain, Windows Credential Manager, Linux
+// libsecret). This file-based cache works everywhere with CGO_ENABLED=0.
+
+const tokenCacheFile = "token-cache.json"
+
+// cachedToken is the on-disk format for the file-based token cache.
+type cachedToken struct {
+	AccessToken string    `json:"access_token"`
+	ExpiresOn   time.Time `json:"expires_on"`
+}
+
+// tokenCachePath returns the full path to the token cache file.
+func tokenCachePath(dataDir string) string {
+	return filepath.Join(dataDir, tokenCacheFile)
+}
+
+// loadCachedToken reads and parses the token cache file.
+// Returns nil (no error) if the file doesn't exist or is corrupted.
+func loadCachedToken(dataDir string) (*cachedToken, error) {
+	data, err := os.ReadFile(tokenCachePath(dataDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read token cache: %w", err)
+	}
+	var ct cachedToken
+	if err := json.Unmarshal(data, &ct); err != nil {
+		// Corrupted cache — treat as missing.
+		return nil, nil //nolint:nilerr
+	}
+	return &ct, nil
+}
+
+// saveCachedToken writes the token to the cache file with 0600 permissions.
+// Creates the dataDir if it doesn't exist.
+func saveCachedToken(dataDir, accessToken string, expiresOn time.Time) error {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return fmt.Errorf("create data dir for token cache: %w", err)
+	}
+	ct := cachedToken{
+		AccessToken: accessToken,
+		ExpiresOn:   expiresOn,
+	}
+	data, err := json.Marshal(ct)
+	if err != nil {
+		return fmt.Errorf("marshal token cache: %w", err)
+	}
+	if err := os.WriteFile(tokenCachePath(dataDir), data, 0600); err != nil {
+		return fmt.Errorf("write token cache: %w", err)
+	}
+	return nil
+}
+
+// ValidateCachedToken checks if a valid (non-expired) cached token exists.
+// Returns nil if valid, error explaining what to do if not.
+// The profile parameter is included in the error message to guide the user.
+func ValidateCachedToken(dataDir, profile string) error {
+	token, err := loadCachedToken(dataDir)
+	if err != nil || token == nil {
+		return fmt.Errorf("no cached Azure token found. Run:\n\n  engram login%s\n\nIf using OpenCode, the azure-entra-auth plugin handles this automatically.", profileFlag(profile))
+	}
+	if time.Now().After(token.ExpiresOn.Add(-tokenRefreshBuffer)) {
+		return fmt.Errorf("cached Azure token has expired. Run:\n\n  engram login%s\n\nIf using OpenCode, the azure-entra-auth plugin handles this automatically.", profileFlag(profile))
+	}
+	return nil
+}
+
+// ValidateCachedTokenExported exposes ValidateCachedToken for non-pgstore callers.
+func ValidateCachedTokenExported(dataDir, profile string) error {
+	return ValidateCachedToken(dataDir, profile)
+}
+
+// profileFlag returns " --profile <name>" if profile is non-empty, or "".
+func profileFlag(profile string) string {
+	if profile == "" {
+		return ""
+	}
+	return " --profile " + profile
+}
+
+// staticCredential implements azcore.TokenCredential for pre-cached tokens.
+type staticCredential struct {
+	token     string
+	expiresOn time.Time
+}
+
+func (s *staticCredential) GetToken(_ context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	return azcore.AccessToken{Token: s.token, ExpiresOn: s.expiresOn}, nil
+}
+
 // NewDeviceCodeTokenProvider creates a TokenProvider that uses Azure Device Code
-// Flow with a persistent token cache. This is intended for non-dev users who
+// Flow with a file-based token cache. This is intended for non-dev users who
 // can't use 'az login' (e.g., running inside OpenCode/Claude/etc.).
 //
-// With the persistent cache, users authenticate once every ~90 days. Tokens are
-// stored in platform-native credential storage:
-//   - macOS: Keychain
-//   - Linux: libsecret / encrypted file fallback
-//   - Windows: Windows Credential Manager
+// The file-based cache stores the access token in ~/.engram/token-cache.json
+// (0600 permissions). On startup, if a valid (non-expired) cached token exists,
+// it is used directly — no device code prompt. When expired or missing, a new
+// device code flow is triggered and the cache is updated.
 //
 // ALL output goes to stderr — stdout is reserved for the MCP stdio protocol.
-func NewDeviceCodeTokenProvider(tenantID, clientID string) (*TokenProvider, error) {
-	c, err := cache.New(&cache.Options{
-		Name: "engram",
-	})
-	if err != nil {
-		return nil, fmt.Errorf("entra: create persistent token cache: %w", err)
+func NewDeviceCodeTokenProvider(tenantID, clientID, dataDir string) (*TokenProvider, error) {
+	// Check file-based token cache first.
+	if dataDir != "" {
+		cached, err := loadCachedToken(dataDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "engram: warning: failed to read token cache: %v\n", err)
+		}
+		if cached != nil && time.Until(cached.ExpiresOn) > tokenRefreshBuffer {
+			// Valid cached token — wrap in a static credential provider.
+			return &TokenProvider{
+				cred:    &staticCredential{token: cached.AccessToken, expiresOn: cached.ExpiresOn},
+				scope:   pgTokenScope,
+				dataDir: dataDir,
+				token:   &azcore.AccessToken{Token: cached.AccessToken, ExpiresOn: cached.ExpiresOn},
+			}, nil
+		}
 	}
 
+	// No valid cache — do device code flow.
 	cred, err := azidentity.NewDeviceCodeCredential(&azidentity.DeviceCodeCredentialOptions{
 		TenantID: tenantID,
 		ClientID: clientID,
-		Cache:    c,
 		UserPrompt: func(ctx context.Context, msg azidentity.DeviceCodeMessage) error {
 			fmt.Fprintf(os.Stderr, "\n")
 			fmt.Fprintf(os.Stderr, "  ┌─────────────────────────────────────────────────┐\n")
@@ -91,9 +194,11 @@ func NewDeviceCodeTokenProvider(tenantID, clientID string) (*TokenProvider, erro
 	if err != nil {
 		return nil, fmt.Errorf("entra: create device code credential: %w", err)
 	}
+
 	return &TokenProvider{
-		cred:  cred,
-		scope: pgTokenScope,
+		cred:    cred,
+		scope:   pgTokenScope,
+		dataDir: dataDir,
 	}, nil
 }
 
@@ -126,6 +231,8 @@ func resolveInteractiveAuth(dataDir, profile string) (tenantID, clientID string,
 
 // Token returns a valid access token, refreshing if within tokenRefreshBuffer
 // of expiry. Only one refresh request is made even with concurrent callers.
+// After a successful refresh, the token is persisted to the file-based cache
+// if dataDir is set.
 func (tp *TokenProvider) Token(ctx context.Context) (string, error) {
 	// Fast path: read lock, check cache.
 	tp.mu.RLock()
@@ -151,6 +258,14 @@ func (tp *TokenProvider) Token(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("entra: get token: %w", err)
 	}
 	tp.token = &token
+
+	// Persist to file cache (best-effort — don't fail the token request).
+	if tp.dataDir != "" {
+		if saveErr := saveCachedToken(tp.dataDir, token.Token, token.ExpiresOn); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "engram: warning: failed to cache token: %v\n", saveErr)
+		}
+	}
+
 	return token.Token, nil
 }
 
@@ -227,7 +342,8 @@ func resolveAuthMethod(connStr string, dataDir string, profile string) string {
 }
 
 // configurePGPool creates a pgxpool.Config from a connection string, optionally
-// injecting Entra ID tokens via the BeforeConnect hook.
+// injecting Entra ID tokens via the BeforeConnect hook and setting the
+// engram.identity GUC variable via AfterConnect for RLS policies.
 func configurePGPool(connStr string, tp *TokenProvider) (*pgxpool.Config, error) {
 	pgxCfg, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
@@ -251,6 +367,22 @@ func configurePGPool(connStr string, tp *TokenProvider) (*pgxpool.Config, error)
 				return fmt.Errorf("entra token for pg connection: %w", err)
 			}
 			cfg.Password = token
+			return nil
+		}
+
+		// Set engram.identity GUC on each new connection so RLS policies
+		// can identify the real user even when multiple Entra users share
+		// the same PostgreSQL role. The identity is extracted from the JWT
+		// token's UPN/email claim.
+		pgxCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			identity := tp.Identity()
+			if identity != "" {
+				if _, err := conn.Exec(ctx,
+					"SELECT set_config('engram.identity', $1, false)", identity,
+				); err != nil {
+					return fmt.Errorf("set engram.identity GUC: %w", err)
+				}
+			}
 			return nil
 		}
 	}
