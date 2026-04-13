@@ -4,14 +4,19 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -266,6 +271,260 @@ func refreshAccessToken(tenantID, clientID, refreshToken, scope string) (accessT
 	return tr.AccessToken, tr.RefreshToken, expiry, nil
 }
 
+// ─── Interactive Browser Flow (PKCE) ─────────────────────────────────────────
+
+// isHeadless returns true when stdin is not a terminal (SSH, containers, CI).
+// When true, interactive browser launch is not possible and device code flow
+// should be used as a fallback instead.
+func isHeadless() bool {
+	return os.Getenv("SSH_CONNECTION") != "" ||
+		os.Getenv("SSH_CLIENT") != "" ||
+		os.Getenv("SSH_TTY") != "" ||
+		os.Getenv("ENGRAM_HEADLESS") != ""
+}
+
+// IsHeadlessExported exposes isHeadless for non-pgstore callers (e.g. cmd/engram).
+func IsHeadlessExported() bool {
+	return isHeadless()
+}
+
+// openBrowser launches the system default browser at the given URL.
+// It uses platform-specific commands and returns an error only if the
+// command cannot be started — a non-zero exit code is ignored.
+func openBrowser(rawURL string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", rawURL).Start()
+	case "linux":
+		return exec.Command("xdg-open", rawURL).Start()
+	case "windows":
+		return exec.Command("cmd", "/c", "start", rawURL).Start()
+	default:
+		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+}
+
+// generatePKCE generates a code_verifier / code_challenge pair using S256.
+// The verifier is 64 random base64url characters (≥43, ≤128 per RFC 7636).
+func generatePKCE() (verifier, challenge string, err error) {
+	buf := make([]byte, 48) // 48 bytes → 64 base64url chars (no padding)
+	if _, err = rand.Read(buf); err != nil {
+		return "", "", fmt.Errorf("generate PKCE verifier: %w", err)
+	}
+	verifier = base64.RawURLEncoding.EncodeToString(buf)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge = base64.RawURLEncoding.EncodeToString(sum[:])
+	return verifier, challenge, nil
+}
+
+// generateState returns a short random opaque string for CSRF protection.
+func generateState() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate state: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// availablePort tries a list of preferred ports and returns the first one that
+// is available for TCP listening. Falls back to :0 (OS-assigned).
+func availablePort(preferred []int) int {
+	for _, p := range preferred {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err == nil {
+			ln.Close()
+			return p
+		}
+	}
+	// Let the OS pick.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return preferred[0] // best-effort fallback
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// successHTML is the page served to the browser after a successful auth callback.
+const successHTML = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Engram — Authenticated</title>
+<style>
+  body { font-family: system-ui, sans-serif; display: flex; justify-content: center;
+         align-items: center; height: 100vh; margin: 0; background: #0d1117; color: #c9d1d9; }
+  .card { text-align: center; padding: 2rem 3rem; border: 1px solid #30363d;
+          border-radius: 12px; background: #161b22; }
+  h1 { color: #58a6ff; margin-top: 0; }
+  p  { color: #8b949e; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>✓ Authentication Successful</h1>
+    <p>You are now logged in to Engram.<br>You can close this window.</p>
+  </div>
+</body>
+</html>`
+
+// interactiveBrowserFlow performs OAuth2 Authorization Code + PKCE using a
+// temporary local HTTP server to receive the redirect. No third-party libraries
+// required — stdlib only (CGO_ENABLED=0 safe).
+//
+// Flow:
+//  1. Generate PKCE verifier + challenge.
+//  2. Start a local HTTP listener on an available port.
+//  3. Open the system browser at the Azure /authorize URL.
+//  4. Wait up to 5 minutes for Azure to redirect back with the auth code.
+//  5. Exchange the code for tokens via a direct HTTP POST.
+//
+// Returns the access token, refresh token, and expiry on success.
+func interactiveBrowserFlow(tenantID, clientID, scope string) (accessToken, refreshToken string, expiresOn time.Time, err error) {
+	// Step 1: PKCE
+	verifier, challenge, err := generatePKCE()
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	state, err := generateState()
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+
+	// Step 2: local HTTP server
+	port := availablePort([]int{45932, 45933, 45934, 45935, 45936})
+	redirectURI := fmt.Sprintf("http://localhost:%d", port)
+
+	// Channel carries the auth code (or an error string prefixed with "error:").
+	codeCh := make(chan string, 1)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+
+		if errParam := q.Get("error"); errParam != "" {
+			desc := q.Get("error_description")
+			codeCh <- "error:" + errParam + ": " + desc
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintf(w, "Authentication error: %s\n%s\nYou may close this window.", errParam, desc)
+			return
+		}
+
+		if q.Get("state") != state {
+			codeCh <- "error:state mismatch — possible CSRF attack"
+			http.Error(w, "Invalid state parameter", http.StatusBadRequest)
+			return
+		}
+
+		code := q.Get("code")
+		if code == "" {
+			codeCh <- "error:missing code parameter in callback"
+			http.Error(w, "Missing code", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, successHTML)
+		codeCh <- code
+	})
+
+	srv := &http.Server{
+		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
+		Handler: mux,
+	}
+
+	// Start listener before opening the browser so the redirect doesn't fail.
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("start local auth server on %s: %w", srv.Addr, err)
+	}
+
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	// Step 3: Build authorize URL and open browser.
+	authURL := fmt.Sprintf(
+		"https://login.microsoftonline.com/%s/oauth2/v2.0/authorize"+
+			"?client_id=%s"+
+			"&response_type=code"+
+			"&redirect_uri=%s"+
+			"&scope=%s"+
+			"&code_challenge=%s"+
+			"&code_challenge_method=S256"+
+			"&state=%s",
+		url.PathEscape(tenantID),
+		url.QueryEscape(clientID),
+		url.QueryEscape(redirectURI),
+		url.QueryEscape(scope+" offline_access"),
+		url.QueryEscape(challenge),
+		url.QueryEscape(state),
+	)
+
+	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(os.Stderr, "  ┌─────────────────────────────────────────────────┐\n")
+	fmt.Fprintf(os.Stderr, "  │  engram: Azure authentication required           │\n")
+	fmt.Fprintf(os.Stderr, "  │                                                  │\n")
+	fmt.Fprintf(os.Stderr, "  │  Opening browser for Azure authentication...     │\n")
+	fmt.Fprintf(os.Stderr, "  │                                                  │\n")
+	fmt.Fprintf(os.Stderr, "  │  If the browser doesn't open, visit:             │\n")
+	fmt.Fprintf(os.Stderr, "  │  %s\n", authURL)
+	fmt.Fprintf(os.Stderr, "  │                                                  │\n")
+	fmt.Fprintf(os.Stderr, "  │  Waiting for authentication...                   │\n")
+	fmt.Fprintf(os.Stderr, "  └─────────────────────────────────────────────────┘\n")
+	fmt.Fprintf(os.Stderr, "\n")
+
+	if openErr := openBrowser(authURL); openErr != nil {
+		fmt.Fprintf(os.Stderr, "engram: could not open browser (%v).\n  Visit manually: %s\n\n", openErr, authURL)
+	}
+
+	// Step 4: Wait for the redirect callback (5-minute timeout).
+	select {
+	case result := <-codeCh:
+		if strings.HasPrefix(result, "error:") {
+			return "", "", time.Time{}, fmt.Errorf("browser auth: %s", strings.TrimPrefix(result, "error:"))
+		}
+		// Step 5: Exchange code for tokens.
+		return exchangeCodeForTokens(tenantID, clientID, result, redirectURI, verifier, scope)
+	case <-time.After(5 * time.Minute):
+		return "", "", time.Time{}, fmt.Errorf("browser authentication timed out after 5 minutes — run 'engram login' to try again")
+	}
+}
+
+// exchangeCodeForTokens POSTs the authorization code + PKCE verifier to the
+// Azure token endpoint and returns the access token, refresh token, and expiry.
+func exchangeCodeForTokens(tenantID, clientID, code, redirectURI, codeVerifier, scope string) (accessToken, refreshToken string, expiresOn time.Time, err error) {
+	data := url.Values{}
+	data.Set("grant_type", "authorization_code")
+	data.Set("client_id", clientID)
+	data.Set("code", code)
+	data.Set("redirect_uri", redirectURI)
+	data.Set("code_verifier", codeVerifier)
+	data.Set("scope", scope+" offline_access")
+
+	resp, err := http.PostForm(tokenEndpoint(tenantID), data)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("http post to token endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("read token response: %w", err)
+	}
+
+	var tr azureTokenResponse
+	if err := json.Unmarshal(body, &tr); err != nil {
+		return "", "", time.Time{}, fmt.Errorf("parse token response: %w", err)
+	}
+	if tr.Error != "" {
+		return "", "", time.Time{}, fmt.Errorf("azure token error %s: %s", tr.Error, tr.ErrorDesc)
+	}
+	if tr.AccessToken == "" {
+		return "", "", time.Time{}, fmt.Errorf("azure returned empty access token (status %d)", resp.StatusCode)
+	}
+
+	expiry := time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
+	return tr.AccessToken, tr.RefreshToken, expiry, nil
+}
+
 // deviceCodeResponse is the JSON shape returned by the device code endpoint.
 type deviceCodeResponse struct {
 	DeviceCode      string `json:"device_code"`
@@ -442,12 +701,25 @@ func NewDeviceCodeTokenProvider(tenantID, clientID, dataDir string) (*TokenProvi
 		}
 	}
 
-	// Case 3: No usable cache — perform interactive Device Code Flow.
-	// We use direct HTTP calls so we can capture the refresh token,
-	// which azidentity.DeviceCodeCredential does not expose.
-	accessToken, refreshToken, expiresOn, err := deviceCodeFlow(context.Background(), tenantID, clientID, pgTokenScope)
-	if err != nil {
-		return nil, fmt.Errorf("entra: device code flow: %w", err)
+	// Case 3: No usable cache — perform interactive authentication.
+	// Desktop environments (non-headless): use Interactive Browser Flow (PKCE).
+	// SSH / containers / headless: fall back to Device Code Flow.
+	var (
+		accessToken  string
+		refreshToken string
+		expiresOn    time.Time
+		authErr      error
+	)
+	if isHeadless() {
+		accessToken, refreshToken, expiresOn, authErr = deviceCodeFlow(context.Background(), tenantID, clientID, pgTokenScope)
+		if authErr != nil {
+			return nil, fmt.Errorf("entra: device code flow: %w", authErr)
+		}
+	} else {
+		accessToken, refreshToken, expiresOn, authErr = interactiveBrowserFlow(tenantID, clientID, pgTokenScope)
+		if authErr != nil {
+			return nil, fmt.Errorf("entra: interactive browser flow: %w", authErr)
+		}
 	}
 
 	// Persist both tokens immediately.

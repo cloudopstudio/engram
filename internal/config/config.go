@@ -54,6 +54,16 @@ var ValidKeys = map[string]KeyInfo{
 		Default:     "",
 		Description: "Default profile name (used when --profile is not given)",
 	},
+	"tenant-id": {
+		EnvVar:      "AZURE_TENANT_ID",
+		Default:     "",
+		Description: "Azure Entra ID tenant ID for database authentication",
+	},
+	"client-id": {
+		EnvVar:      "AZURE_CLIENT_ID",
+		Default:     "",
+		Description: "Azure App Registration client ID for database authentication",
+	},
 }
 
 // profileExcludedKeys are keys that cannot be set inside a profile.
