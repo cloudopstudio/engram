@@ -298,10 +298,25 @@ func openBrowser(rawURL string) error {
 	case "linux":
 		return exec.Command("xdg-open", rawURL).Start()
 	case "windows":
-		// Windows cmd.exe treats & as a command separator. The URL must be
-		// quoted, and `start` requires an empty title ("") when the target
-		// is quoted, otherwise it interprets the quoted URL as the title.
-		return exec.Command("cmd", "/c", "start", "", rawURL).Start()
+		// Windows cmd.exe and rundll32 both corrupt long URLs containing
+		// &, %, ^ and other shell metacharacters. The reliable workaround
+		// is to write a temporary HTML file with a meta-refresh redirect
+		// and open that file instead — the browser handles the full URL.
+		tmpFile := filepath.Join(os.TempDir(), "engram-auth-redirect.html")
+		html := fmt.Sprintf(
+			`<html><head><meta http-equiv="refresh" content="0;url=%s"></head>`+
+				`<body>Redirecting to Azure login...</body></html>`,
+			rawURL,
+		)
+		if err := os.WriteFile(tmpFile, []byte(html), 0600); err != nil {
+			return fmt.Errorf("write redirect file: %w", err)
+		}
+		// Clean up after a short delay (browser will have read the file).
+		go func() {
+			time.Sleep(10 * time.Second)
+			os.Remove(tmpFile)
+		}()
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", tmpFile).Start()
 	default:
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
