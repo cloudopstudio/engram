@@ -11,13 +11,22 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ftsLanguage returns the PostgreSQL text search configuration to use.
+// ftsBaseLanguage returns the base PostgreSQL text search language.
 // Defaults to 'english', overridable via ENGRAM_FTS_LANGUAGE env var.
-func ftsLanguage() string {
+// Used during migration to create the 'engram' text search configuration.
+func ftsBaseLanguage() string {
 	if lang := os.Getenv("ENGRAM_FTS_LANGUAGE"); lang != "" {
 		return lang
 	}
 	return "english"
+}
+
+// ftsLanguage returns the PostgreSQL text search configuration to use
+// in queries. After migration v8, this is the custom 'engram' config
+// which includes unaccent + language stemmer for diacritic-insensitive
+// search (código = codigo).
+func ftsLanguage() string {
+	return "engram"
 }
 
 // migratePG runs idempotent schema migrations against the PostgreSQL database.
@@ -145,8 +154,8 @@ func migratePG(pool *pgxpool.Pool) error {
 				CREATE TRIGGER trg_prompts_search_vector
 					BEFORE INSERT OR UPDATE ON user_prompts
 					FOR EACH ROW EXECUTE FUNCTION prompts_search_vector_update();
-			`, ftsLanguage(), ftsLanguage(), ftsLanguage(), ftsLanguage(), ftsLanguage(), ftsLanguage(),
-				ftsLanguage(), ftsLanguage()),
+			`, ftsBaseLanguage(), ftsBaseLanguage(), ftsBaseLanguage(), ftsBaseLanguage(), ftsBaseLanguage(), ftsBaseLanguage(),
+				ftsBaseLanguage(), ftsBaseLanguage()),
 		},
 		{
 			version:     3,
@@ -367,6 +376,24 @@ func migratePG(pool *pgxpool.Pool) error {
 					updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 				);
 			`,
+		},
+		{
+			version:     8,
+			description: "unaccent-aware FTS: normalize diacritics (código = codigo)",
+			sql: fmt.Sprintf(`
+				-- Enable unaccent extension for diacritics normalization.
+				CREATE EXTENSION IF NOT EXISTS unaccent;
+
+				-- Create a custom text search config that strips diacritics
+				-- before stemming. This makes "código" match "codigo", "ñoño"
+				-- match "nono", etc. — critical for Spanish and Portuguese.
+				DROP TEXT SEARCH CONFIGURATION IF EXISTS engram;
+				CREATE TEXT SEARCH CONFIGURATION engram (COPY = %s);
+				ALTER TEXT SEARCH CONFIGURATION engram
+					ALTER MAPPING FOR asciiword, asciihword, hword_asciipart,
+					                  word, hword, hword_part
+					WITH unaccent, %s_stem;
+			`, ftsBaseLanguage(), ftsBaseLanguage()),
 		},
 	}
 
