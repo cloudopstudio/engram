@@ -393,7 +393,70 @@ func migratePG(pool *pgxpool.Pool) error {
 					ALTER MAPPING FOR asciiword, asciihword, hword_asciipart,
 					                  word, hword, hword_part
 					WITH unaccent, %s_stem;
+
+				-- Recreate trigger functions using the new 'engram' config
+				-- instead of the bare language name.
+				CREATE OR REPLACE FUNCTION observations_search_vector_update() RETURNS trigger AS $$
+				BEGIN
+					NEW.search_vector :=
+						setweight(to_tsvector('engram', COALESCE(NEW.title, '')), 'A') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.topic_key, '')), 'A') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.content, '')), 'B') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.type, '')), 'C') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.project, '')), 'C') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.tool_name, '')), 'D');
+					RETURN NEW;
+				END;
+				$$ LANGUAGE plpgsql;
+
+				CREATE OR REPLACE FUNCTION prompts_search_vector_update() RETURNS trigger AS $$
+				BEGIN
+					NEW.search_vector :=
+						setweight(to_tsvector('engram', COALESCE(NEW.content, '')), 'A') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.project, '')), 'B');
+					RETURN NEW;
+				END;
+				$$ LANGUAGE plpgsql;
+
+				-- Reindex ALL existing rows. Concatenating empty string forces
+				-- PostgreSQL to see the column as changed, firing the trigger.
+				UPDATE observations SET title = title || '' WHERE deleted_at IS NULL;
+				UPDATE user_prompts SET content = content || '';
 			`, ftsBaseLanguage(), ftsBaseLanguage()),
+		},
+		{
+			version:     9,
+			description: "fix v8: recreate triggers with engram config and reindex existing rows",
+			sql: `
+				-- v8 only created the text search config but did not update the
+				-- trigger functions or reindex. This migration fixes that.
+
+				CREATE OR REPLACE FUNCTION observations_search_vector_update() RETURNS trigger AS $$
+				BEGIN
+					NEW.search_vector :=
+						setweight(to_tsvector('engram', COALESCE(NEW.title, '')), 'A') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.topic_key, '')), 'A') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.content, '')), 'B') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.type, '')), 'C') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.project, '')), 'C') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.tool_name, '')), 'D');
+					RETURN NEW;
+				END;
+				$$ LANGUAGE plpgsql;
+
+				CREATE OR REPLACE FUNCTION prompts_search_vector_update() RETURNS trigger AS $$
+				BEGIN
+					NEW.search_vector :=
+						setweight(to_tsvector('engram', COALESCE(NEW.content, '')), 'A') ||
+						setweight(to_tsvector('engram', COALESCE(NEW.project, '')), 'B');
+					RETURN NEW;
+				END;
+				$$ LANGUAGE plpgsql;
+
+				-- Reindex: concatenating '' forces trigger to fire.
+				UPDATE observations SET title = title || '' WHERE deleted_at IS NULL;
+				UPDATE user_prompts SET content = content || '';
+			`,
 		},
 	}
 
