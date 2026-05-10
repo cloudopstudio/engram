@@ -24,11 +24,13 @@
     "extension"
   ],
   "pi": {
+    "image": "https://raw.githubusercontent.com/Gentleman-Programming/engram/main/plugin/pi/assets/engram-logo-only.png",
     "extensions": [
       "./index.ts"
     ]
   },
   "files": [
+    "assets/",
     "cli.js",
     "index.ts",
     "mcp-template.json",
