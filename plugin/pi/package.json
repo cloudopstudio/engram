@@ -1,0 +1,49 @@
+{
+  "name": "@gentleman-programming/pi-engram",
+  "version": "0.1.0",
+  "description": "Engram persistent memory integration for the Pi coding agent",
+  "type": "module",
+  "license": "MIT",
+  "author": "Gentleman Programming",
+  "homepage": "https://github.com/Gentleman-Programming/engram",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gentleman-Programming/engram.git",
+    "directory": "plugin/pi"
+  },
+  "bin": {
+    "pi-engram": "cli.js"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "engram",
+    "memory",
+    "mcp",
+    "coding-agent",
+    "extension"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "cli.js",
+    "index.ts",
+    "mcp-template.json",
+    "README.md",
+    "package.json"
+  ],
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "^0.70.2"
+  },
+  "peerDependencies": {
+    "pi-mcp-adapter": ">=2.5.0"
+  },
+  "peerDependenciesMeta": {
+    "pi-mcp-adapter": {
+      "optional": true
+    }
+  }
+}
