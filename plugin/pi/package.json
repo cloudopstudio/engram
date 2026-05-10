@@ -1,6 +1,6 @@
 {
   "name": "gentle-engram",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Engram persistent memory integration for the Pi coding agent",
   "type": "module",
   "license": "MIT",

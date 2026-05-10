@@ -7,7 +7,8 @@
  */
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const ENGRAM_PORT = Number.parseInt(process.env.ENGRAM_PORT ?? "7437", 10);
@@ -107,6 +108,10 @@ interface ContextResponse {
   context?: string;
 }
 
+interface ProjectConfig {
+  project_name?: unknown;
+}
+
 interface SessionContext {
   cwd: string;
   sessionManager: {
@@ -148,7 +153,59 @@ async function isEngramRunning(): Promise<boolean> {
   }
 }
 
-function extractProjectName(directory: string): string {
+function normalizeProjectName(name: string): string {
+  const normalized = name.trim().toLowerCase();
+  return normalized || "unknown";
+}
+
+function normalizeConfigProjectName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || /[/\\]/.test(trimmed) || /[\x00-\x1f\x7f]/.test(trimmed)) return undefined;
+  return normalizeProjectName(trimmed);
+}
+
+function getGitRoot(directory: string): string | undefined {
+  try {
+    const result = spawnSync("git", ["-C", directory, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+    });
+    if (result.status === 0) {
+      return result.stdout?.trim() || undefined;
+    }
+  } catch {}
+  return undefined;
+}
+
+function readConfigProjectName(projectDir: string): string | undefined {
+  const configPath = join(projectDir, ".engram", "config.json");
+  if (!existsSync(configPath)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(configPath, "utf8")) as ProjectConfig;
+    return normalizeConfigProjectName(parsed.project_name);
+  } catch {
+    return undefined;
+  }
+}
+
+function detectConfigProjectName(directory: string): string | undefined {
+  const start = resolve(directory || ".");
+  const gitRoot = getGitRoot(start);
+  if (!gitRoot) return readConfigProjectName(start);
+
+  let current = start;
+  const stop = resolve(gitRoot);
+  for (;;) {
+    const projectName = readConfigProjectName(current);
+    if (projectName) return projectName;
+    if (current === stop) return undefined;
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+function detectGitRemoteProjectName(directory: string): string | undefined {
   try {
     const result = spawnSync("git", ["-C", directory, "remote", "get-url", "origin"], {
       encoding: "utf8",
@@ -156,21 +213,43 @@ function extractProjectName(directory: string): string {
     if (result.status === 0) {
       const url = result.stdout?.trim();
       const name = url?.replace(/\.git$/, "").split(/[/:]/).pop();
-      if (name) return name;
+      if (name) return normalizeProjectName(name);
     }
   } catch {}
+  return undefined;
+}
 
+function detectSingleChildGitProjectName(directory: string): string | undefined {
+  const noise = new Set(["node_modules", "vendor", ".venv", "__pycache__", "target", "dist", "build", ".idea", ".vscode"]);
+  const repos: string[] = [];
   try {
-    const result = spawnSync("git", ["-C", directory, "rev-parse", "--show-toplevel"], {
-      encoding: "utf8",
-    });
-    if (result.status === 0) {
-      const root = result.stdout?.trim();
-      if (root) return root.split("/").pop() ?? "unknown";
+    for (const entry of readdirSync(directory).slice(0, 20)) {
+      if (entry.startsWith(".") || noise.has(entry)) continue;
+      const childPath = join(directory, entry);
+      try {
+        if (!statSync(childPath).isDirectory()) continue;
+        if (existsSync(join(childPath, ".git"))) repos.push(entry);
+        if (repos.length > 1) return undefined;
+      } catch {}
     }
   } catch {}
+  return repos.length === 1 ? repos[0] : undefined;
+}
 
-  return directory.split("/").pop() ?? "unknown";
+function extractProjectName(directory: string): string {
+  const configProject = detectConfigProjectName(directory);
+  if (configProject) return configProject;
+
+  const remoteProject = detectGitRemoteProjectName(directory);
+  if (remoteProject) return remoteProject;
+
+  const root = getGitRoot(directory);
+  if (root) return normalizeProjectName(basename(root));
+
+  const childProject = detectSingleChildGitProjectName(directory);
+  if (childProject) return normalizeProjectName(childProject);
+
+  return normalizeProjectName(basename(directory));
 }
 
 function truncate(str: string, max: number): string {

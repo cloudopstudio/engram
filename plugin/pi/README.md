@@ -24,8 +24,8 @@ If you only want HTTP session capture against an already running Engram server, 
 
 ## What It Adds
 
-- **Session memory**: Pi prompts, session summaries, and passive task learnings are sent to `engram serve`.
-- **MCP tools**: `mem_search`, `mem_save`, `mem_context`, and the other Engram tools are exposed through `pi-mcp-adapter` and `engram mcp`.
+- **Session memory**: Pi prompts and passive task learnings are sent to `engram serve`; session summaries are preserved through the injected Memory Protocol and `mem_session_summary`.
+- **MCP tools**: `mem_search`, `mem_save`, `mem_context`, and the other agent-profile Engram tools are exposed through `pi-mcp-adapter` and `engram mcp --tools=agent`.
 - **Safe startup**: missing `engram` binaries degrade cleanly instead of crashing Pi with `spawn engram ENOENT`.
 
 ## Configuration
@@ -73,6 +73,24 @@ Pi MCP tools -> pi-mcp-adapter -> ENGRAM_BIN / engram mcp -> SQLite
 ```
 
 HTTP event capture and MCP tools are separate paths. Engram currently exposes MCP over stdio, so direct MCP tools still need an Engram binary even when `ENGRAM_URL` points at a remote HTTP server.
+
+## Project Detection
+
+The HTTP event-capture path mirrors Engram's normal project detection order as closely as a Pi adapter can:
+
+1. nearest `.engram/config.json` inside the current git repo
+2. git `origin` remote name
+3. git root directory name
+4. single child git repo name
+5. current directory basename
+
+MCP tool calls still use Engram core's canonical project resolver at call time. For critical repos or monorepos, prefer an explicit `.engram/config.json`:
+
+```json
+{
+  "project_name": "my-project"
+}
+```
 
 ## Troubleshooting
 
