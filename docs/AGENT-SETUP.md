@@ -9,7 +9,7 @@ Engram works with **any MCP-compatible agent**. Pick your agent below.
 | Agent | One-liner | Manual Config |
 |-------|-----------|---------------|
 | Claude Code | `claude plugin marketplace add Gentleman-Programming/engram && claude plugin install engram` | [Details](#claude-code) |
-| Pi | `pi install npm:@gentleman-programming/pi-engram && pi install npm:pi-mcp-adapter && pi-engram init` | [Details](#pi) |
+| Pi | `pi install npm:gentle-engram && pi install npm:pi-mcp-adapter && pi-engram init` | [Details](#pi) |
 | OpenCode | `engram setup opencode` | [Details](#opencode) |
 | Gemini CLI | `engram setup gemini-cli` | [Details](#gemini-cli) |
 | Codex | `engram setup codex` | [Details](#codex) |
@@ -24,7 +24,7 @@ Engram works with **any MCP-compatible agent**. Pick your agent below.
 Install Engram's Pi package and the MCP adapter:
 
 ```bash
-pi install npm:@gentleman-programming/pi-engram
+pi install npm:gentle-engram
 pi install npm:pi-mcp-adapter
 pi-engram init
 ```

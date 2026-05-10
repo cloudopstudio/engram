@@ -7,7 +7,7 @@ It installs a Pi extension for session capture and configures Engram MCP tools t
 ## Quick Start
 
 ```bash
-pi install npm:@gentleman-programming/pi-engram
+pi install npm:gentle-engram
 pi install npm:pi-mcp-adapter
 pi-engram init
 ```
@@ -54,7 +54,7 @@ If the binary is missing, Pi keeps running and memory degrades instead of crashi
 
 `pi-engram init` writes Pi-owned config in the Pi agent directory:
 
-- `settings.json`: ensures `npm:pi-mcp-adapter` and `npm:@gentleman-programming/pi-engram` are declared.
+- `settings.json`: ensures `npm:pi-mcp-adapter` and `npm:gentle-engram` are declared.
 - `mcp.json`: adds an `engram` MCP server that launches `engram mcp --tools=agent` through a safe Node wrapper.
 
 Existing `mcpServers.engram` entries are preserved unless you pass `--force`:

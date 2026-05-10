@@ -1,5 +1,5 @@
 {
-  "name": "@gentleman-programming/pi-engram",
+  "name": "gentle-engram",
   "version": "0.1.0",
   "description": "Engram persistent memory integration for the Pi coding agent",
   "type": "module",
