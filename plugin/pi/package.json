@@ -35,10 +35,8 @@
     "README.md",
     "package.json"
   ],
-  "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.70.2"
-  },
   "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
     "pi-mcp-adapter": ">=2.5.0"
   },
   "peerDependenciesMeta": {
