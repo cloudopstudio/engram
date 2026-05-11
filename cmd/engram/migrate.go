@@ -62,10 +62,10 @@ func cmdMigrate(cfg store.Config) {
 	ctx := context.Background()
 
 	authMethod := store.ResolveAuthMethodExported(targetURL)
-	var tp *store.TokenProvider
+	var ts store.TokenSource
 	var identity string
-	if authMethod != "password" {
-		tp, err = store.NewTokenProvider()
+	if authMethod == "entra" {
+		tp, err := store.NewTokenProvider()
 		if err != nil {
 			fatal(fmt.Errorf("entra auth: %w\nSet ENGRAM_AUTH_METHOD=password to use password auth", err))
 		}
@@ -74,9 +74,12 @@ func cmdMigrate(cfg store.Config) {
 		} else {
 			identity = tp.Identity()
 		}
+		ts = tp
+	} else if authMethod == "aws-iam" {
+		fatal(fmt.Errorf("aws-iam auth is not supported by 'engram migrate' yet — use password auth for migration, then switch to aws-iam in config"))
 	}
 
-	pgxCfg, err := store.ConfigurePGPoolExported(targetURL, tp)
+	pgxCfg, err := store.ConfigurePGPoolExported(targetURL, ts)
 	if err != nil {
 		fatal(err)
 	}

@@ -204,6 +204,8 @@ func main() {
 		cmdConfig(cfg)
 	case "login":
 		cmdLogin(cfg)
+	case "aws-login":
+		cmdAWSLogin(cfg)
 	case "migrate":
 		cmdMigrate(cfg)
 	case "promote":
@@ -1740,7 +1742,9 @@ Commands:
                      Merge similar project names into one canonical name
                        --all      Scan ALL projects for similar name groups
                        --dry-run  Preview what would be merged (no changes)
-  login              Authenticate with Azure (device code flow)
+  login              Authenticate with Azure Entra ID (device code / browser flow)
+  aws-login          Verify the AWS SSO session for RDS IAM authentication
+                       --profile <name>  Use a specific engram profile
   config <sub>       Manage persistent configuration (set, get, list, profiles, path)
   setup [agent]      Install/setup agent integration (opencode, claude-code, gemini-cli, codex)
   sync               Export new memories as compressed chunk to .engram/
