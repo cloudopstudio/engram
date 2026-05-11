@@ -37,7 +37,17 @@ var ValidKeys = map[string]KeyInfo{
 	"auth-method": {
 		EnvVar:      "ENGRAM_AUTH_METHOD",
 		Default:     "",
-		Description: "Authentication method: entra or password (auto-detected if unset)",
+		Description: "Authentication method: entra, aws-iam, or password (auto-detected if unset)",
+	},
+	"aws-region": {
+		EnvVar:      "AWS_REGION",
+		Default:     "",
+		Description: "AWS region for RDS IAM authentication (e.g. us-east-1)",
+	},
+	"aws-profile": {
+		EnvVar:      "AWS_PROFILE",
+		Default:     "",
+		Description: "AWS shared-config profile name for RDS IAM authentication (used by aws sso login)",
 	},
 	"server-port": {
 		EnvVar:      "ENGRAM_PORT",

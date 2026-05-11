@@ -37,6 +37,20 @@ const (
 	tokenRefreshBuffer = 5 * time.Minute
 )
 
+// TokenSource is the abstraction over per-cloud authentication providers
+// (Entra ID for Azure Database, IAM for AWS RDS). Implementations must be
+// safe for concurrent use — callers may invoke Token from multiple goroutines.
+//
+// Implementations: *TokenProvider (Entra), *AWSTokenProvider (RDS IAM).
+type TokenSource interface {
+	// Token returns a currently-valid access token, refreshing if needed.
+	Token(ctx context.Context) (string, error)
+	// Identity returns the human identifier (UPN/email) extracted from the
+	// authenticated session, used to seed the engram.identity GUC for RLS.
+	// Returns "" if identity is unavailable.
+	Identity() string
+}
+
 // TokenProvider acquires and refreshes Entra ID access tokens for
 // Azure Database for PostgreSQL authentication. Thread-safe.
 type TokenProvider struct {
@@ -928,7 +942,7 @@ func (tp *TokenProvider) Identity() string {
 
 // resolveAuthMethod determines the authentication method from env vars,
 // config file (with profile support), and the connection string host.
-// Returns "entra" or "password".
+// Returns "entra", "aws-iam", or "password".
 // dataDir is used to read config file fallback; empty string skips config lookup.
 // profile is the active profile name (may be "").
 func resolveAuthMethod(connStr string, dataDir string, profile string) string {
@@ -940,17 +954,24 @@ func resolveAuthMethod(connStr string, dataDir string, profile string) string {
 			return strings.ToLower(strings.TrimSpace(method))
 		}
 	}
-	// Auto-detect: if the host is Azure, use Entra ID.
+	// Auto-detect from the connection string host.
 	if strings.Contains(connStr, ".database.azure.com") {
 		return "entra"
+	}
+	if strings.Contains(connStr, ".rds.amazonaws.com") {
+		return "aws-iam"
 	}
 	return "password"
 }
 
 // configurePGPool creates a pgxpool.Config from a connection string, optionally
-// injecting Entra ID tokens via the BeforeConnect hook and setting the
+// injecting cloud-issued tokens via the BeforeConnect hook and setting the
 // engram.identity GUC variable via AfterConnect for RLS policies.
-func configurePGPool(connStr string, tp *TokenProvider) (*pgxpool.Config, error) {
+//
+// ts may be nil (password auth) or a *TokenProvider (Entra) / *AWSTokenProvider
+// (RDS IAM). The TokenSource interface decouples the pool config from the
+// specific cloud authentication backend.
+func configurePGPool(connStr string, ts TokenSource) (*pgxpool.Config, error) {
 	pgxCfg, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
 		return nil, fmt.Errorf("parse pg connection string: %w", err)
@@ -965,23 +986,23 @@ func configurePGPool(connStr string, tp *TokenProvider) (*pgxpool.Config, error)
 	// Statement timeout to protect against runaway queries.
 	pgxCfg.ConnConfig.RuntimeParams["statement_timeout"] = "30000"
 
-	// Inject Entra ID token before each new connection.
-	if tp != nil {
+	// Inject cloud-issued token before each new connection (Entra or RDS IAM).
+	if ts != nil {
 		pgxCfg.BeforeConnect = func(ctx context.Context, cfg *pgx.ConnConfig) error {
-			token, err := tp.Token(ctx)
+			token, err := ts.Token(ctx)
 			if err != nil {
-				return fmt.Errorf("entra token for pg connection: %w", err)
+				return fmt.Errorf("auth token for pg connection: %w", err)
 			}
 			cfg.Password = token
 			return nil
 		}
 
 		// Set engram.identity GUC on each new connection so RLS policies
-		// can identify the real user even when multiple Entra users share
-		// the same PostgreSQL role. The identity is extracted from the JWT
-		// token's UPN/email claim.
+		// can identify the real user even when many federated users share
+		// the same PostgreSQL role. The identity comes from the JWT UPN
+		// claim (Entra) or the IAM caller ARN's user segment (AWS SSO).
 		pgxCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-			identity := tp.Identity()
+			identity := ts.Identity()
 			if identity != "" {
 				if _, err := conn.Exec(ctx,
 					"SELECT set_config('engram.identity', $1, false)", identity,

@@ -352,9 +352,22 @@ func New(cfg Config) (*Store, error) {
 
 	authMethod := resolveAuthMethod(connStr, cfg.DataDir, cfg.Profile)
 
-	var tp *TokenProvider
+	var ts TokenSource
 	var identity string
-	if authMethod != "password" {
+
+	switch authMethod {
+	case "aws-iam":
+		region, awsProfile := resolveAWSAuth(cfg.DataDir, cfg.Profile)
+		awsTP, err := NewAWSTokenProvider(context.Background(), connStr, region, awsProfile)
+		if err != nil {
+			return nil, fmt.Errorf("engram: %w", err)
+		}
+		ts = awsTP
+		identity = awsTP.Identity()
+		log.Printf("[engram] aws-iam auth (region=%s profile=%s identity=%s)", awsTP.region, awsProfile, identity)
+
+	case "entra":
+		var tp *TokenProvider
 		if cfg.AuthInteractive {
 			// Explicit --auth-interactive: use cached token only — never block
 			// with device code. The device code flow is reserved for `engram login`.
@@ -406,9 +419,16 @@ func New(cfg Config) (*Store, error) {
 		} else {
 			identity = tp.Identity()
 		}
+		ts = tp
+
+	case "password":
+		// No token source — pgx will use the password from the connection string.
+
+	default:
+		return nil, fmt.Errorf("engram: unknown auth-method %q (valid: entra, aws-iam, password)", authMethod)
 	}
 
-	pgxCfg, err := configurePGPool(connStr, tp)
+	pgxCfg, err := configurePGPool(connStr, ts)
 	if err != nil {
 		return nil, err
 	}
@@ -3528,8 +3548,9 @@ func ResolveAuthMethodExported(connStr string) string {
 }
 
 // ConfigurePGPoolExported exposes configurePGPool for the migration CLI.
-func ConfigurePGPoolExported(connStr string, tp *TokenProvider) (*pgxpool.Config, error) {
-	return configurePGPool(connStr, tp)
+// ts may be nil (password auth) or any TokenSource implementation.
+func ConfigurePGPoolExported(connStr string, ts TokenSource) (*pgxpool.Config, error) {
+	return configurePGPool(connStr, ts)
 }
 
 // MigratePGExported exposes migratePG for the migration CLI.
