@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Obsidian plugin to sync Engram persistent memory into your vault",
   "main": "main.js",
+  "private": true,
   "scripts": {
     "build": "node esbuild.config.mjs",
     "dev": "node esbuild.config.mjs --watch"

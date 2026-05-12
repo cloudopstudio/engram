@@ -1,0 +1,25 @@
+name: Publish gentle-engram
+
+on:
+  push:
+    tags:
+      - "pi-v*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish to npm with provenance
+        working-directory: plugin/pi
+        run: npm publish --provenance --access public
