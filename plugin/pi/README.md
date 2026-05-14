@@ -78,7 +78,7 @@ Engram includes a terminal UI for browsing sessions, observations, prompts, proj
 ## Quick start
 
 ```bash
-pi install npm:gentle-engram
+pi install npm:gentle-engram@0.1.5
 pi install npm:pi-mcp-adapter
 pi-engram init
 ```
@@ -189,7 +189,7 @@ If the binary is missing, Pi keeps running and memory degrades instead of crashi
 
 `pi-engram init` writes Pi-owned config in the Pi agent directory:
 
-- `settings.json`: ensures `npm:pi-mcp-adapter` and `npm:gentle-engram` are declared.
+- `settings.json`: ensures `npm:pi-mcp-adapter` and `npm:gentle-engram@0.1.5` are declared.
 - `mcp.json`: adds an `engram` MCP server that launches `engram mcp --tools=agent` through a safe Node wrapper with `directTools: false`, so MCP remains available through the gateway without duplicating Pi-native `mem_*` tools.
 
 Existing `mcpServers.engram` entries are preserved unless you pass `--force`:
