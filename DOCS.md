@@ -67,10 +67,16 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 - `POST /sessions` — Create session. Body: `{id, project, directory}`
 - `POST /sessions/{id}/end` — End session. Body: `{summary}`
 - `GET /sessions/recent` — Recent sessions. Query: `?project=X&limit=N`
+- `GET /sessions/{id}` — Get single session by ID
+- `DELETE /sessions/{id}` — Delete session
+  - `200` when deleted
+  - `404` when session does not exist
+  - `409` when session still has observations (delete/migrate observations first)
 
 ### Observations
 
 - `POST /observations` — Add observation. Body: `{session_id, type, title, content, tool_name?, project?, scope?, topic_key?}`
+- `GET /observations` — Recent observations compatibility endpoint. Query: `?project=X&scope=project|personal&limit=N&sort=created_at:desc`
 - `GET /observations/recent` — Recent observations. Query: `?project=X&scope=project|personal&limit=N`
 - `GET /observations/{id}` — Get single observation by ID
 - `PATCH /observations/{id}` — Update fields. Body: `{title?, content?, type?, project?, scope?, topic_key?}`
