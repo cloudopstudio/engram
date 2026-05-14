@@ -52,7 +52,7 @@ function createEngramServerConfig() {
     command: "node",
     args: ["-e", MCP_LAUNCHER],
     lifecycle: "lazy",
-    directTools: true,
+    directTools: false,
   };
 }
 

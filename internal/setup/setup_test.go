@@ -359,7 +359,7 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected mcpServers.engram in %#v", mcpConfig.MCPServers)
 	}
-	if server.Command != "/opt/engram/bin/engram" || !reflect.DeepEqual(server.Args, []string{"mcp", "--tools=agent"}) || server.Lifecycle != "lazy" || !server.DirectTools {
+	if server.Command != "/opt/engram/bin/engram" || !reflect.DeepEqual(server.Args, []string{"mcp", "--tools=agent"}) || server.Lifecycle != "lazy" || server.DirectTools {
 		t.Fatalf("unexpected engram MCP server: %#v", server)
 	}
 }

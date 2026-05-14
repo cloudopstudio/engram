@@ -13,9 +13,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	projectpkg "github.com/Gentleman-Programming/engram/internal/project"
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
@@ -134,10 +137,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /export", s.handleExport)
 	s.mux.HandleFunc("POST /import", s.handleImport)
 
-	// Stats
+	// Stats / diagnostics
 	s.mux.HandleFunc("GET /stats", s.handleStats)
+	s.mux.HandleFunc("GET /doctor", s.handleDoctor)
 
-	// Project migration
+	// Project detection / migration
+	s.mux.HandleFunc("GET /project/current", s.handleCurrentProject)
 	s.mux.HandleFunc("POST /projects/migrate", s.handleMigrateProject)
 
 	// Sync status (degraded-state visibility for autosync)
@@ -232,6 +237,9 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "session_id, title, and content are required")
 		return
 	}
+	if !s.validateSessionProject(w, body.SessionID, body.Project) {
+		return
+	}
 
 	id, err := s.store.AddObservation(body)
 	if err != nil {
@@ -251,6 +259,9 @@ func (s *Server) handlePassiveCapture(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.SessionID == "" {
 		jsonError(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+	if !s.validateSessionProject(w, body.SessionID, body.Project) {
 		return
 	}
 
@@ -414,6 +425,9 @@ func (s *Server) handleAddPrompt(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "session_id and content are required")
 		return
 	}
+	if !s.validateSessionProject(w, body.SessionID, body.Project) {
+		return
+	}
 
 	id, err := s.store.AddPrompt(body)
 	if err != nil {
@@ -567,6 +581,46 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, stats)
 }
 
+func (s *Server) handleDoctor(w http.ResponseWriter, r *http.Request) {
+	// The diagnostic subsystem is not yet ported to this fork.
+	// Return a placeholder response so the endpoint exists without panicking.
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"message": "diagnostic subsystem not available in this build",
+	})
+}
+
+// ─── Project Detection ───────────────────────────────────────────────────────
+
+func (s *Server) handleCurrentProject(w http.ResponseWriter, r *http.Request) {
+	cwd := strings.TrimSpace(r.URL.Query().Get("cwd"))
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to detect cwd: "+err.Error())
+			return
+		}
+	}
+
+	res := projectpkg.DetectProjectFull(cwd)
+	payload := map[string]any{
+		"project":            res.Project,
+		"project_source":     res.Source,
+		"project_path":       res.Path,
+		"cwd":                cwd,
+		"available_projects": res.AvailableProjects,
+	}
+	if res.Warning != "" {
+		payload["warning"] = res.Warning
+	}
+	if res.Error != nil {
+		payload["error_hint"] = res.Error.Error()
+	}
+
+	jsonResponse(w, http.StatusOK, payload)
+}
+
 // ─── Sync Status ─────────────────────────────────────────────────────────────
 
 func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
@@ -638,6 +692,32 @@ func (s *Server) handleMigrateProject(w http.ResponseWriter, r *http.Request) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+func (s *Server) validateSessionProject(w http.ResponseWriter, sessionID, projectName string) bool {
+	if strings.TrimSpace(projectName) == "" {
+		return true
+	}
+	projectName, _ = store.NormalizeProject(projectName)
+	session, err := s.store.GetSession(sessionID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			jsonError(w, http.StatusNotFound, "session not found")
+			return false
+		}
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return false
+	}
+	sessionProject, _ := store.NormalizeProject(session.Project)
+	if sessionProject != "" && sessionProject != projectName {
+		jsonErrorWithFields(w, http.StatusBadRequest, "session project does not match requested project", map[string]any{
+			"code":            "session_project_mismatch",
+			"session_project": sessionProject,
+			"project":         projectName,
+		})
+		return false
+	}
+	return true
+}
+
 func jsonResponse(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -646,6 +726,14 @@ func jsonResponse(w http.ResponseWriter, status int, data any) {
 
 func jsonError(w http.ResponseWriter, status int, msg string) {
 	jsonResponse(w, status, map[string]string{"error": msg})
+}
+
+func jsonErrorWithFields(w http.ResponseWriter, status int, msg string, fields map[string]any) {
+	payload := map[string]any{"error": msg}
+	for key, value := range fields {
+		payload[key] = value
+	}
+	jsonResponse(w, status, payload)
 }
 
 func queryInt(r *http.Request, key string, defaultVal int) int {
