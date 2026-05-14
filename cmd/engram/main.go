@@ -1649,7 +1649,7 @@ func cmdSetup() {
 		}
 		fmt.Printf("✓ Installed %s plugin (%d files)\n", result.Agent, result.Files)
 		fmt.Printf("  → %s\n", result.Destination)
-		printPostInstall(result.Agent)
+		printPostInstall(result)
 		return
 	}
 
@@ -1684,16 +1684,23 @@ func cmdSetup() {
 
 	fmt.Printf("✓ Installed %s plugin (%d files)\n", result.Agent, result.Files)
 	fmt.Printf("  → %s\n", result.Destination)
-	printPostInstall(result.Agent)
+	printPostInstall(result)
 }
 
-func printPostInstall(agent string) {
-	switch agent {
+func printPostInstall(result *setup.Result) {
+	switch result.Agent {
 	case "opencode":
 		fmt.Println("\nNext steps:")
 		fmt.Println("  1. Restart OpenCode — plugin + MCP server + /engram-login are ready")
 		fmt.Println("  2. For Azure auth: run /engram-login inside OpenCode")
-		fmt.Println("  3. Run 'engram serve &' for session tracking (HTTP API)")
+		fmt.Println("  3. The plugin auto-starts the Engram HTTP server when needed")
+		if result.TUIPluginEnabled {
+			fmt.Println("\nAlso enabled: opencode-subagent-statusline in tui.json — sub-agent activity in the sidebar/footer.")
+		}
+	case "pi":
+		fmt.Println("\nNext steps:")
+		fmt.Println("  1. Restart Pi so packages and MCP config are reloaded")
+		fmt.Println("  2. Verify with: pi list")
 	case "claude-code":
 		// Offer to add engram tools to the permissions allowlist
 		fmt.Print("\nAdd engram tools to ~/.claude/settings.json allowlist?\n")
@@ -1772,7 +1779,7 @@ Commands:
   aws-login          Verify the AWS SSO session for RDS IAM authentication
                        --profile <name>  Use a specific engram profile
   config <sub>       Manage persistent configuration (set, get, list, profiles, path)
-  setup [agent]      Install/setup agent integration (opencode, claude-code, gemini-cli, codex)
+  setup [agent]      Install/setup agent integration (opencode, pi, claude-code, gemini-cli, codex)
   sync               Export new memories as compressed chunk to .engram/
                        --import   Import new chunks from .engram/ into local DB
                        --status   Show sync status (local vs remote chunks)
