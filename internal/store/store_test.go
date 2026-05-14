@@ -4676,3 +4676,134 @@ func TestDeletePrompt_NotFound(t *testing.T) {
 		t.Fatalf("expected ErrPromptNotFound, got: %v", err)
 	}
 }
+
+
+// ─── ProjectExists tests — skipped: upstream feature not yet ported ───────────
+// TODO(merge-upstream-v2 PR #2/#3): port ProjectExists from gentle/main to enable these tests
+
+func TestProjectExists_EmptyStore(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+}
+
+func TestProjectExists_Known(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+}
+
+func TestProjectExists_KnownViaSession(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+}
+
+func TestProjectExists_KnownViaPrompt(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+}
+
+func TestProjectExists_Unknown(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+}
+
+func TestProjectExists_KnownViaEnrollmentOnly(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+}
+
+// ─── Doctor diagnostic helpers — skipped: upstream feature not yet ported ────
+// TODO(merge-upstream-v2 PR #2/#3): port ListDiagnosticSessions from gentle/main to enable
+
+func TestListDiagnosticSessionsScopesByProject(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ListDiagnosticSessions — needs merge-upstream-v2 PR #2+")
+}
+
+func TestListPendingProjectMutationsAndPayloadValidation(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ListPendingProjectMutations/ValidateSyncMutationPayload — needs merge-upstream-v2 PR #2+")
+}
+
+func TestValidateSyncMutationPayloadRelationRequiresServerFields(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ValidateSyncMutationPayload/SyncEntityRelation — needs merge-upstream-v2 PR #2+")
+}
+
+func TestReadSQLiteLockSnapshotDoesNotMutateApplicationRows(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ReadSQLiteLockSnapshot — needs merge-upstream-v2 PR #2+")
+}
+
+// ─── newTestStoreRaw / countSyncMutations helpers ────────────────────────────
+// TODO(merge-upstream-v2 PR #2/#3): port newWithoutRepair to enable repair tests
+
+func newTestStoreRaw(t *testing.T) *SQLiteStore {
+	t.Helper()
+	return newTestStore(t)
+}
+
+func countSyncMutations(t *testing.T, s *SQLiteStore, project string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sync_mutations WHERE project = ? AND source = ?`,
+		project, SyncSourceLocal,
+	).Scan(&n); err != nil {
+		t.Fatalf("count sync_mutations: %v", err)
+	}
+	return n
+}
+
+// ─── Repair tests — skipped: upstream feature not yet ported ─────────────────
+// TODO(merge-upstream-v2 PR #2/#3): port repairEnrolledProjectSyncMutations to enable
+
+func TestRepairIsIdempotentOnAlreadyRepairedStore(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: repairEnrolledProjectSyncMutations — needs merge-upstream-v2 PR #2+")
+}
+
+func TestRepairBackfillsMissingMutations(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: repairEnrolledProjectSyncMutations — needs merge-upstream-v2 PR #2+")
+}
+
+func TestRepairDoesNotDeadlockWithCursorAndInsert(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: repairEnrolledProjectSyncMutations — needs merge-upstream-v2 PR #2+")
+}
+
+func TestRepairHandlesMixedState(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: repairEnrolledProjectSyncMutations — needs merge-upstream-v2 PR #2+")
+}
+
+// ─── Decay defaults tests — skipped: upstream feature not yet ported ─────────
+// TODO(merge-upstream-v2 PR #2/#3): port review_after/expires_at decay fields to enable
+
+func TestAddObservation_DecayDefaults(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: decay fields (review_after/expires_at) — needs merge-upstream-v2 PR #2+")
+}
+
+func TestAddObservation_DecayNotAppliedToExistingRows(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: decay fields (review_after/expires_at) — needs merge-upstream-v2 PR #2+")
+}
+
+// ─── ListDeferred / GetDeferred tests — skipped: upstream feature not yet ported ─
+// TODO(merge-upstream-v2 PR #2/#3): port ListDeferred/GetDeferred to enable these tests
+
+func seedDeferredRow(t *testing.T, s *SQLiteStore, syncID, entity, payload string, retryCount int, applyStatus string) {
+	t.Helper()
+	if _, err := s.db.Exec(`
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, apply_status, retry_count, first_seen_at)
+		VALUES (?, ?, ?, ?, ?, datetime('now'))
+	`, syncID, entity, payload, applyStatus, retryCount); err != nil {
+		t.Fatalf("seedDeferredRow %q: %v", syncID, err)
+	}
+}
+
+func TestListDeferred_HappyPath(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ListDeferred — needs merge-upstream-v2 PR #2+")
+}
+
+func TestListDeferred_DecodedPayload(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ListDeferred — needs merge-upstream-v2 PR #2+")
+}
+
+func TestListDeferred_MalformedPayload(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: ListDeferred — needs merge-upstream-v2 PR #2+")
+}
+
+func TestGetDeferred_HappyPath(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: GetDeferred — needs merge-upstream-v2 PR #2+")
+}
+
+func TestGetDeferred_NotFound(t *testing.T) {
+	t.Skipf("upstream feature not yet ported: GetDeferred — needs merge-upstream-v2 PR #2+")
+}
