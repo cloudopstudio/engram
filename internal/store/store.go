@@ -893,7 +893,7 @@ func (s *SQLiteStore) RecentObservations(project, scope string, limit int) ([]Ob
 		args = append(args, normalizeScope(scope))
 	}
 
-	query += " ORDER BY o.created_at DESC LIMIT ?"
+	query += " ORDER BY o.created_at DESC, o.id DESC LIMIT ?"
 	args = append(args, limit)
 
 	return s.queryObservations(query, args...)

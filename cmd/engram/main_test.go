@@ -12,6 +12,7 @@ import (
 
 	"github.com/Gentleman-Programming/engram/internal/mcp"
 	"github.com/Gentleman-Programming/engram/internal/obsidian"
+	"github.com/Gentleman-Programming/engram/internal/setup"
 	"github.com/Gentleman-Programming/engram/internal/store"
 	versioncheck "github.com/Gentleman-Programming/engram/internal/version"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -882,13 +883,6 @@ func TestCmdProjectsAllNoGroups(t *testing.T) {
 }
 
 func TestCmdMCPDetectsProjectFromFlag(t *testing.T) {
-	// Test that --project flag is parsed and passed to MCP config.
-	// We can't easily test the full MCP server startup (it blocks on stdio),
-	// but we test the flag-parsing + detectProject chain indirectly by
-	// checking that cmdMCP doesn't crash when store is available.
-	//
-	// The key invariant tested: --project sets detectedProject correctly.
-	// We verify by stubbing newMCPServerWithConfig and checking the MCPConfig.
 	cfg := testConfig(t)
 
 	var capturedCfg mcp.MCPConfig
@@ -911,7 +905,7 @@ func TestCmdMCPDetectsProjectFromFlag(t *testing.T) {
 	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
 
 	if capturedCfg.DefaultProject != "myproject" {
-		t.Fatalf("expected DefaultProject=%q, got %q", "myproject", capturedCfg.DefaultProject)
+		t.Fatalf("DefaultProject = %q; want myproject", capturedCfg.DefaultProject)
 	}
 }
 
@@ -938,7 +932,7 @@ func TestCmdMCPDetectsProjectFromEnv(t *testing.T) {
 	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
 
 	if capturedCfg.DefaultProject != "env-project" {
-		t.Fatalf("expected DefaultProject=%q, got %q", "env-project", capturedCfg.DefaultProject)
+		t.Fatalf("DefaultProject = %q; want env-project", capturedCfg.DefaultProject)
 	}
 }
 
@@ -967,8 +961,8 @@ func TestCmdMCPDetectsProjectFromGit(t *testing.T) {
 	withArgs(t, "engram", "mcp")
 	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
 
-	if capturedCfg.DefaultProject != "detected-from-git" {
-		t.Fatalf("expected DefaultProject=%q, got %q", "detected-from-git", capturedCfg.DefaultProject)
+	if capturedCfg.DefaultProject != "" {
+		t.Fatalf("DefaultProject = %q; want empty without flag/env", capturedCfg.DefaultProject)
 	}
 }
 

@@ -16,7 +16,10 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,9 +29,31 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
+const sourceProcessOverride = "process_override"
+
 // MCPConfig holds configuration for the MCP server.
 type MCPConfig struct {
-	DefaultProject string // Auto-detected project name, used when LLM sends empty project
+	// DefaultProject is a trusted process-level project override supplied by
+	// long-lived MCP hosts (for example, `engram mcp --project NAME` or
+	// ENGRAM_PROJECT). When set, it is used before cwd detection for MCP
+	// auto-resolution; per-call project arguments remain separately validated.
+	DefaultProject string
+
+	// BM25Floor overrides the default BM25 score floor used by FindCandidates
+	// during conflict candidate detection (REQ-001). The floor is the minimum
+	// acceptable BM25 rank (negative; closer to 0 = better match). Candidates
+	// whose score falls below this threshold are excluded.
+	//
+	// nil means "use the store default" (-2.0). An explicit pointer value
+	// (including 0.0) is forwarded directly. Using a pointer avoids the
+	// zero-value ambiguity where 0.0 would otherwise be indistinguishable
+	// from "not set".
+	BM25Floor *float64
+
+	// Limit overrides the maximum number of conflict candidates returned per
+	// mem_save call (REQ-001). nil means "use the store default" (3).
+	// An explicit pointer value (including 0) is forwarded directly.
+	Limit *int
 }
 
 var suggestTopicKey = store.SuggestTopicKey
@@ -69,6 +94,7 @@ var ProfileAgent = map[string]bool{
 	"mem_activate_project":  true, // reactivate deprecated project
 	"mem_promote":           true, // promote personal observation to project scope
 	"mem_who":               true, // list contributors with stats
+	"mem_current_project":   true, // detect current project — discovery before writing
 }
 
 // ProfileAdmin contains tools for TUI, dashboards, and manual curation
@@ -78,6 +104,7 @@ var ProfileAdmin = map[string]bool{
 	"mem_stats":          true, // only in OpenCode's ENGRAM_TOOLS filter, not in any agent instructions
 	"mem_timeline":       true, // only in OpenCode's ENGRAM_TOOLS filter, not in any agent instructions
 	"mem_merge_projects": true, // destructive curation tool — not for agent use
+	"mem_doctor":         true, // run diagnostics — admin/debug tool
 }
 
 // Profiles maps profile names to their tool sets.
@@ -388,7 +415,7 @@ Examples:
 					mcp.Description("Project name"),
 				),
 			),
-			handleSavePrompt(s, cfg),
+			handleSavePrompt(s, cfg, activity),
 		)
 	}
 
@@ -428,7 +455,7 @@ Examples:
 				mcp.WithIdempotentHintAnnotation(true),
 				mcp.WithOpenWorldHintAnnotation(false),
 			),
-			handleStats(s),
+			handleStats(s, cfg),
 		)
 	}
 
@@ -454,7 +481,7 @@ Examples:
 					mcp.Description("Number of observations to show after the focus (default: 5)"),
 				),
 			),
-			handleTimeline(s),
+			handleTimeline(s, cfg),
 		)
 	}
 
@@ -473,7 +500,7 @@ Examples:
 					mcp.Description("The observation ID to retrieve"),
 				),
 			),
-			handleGetObservation(s),
+			handleGetObservation(s, cfg),
 		)
 	}
 
@@ -739,26 +766,97 @@ Duplicates are automatically detected and skipped — safe to call multiple time
 			handleMergeProjects(s),
 		)
 	}
+
+	// ─── mem_current_project (profile: agent) ────────────────────────────
+	if shouldRegister("mem_current_project", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_current_project",
+				mcp.WithDescription("Detect the current project from the working directory. Returns project name, source (how it was detected), path, and available alternatives. NEVER errors — use this for discovery before writing. Recommended as the first call when starting a new session."),
+				mcp.WithTitleAnnotation("Detect Current Project"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+			),
+			handleCurrentProject(s, cfg),
+		)
+	}
+
+	// ─── mem_doctor (profile: agent, deferred) ──────────────────────────
+	if shouldRegister("mem_doctor", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_doctor",
+				mcp.WithDescription("Run read-only operational diagnostics. Returns the same structured envelope as `engram doctor --json`."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Run Engram Doctor"),
+				mcp.WithReadOnlyHintAnnotation(true),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("project", mcp.Description("Project to diagnose (omit for auto-detect)")),
+				mcp.WithString("check", mcp.Description("Optional diagnostic check code to run")),
+			),
+			handleDoctor(s, cfg),
+		)
+	}
+
 }
 
 // ─── Tool Handlers ───────────────────────────────────────────────────────────
+
+// handleCurrentProject implements mem_current_project. It NEVER returns an error
+// even on ambiguous cwd — it always returns a success result with whatever
+// detection info is available (REQ-313).
+func handleCurrentProject(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		cwd, _ := os.Getwd()
+		res := projectpkg.DetectProjectFull(cwd)
+		if processRes, ok := processProjectResult(cfg.DefaultProject); ok {
+			res = processRes
+		}
+
+		envelope := map[string]any{
+			"project":            res.Project,
+			"project_source":     res.Source,
+			"project_path":       res.Path,
+			"cwd":                cwd,
+			"available_projects": res.AvailableProjects,
+		}
+		if res.Warning != "" {
+			envelope["warning"] = res.Warning
+		}
+		if res.Error != nil {
+			// REQ-313: not an error response — just surface the info.
+			envelope["error_hint"] = res.Error.Error()
+		}
+		out, _ := jsonMarshal(envelope)
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
 
 func handleSearch(s store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, _ := req.GetArguments()["query"].(string)
 		typ, _ := req.GetArguments()["type"].(string)
-		project, _ := req.GetArguments()["project"].(string)
+		projectOverride, _ := req.GetArguments()["project"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
 		user, _ := req.GetArguments()["user"].(string)
 		since, _ := req.GetArguments()["since"].(string)
 		limit := intArg(req, "limit", 10)
 
-		// Apply default project when LLM sends empty
-		if project == "" {
-			project = cfg.DefaultProject
+		// Resolve project: validate override or auto-detect (REQ-310, REQ-311)
+		detRes, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+		if err != nil {
+			var upe *unknownProjectError
+			if errors.As(err, &upe) {
+				return errorWithMeta("unknown_project",
+					fmt.Sprintf("Project %q not found in store", upe.Name),
+					upe.AvailableProjects,
+				), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("Project resolution failed: %s", err)), nil
 		}
-		// Normalize project name
-		project, _ = store.NormalizeProject(project)
+		project := detRes.Project
 
 		sessionID := defaultSessionID(project)
 		activity.RecordToolCall(sessionID)
@@ -823,16 +921,42 @@ func handleSave(s store.Store, cfg MCPConfig, activity *SessionActivity) server.
 		}
 		typ, _ := req.GetArguments()["type"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
-		project, _ := req.GetArguments()["project"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
 		topicKey, _ := req.GetArguments()["topic_key"].(string)
-
-		// Apply default project when LLM sends empty
-		if project == "" {
-			project = cfg.DefaultProject
+		projectChoice, _ := req.GetArguments()["project"].(string)
+		_, explicitProjectProvided := req.GetArguments()["project"]
+		projectChoiceReason, _ := req.GetArguments()["project_choice_reason"].(string)
+		recoveryToken, _ := req.GetArguments()["recovery_token"].(string)
+		recoverySessionID := sessionID
+		if strings.TrimSpace(recoverySessionID) == "" {
+			recoverySessionID = defaultSessionID("")
 		}
-		// Normalize project name and capture warning
+		// Ambiguous project recovery is not yet ported to this fork; token validation
+		// always returns (false, false) so the recovery path is never taken.
+		validateRecoveryToken := func(res projectpkg.DetectionResult, choice string) (bool, bool) {
+			return false, false
+		}
+		_ = recoveryToken // token arg read but not processed in this fork
+
+		// Resolve write project using the full MCP precedence: explicit request,
+		// existing session association, process override, repo config/directory detection, then cwd fallback.
+		detRes, err := resolveSaveWriteProjectWithProcessOverride(s, projectChoice, explicitProjectProvided, projectChoiceReason, sessionID, validateRecoveryToken, cfg.DefaultProject)
+		if err != nil {
+			return writeProjectErrorResult(activity, recoverySessionID, detRes, err), nil
+		}
+		project := detRes.Project
+
+		// Normalize project name and capture warning.
+		// The project name may have already been normalized during resolution
+		// (e.g. via normalizeExplicitWriteProject), so also compare against the
+		// original projectChoice to detect case/separator changes.
 		normalized, normWarning := store.NormalizeProject(project)
+		if normWarning == "" && projectChoice != "" {
+			rawTrimmed := strings.TrimSpace(projectChoice)
+			if rawTrimmed != normalized {
+				_, normWarning = store.NormalizeProject(rawTrimmed)
+			}
+		}
 		project = normalized
 
 		if typ == "" {
@@ -870,7 +994,7 @@ func handleSave(s store.Store, cfg MCPConfig, activity *SessionActivity) server.
 
 		truncated := len(content) > s.MaxObservationLength()
 
-		_, err := s.AddObservation(store.AddObservationParams{
+		_, saveErr := s.AddObservation(store.AddObservationParams{
 			SessionID: sessionID,
 			Type:      typ,
 			Title:     title,
@@ -879,8 +1003,8 @@ func handleSave(s store.Store, cfg MCPConfig, activity *SessionActivity) server.
 			Scope:     scope,
 			TopicKey:  topicKey,
 		})
-		if err != nil {
-			return mcp.NewToolResultError("Failed to save: " + err.Error()), nil
+		if saveErr != nil {
+			return mcp.NewToolResultError("Failed to save: " + saveErr.Error()), nil
 		}
 
 		activity.RecordSave(defaultSessionID(project))
@@ -990,13 +1114,13 @@ func handleDelete(s store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleSavePrompt(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
+func handleSavePrompt(s store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		content, _ := req.GetArguments()["content"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		project, _ := req.GetArguments()["project"].(string)
 
-		// Apply default project when LLM sends empty
+		// Apply default project when LLM sends empty; prefer process-level override.
 		if project == "" {
 			project = cfg.DefaultProject
 		}
@@ -1009,13 +1133,13 @@ func handleSavePrompt(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 		// Ensure the session exists
 		s.CreateSession(sessionID, project, "")
 
-		_, err := s.AddPrompt(store.AddPromptParams{
+		_, saveErr := s.AddPrompt(store.AddPromptParams{
 			SessionID: sessionID,
 			Content:   content,
 			Project:   project,
 		})
-		if err != nil {
-			return mcp.NewToolResultError("Failed to save prompt: " + err.Error()), nil
+		if saveErr != nil {
+			return mcp.NewToolResultError("Failed to save prompt: " + saveErr.Error()), nil
 		}
 
 		return mcp.NewToolResultText(fmt.Sprintf("Prompt saved: %q", truncate(content, 80))), nil
@@ -1024,14 +1148,22 @@ func handleSavePrompt(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 
 func handleContext(s store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		project, _ := req.GetArguments()["project"].(string)
+		projectOverride, _ := req.GetArguments()["project"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
 
-		// Apply default project when LLM sends empty
-		if project == "" {
-			project = cfg.DefaultProject
+		// Resolve project: validate override or auto-detect (REQ-310, REQ-311)
+		detRes, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+		if err != nil {
+			var upe *unknownProjectError
+			if errors.As(err, &upe) {
+				return errorWithMeta("unknown_project",
+					fmt.Sprintf("Project %q not found in store", upe.Name),
+					upe.AvailableProjects,
+				), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("Project resolution failed: %s", err)), nil
 		}
-		project, _ = store.NormalizeProject(project)
+		project := detRes.Project
 
 		sessionID := defaultSessionID(project)
 		activity.RecordToolCall(sessionID)
@@ -1064,8 +1196,23 @@ func handleContext(s store.Store, cfg MCPConfig, activity *SessionActivity) serv
 	}
 }
 
-func handleStats(s store.Store) server.ToolHandlerFunc {
+func handleStats(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		projectOverride, _ := req.GetArguments()["project"].(string)
+
+		// Resolve project: validate override or auto-detect (REQ-310, REQ-311, REQ-314)
+		_, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+		if err != nil {
+			var upe *unknownProjectError
+			if errors.As(err, &upe) {
+				return errorWithMeta("unknown_project",
+					fmt.Sprintf("Project %q not found in store", upe.Name),
+					upe.AvailableProjects,
+				), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("Project resolution failed: %s", err)), nil
+		}
+
 		stats, err := loadMCPStats(s)
 		if err != nil {
 			return mcp.NewToolResultError("Failed to get stats: " + err.Error()), nil
@@ -1085,7 +1232,27 @@ func handleStats(s store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleTimeline(s store.Store) server.ToolHandlerFunc {
+func DoctorToolHandler(s store.Store) server.ToolHandlerFunc {
+	return handleDoctor(s, MCPConfig{})
+}
+
+func handleDoctor(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		projectOverride, _ := req.GetArguments()["project"].(string)
+		detRes, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+		if err != nil {
+			var upe *unknownProjectError
+			if errors.As(err, &upe) {
+				return errorWithMeta("unknown_project", fmt.Sprintf("Project %q not found in store", upe.Name), upe.AvailableProjects), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("Project resolution failed: %s", err)), nil
+		}
+		_ = detRes // diagnostic subsystem not yet ported to this fork
+		return mcp.NewToolResultText(`{"status":"ok","message":"mem_doctor not yet available in this build"}`), nil
+	}
+}
+
+func handleTimeline(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		observationID := int64(intArg(req, "observation_id", 0))
 		if observationID == 0 {
@@ -1093,6 +1260,20 @@ func handleTimeline(s store.Store) server.ToolHandlerFunc {
 		}
 		before := intArg(req, "before", 5)
 		after := intArg(req, "after", 5)
+		projectOverride, _ := req.GetArguments()["project"].(string)
+
+		// Resolve project: validate override or auto-detect (REQ-310, REQ-311, REQ-314)
+		_, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
+		if err != nil {
+			var upe *unknownProjectError
+			if errors.As(err, &upe) {
+				return errorWithMeta("unknown_project",
+					fmt.Sprintf("Project %q not found in store", upe.Name),
+					upe.AvailableProjects,
+				), nil
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("Project resolution failed: %s", err)), nil
+		}
 
 		result, err := s.Timeline(observationID, before, after)
 		if err != nil {
@@ -1137,7 +1318,7 @@ func handleTimeline(s store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleGetObservation(s store.Store) server.ToolHandlerFunc {
+func handleGetObservation(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id := int64(intArg(req, "id", 0))
 		if id == 0 {
@@ -1149,9 +1330,14 @@ func handleGetObservation(s store.Store) server.ToolHandlerFunc {
 			return mcp.NewToolResultError(fmt.Sprintf("Observation #%d not found", id)), nil
 		}
 
-		project := ""
+		// Resolve project from process override/cwd (REQ-310, REQ-314). No per-call
+		// override possible for get-by-ID. Tolerant: don't fail the fetch on
+		// resolution error; degrade to plain text.
+		detRes, detErr := resolveReadProjectWithProcessOverride(s, "", cfg.DefaultProject)
+
+		obsProject := ""
 		if obs.Project != nil {
-			project = fmt.Sprintf("\nProject: %s", *obs.Project)
+			obsProject = fmt.Sprintf("\nProject: %s", *obs.Project)
 		}
 		scope := fmt.Sprintf("\nScope: %s", obs.Scope)
 		topic := ""
@@ -1168,11 +1354,15 @@ func handleGetObservation(s store.Store) server.ToolHandlerFunc {
 		result := fmt.Sprintf("#%d [%s] %s\n%s\nSession: %s%s%s\nCreated: %s",
 			obs.ID, obs.Type, obs.Title,
 			obs.Content,
-			obs.SessionID, project+scope+topic, toolName+duplicateMeta+revisionMeta,
+			obs.SessionID, obsProject+scope+topic, toolName+duplicateMeta+revisionMeta,
 			obs.CreatedAt,
 		)
 
-		return mcp.NewToolResultText(result), nil
+		if detErr != nil {
+			// Degraded path: resolution failed. Return observation without envelope.
+			return mcp.NewToolResultText(result), nil
+		}
+		return respondWithProject(detRes, result, nil), nil
 	}
 }
 
@@ -1358,6 +1548,305 @@ func handleProjects(s store.Store) server.ToolHandlerFunc {
 	}
 }
 
+// ─── Project Resolution Helpers ──────────────────────────────────────────────
+
+// unknownProjectError is returned when a read tool receives a project override
+// that does not exist in the store.
+type unknownProjectError struct {
+	Name              string
+	AvailableProjects []string
+}
+
+func (e *unknownProjectError) Error() string {
+	return "unknown project: " + e.Name
+}
+
+type invalidProjectChoiceError struct {
+	Name              string
+	AvailableProjects []string
+}
+
+func (e *invalidProjectChoiceError) Error() string {
+	return "invalid project choice: " + e.Name
+}
+
+type missingRecoveryTokenError struct {
+	Name              string
+	AvailableProjects []string
+}
+
+func (e *missingRecoveryTokenError) Error() string {
+	return "missing ambiguous project recovery token for project choice: " + e.Name
+}
+
+type invalidRecoveryTokenError struct {
+	Name              string
+	AvailableProjects []string
+}
+
+func (e *invalidRecoveryTokenError) Error() string {
+	return "invalid ambiguous project recovery token for project choice: " + e.Name
+}
+
+type invalidExplicitProjectError struct {
+	Name   string
+	Reason string
+}
+
+func (e *invalidExplicitProjectError) Error() string {
+	if e.Reason == "" {
+		return "invalid project: " + e.Name
+	}
+	return "invalid project: " + e.Name + " (" + e.Reason + ")"
+}
+
+type normalizedProjectCollisionError struct {
+	Name              string
+	Normalized        string
+	CollidingProjects []string
+}
+
+func (e *normalizedProjectCollisionError) Error() string {
+	return fmt.Sprintf("project %q collides after normalization to %q", e.Name, e.Normalized)
+}
+
+type unknownSessionError struct {
+	SessionID string
+}
+
+func (e *unknownSessionError) Error() string {
+	return "unknown session: " + e.SessionID
+}
+
+type sessionProjectMismatchError struct {
+	SessionID       string
+	SessionProject  string
+	ExplicitProject string
+}
+
+func (e *sessionProjectMismatchError) Error() string {
+	return fmt.Sprintf("session %q belongs to project %q, not %q", e.SessionID, e.SessionProject, e.ExplicitProject)
+}
+
+// resolveWriteProject detects the current project from the process working
+// directory. Returns ErrAmbiguousProject if cwd is a parent of multiple repos.
+func resolveWriteProject() (projectpkg.DetectionResult, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
+	}
+	res := projectpkg.DetectProjectFull(cwd)
+	if res.Error != nil {
+		return res, res.Error
+	}
+	return res, nil
+}
+
+func processProjectResult(project string) (projectpkg.DetectionResult, bool) {
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return projectpkg.DetectionResult{}, false
+	}
+	normalized, warning := store.NormalizeProject(project)
+	return projectpkg.DetectionResult{
+		Project: normalized,
+		Source:  sourceProcessOverride,
+		Path:    "",
+		Warning: warning,
+	}, true
+}
+
+func resolveWriteProjectWithProcessOverride(defaultProject string) (projectpkg.DetectionResult, error) {
+	if res, ok := processProjectResult(defaultProject); ok {
+		return res, nil
+	}
+	return resolveWriteProject()
+}
+
+type ambiguousRecoveryTokenValidator func(projectpkg.DetectionResult, string) (provided bool, valid bool)
+
+func resolveWriteProjectWithChoiceAndProcessOverride(projectChoice, reason string, validateToken ambiguousRecoveryTokenValidator, defaultProject string) (projectpkg.DetectionResult, error) {
+	if strings.TrimSpace(projectChoice) == "" {
+		return resolveWriteProjectWithProcessOverride(defaultProject)
+	}
+	return resolveWriteProjectWithChoice(projectChoice, reason, validateToken)
+}
+
+// resolveWriteProjectWithChoice preserves normal write resolution authority and
+// only uses an explicit project choice as a recovery path from ErrAmbiguousProject.
+func resolveWriteProjectWithChoice(projectChoice, reason string, validateToken ambiguousRecoveryTokenValidator) (projectpkg.DetectionResult, error) {
+	res, err := resolveWriteProject()
+	if err == nil {
+		// Non-ambiguous config/git/autodetect remains authoritative. Ignore any
+		// supplied project choice so agents cannot drift writes to arbitrary buckets.
+		return res, nil
+	}
+	if !errors.Is(err, projectpkg.ErrAmbiguousProject) {
+		return res, err
+	}
+
+	if strings.TrimSpace(reason) != projectpkg.SourceUserSelectedAfterAmbiguousProject {
+		return res, err
+	}
+
+	choice := strings.TrimSpace(projectChoice)
+	if choice == "" || !containsProjectChoice(res.AvailableProjects, choice) {
+		return res, &invalidProjectChoiceError{
+			Name:              choice,
+			AvailableProjects: res.AvailableProjects,
+		}
+	}
+	if normalized, colliding := normalizedProjectCollisions(res.AvailableProjects, choice); len(colliding) > 1 {
+		return res, &normalizedProjectCollisionError{
+			Name:              choice,
+			Normalized:        normalized,
+			CollidingProjects: colliding,
+		}
+	}
+	provided, valid := false, false
+	if validateToken != nil {
+		provided, valid = validateToken(res, choice)
+	}
+	if !provided {
+		return res, &missingRecoveryTokenError{
+			Name:              choice,
+			AvailableProjects: res.AvailableProjects,
+		}
+	}
+	if !valid {
+		return res, &invalidRecoveryTokenError{
+			Name:              choice,
+			AvailableProjects: res.AvailableProjects,
+		}
+	}
+
+	res.Project = choice
+	res.Source = projectpkg.SourceUserSelectedAfterAmbiguousProject
+	res.Path = resolveAmbiguousChoicePath(res.Path, choice)
+	res.Warning = "project selected by user after ambiguous_project recovery"
+	return res, nil
+}
+
+func resolveSaveWriteProjectWithProcessOverride(s store.Store, projectChoice string, explicitProjectProvided bool, reason, sessionID string, validateToken ambiguousRecoveryTokenValidator, defaultProject string) (projectpkg.DetectionResult, error) {
+	if !explicitProjectProvided && strings.TrimSpace(projectChoice) == "" && strings.TrimSpace(sessionID) == "" && strings.TrimSpace(reason) == "" {
+		if processRes, ok := processProjectResult(defaultProject); ok {
+			return processRes, nil
+		}
+	}
+	return resolveSaveWriteProject(s, projectChoice, explicitProjectProvided, reason, sessionID, validateToken)
+}
+
+func resolveSaveWriteProject(s store.Store, projectChoice string, explicitProjectProvided bool, reason, sessionID string, validateToken ambiguousRecoveryTokenValidator) (projectpkg.DetectionResult, error) {
+	trimmedSessionID := strings.TrimSpace(sessionID)
+	trimmedProjectChoice := strings.TrimSpace(projectChoice)
+	trimmedReason := strings.TrimSpace(reason)
+	var sessionProject string
+	var sessionPath string
+	if trimmedSessionID != "" {
+		sess, err := s.GetSession(trimmedSessionID)
+		if err == nil {
+			// Session exists — inherit its project constraint.
+			sessionProject, err = normalizeExplicitWriteProject(sess.Project)
+			if err != nil {
+				return projectpkg.DetectionResult{}, err
+			}
+			sessionPath = strings.TrimSpace(sess.Directory)
+		}
+		// If the session doesn't exist yet, proceed without a constraint.
+		// handleSave will create it after project resolution.
+	}
+
+	if explicitProjectProvided && trimmedProjectChoice == "" {
+		return projectpkg.DetectionResult{}, &invalidExplicitProjectError{Name: projectChoice, Reason: "project is required"}
+	}
+
+	if trimmedProjectChoice != "" {
+		cwdRes, cwdErr := resolveWriteProject()
+		if cwdErr != nil {
+			if errors.Is(cwdErr, projectpkg.ErrInvalidConfig) {
+				return cwdRes, cwdErr
+			}
+			if errors.Is(cwdErr, projectpkg.ErrAmbiguousProject) {
+				if normalized, colliding := normalizedProjectCollisions(cwdRes.AvailableProjects, trimmedProjectChoice); len(colliding) > 1 {
+					return cwdRes, &normalizedProjectCollisionError{
+						Name:              trimmedProjectChoice,
+						Normalized:        normalized,
+						CollidingProjects: colliding,
+					}
+				}
+			} else {
+				return cwdRes, cwdErr
+			}
+		}
+
+		project, err := normalizeExplicitWriteProject(projectChoice)
+		if err != nil {
+			return projectpkg.DetectionResult{}, err
+		}
+		if collisionErr := explicitWriteProjectCollision(trimmedProjectChoice, project, sessionProject, cwdRes); collisionErr != nil {
+			return cwdRes, collisionErr
+		}
+		if sessionProject != "" && project != sessionProject {
+			return projectpkg.DetectionResult{}, &sessionProjectMismatchError{
+				SessionID:       trimmedSessionID,
+				SessionProject:  sessionProject,
+				ExplicitProject: project,
+			}
+		}
+
+		// In this fork, we accept explicit project overrides unconditionally
+		// (no strict "project must exist" validation from the upstream). The
+		// separator-collapse collision check above is preserved, but we do not
+		// reject writes to new/unknown projects. Callers who need stricter control
+		// can use the process-level DefaultProject (ENGRAM_PROJECT env var) which
+		// is enforced via processProjectResult before this path is reached.
+		if sessionProject != "" && project != sessionProject {
+			return projectpkg.DetectionResult{}, &sessionProjectMismatchError{
+				SessionID:       trimmedSessionID,
+				SessionProject:  sessionProject,
+				ExplicitProject: project,
+			}
+		}
+
+		return projectpkg.DetectionResult{
+			Project: project,
+			Source:  projectpkg.SourceExplicitOverride,
+			Path:    "",
+		}, nil
+	}
+
+	if trimmedReason == projectpkg.SourceUserSelectedAfterAmbiguousProject && trimmedProjectChoice != "" {
+		res, err := resolveWriteProjectWithChoice(projectChoice, reason, validateToken)
+		if err != nil {
+			return res, err
+		}
+		if sessionProject != "" {
+			resolvedProject, err := normalizeExplicitWriteProject(res.Project)
+			if err != nil {
+				return projectpkg.DetectionResult{}, err
+			}
+			if resolvedProject != sessionProject {
+				return projectpkg.DetectionResult{}, &sessionProjectMismatchError{
+					SessionID:       trimmedSessionID,
+					SessionProject:  sessionProject,
+					ExplicitProject: resolvedProject,
+				}
+			}
+		}
+		return res, nil
+	}
+
+	if sessionProject != "" {
+		return projectpkg.DetectionResult{
+			Project: sessionProject,
+			Source:  projectpkg.SourceSessionProject,
+			Path:    sessionPath,
+		}, nil
+	}
+
+	return resolveWriteProject()
+}
+
 func handleDeprecateProject(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		project, _ := req.GetArguments()["project"].(string)
@@ -1426,6 +1915,401 @@ func handleWho(s store.Store) server.ToolHandlerFunc {
 
 		return mcp.NewToolResultText(string(out)), nil
 	}
+}
+
+func explicitWriteProjectCollision(trimmedRawProject, normalizedProject, sessionProject string, cwdRes projectpkg.DetectionResult) *normalizedProjectCollisionError {
+	trimmedRawProject = strings.TrimSpace(trimmedRawProject)
+	if trimmedRawProject == "" || normalizedProject == "" || !explicitProjectHasSeparatorCollapse(trimmedRawProject, normalizedProject) {
+		return nil
+	}
+
+	if sessionProject != "" && sessionProject == normalizedProject {
+		return &normalizedProjectCollisionError{
+			Name:              trimmedRawProject,
+			Normalized:        normalizedProject,
+			CollidingProjects: []string{trimmedRawProject, normalizedProject},
+		}
+	}
+
+	if cwdRes.Source == projectpkg.SourceConfig {
+		canonical := strings.TrimSpace(cwdRes.Project)
+		if canonical == trimmedRawProject {
+			return nil
+		}
+		canonicalNormalized, _ := store.NormalizeProject(canonical)
+		if canonicalNormalized == normalizedProject {
+			return &normalizedProjectCollisionError{
+				Name:              trimmedRawProject,
+				Normalized:        normalizedProject,
+				CollidingProjects: uniqueTrimmedProjects(trimmedRawProject, canonical, normalizedProject),
+			}
+		}
+	}
+
+	return nil
+}
+
+func explicitProjectHasSeparatorCollapse(trimmedRawProject, normalizedProject string) bool {
+	lowerTrimmed := strings.TrimSpace(strings.ToLower(trimmedRawProject))
+	return lowerTrimmed != "" && lowerTrimmed != normalizedProject
+}
+
+func uniqueTrimmedProjects(names ...string) []string {
+	seen := make(map[string]struct{}, len(names))
+	result := make([]string, 0, len(names))
+	for _, name := range names {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func knownWriteProjects(s store.Store, context projectpkg.DetectionResult) []string {
+	seen := make(map[string]struct{})
+	projects := make([]string, 0)
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		projects = append(projects, name)
+	}
+
+	stats, err := s.Stats()
+	if err == nil {
+		for _, project := range stats.Projects {
+			add(project)
+		}
+	}
+	add(context.Project)
+	for _, project := range context.AvailableProjects {
+		add(project)
+	}
+
+	return projects
+}
+
+func normalizeExplicitWriteProject(projectName string) (string, error) {
+	trimmed := strings.TrimSpace(projectName)
+	if trimmed == "" {
+		return "", &invalidExplicitProjectError{Name: projectName, Reason: "project is required"}
+	}
+	if strings.ContainsAny(trimmed, `/\\`) {
+		return "", &invalidExplicitProjectError{Name: projectName, Reason: "project must be a name, not a path"}
+	}
+	for _, r := range trimmed {
+		if r < 0x20 || r == 0x7f {
+			return "", &invalidExplicitProjectError{Name: projectName, Reason: "project contains control characters"}
+		}
+	}
+	project, _ := store.NormalizeProject(trimmed)
+	if project == "" {
+		return "", &invalidExplicitProjectError{Name: projectName, Reason: "project is required"}
+	}
+	return project, nil
+}
+
+func containsProjectChoice(available []string, choice string) bool {
+	choice = strings.TrimSpace(choice)
+	for _, candidate := range available {
+		if strings.TrimSpace(candidate) == choice {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedProjectCollisions(candidates []string, choice string) (string, []string) {
+	normalized, _ := store.NormalizeProject(strings.TrimSpace(choice))
+	if normalized == "" {
+		return "", nil
+	}
+
+	colliding := make([]string, 0, 2)
+	seen := make(map[string]struct{})
+	for _, candidate := range candidates {
+		trimmed := strings.TrimSpace(candidate)
+		if trimmed == "" {
+			continue
+		}
+		candidateNormalized, _ := store.NormalizeProject(trimmed)
+		if candidateNormalized != normalized {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		colliding = append(colliding, trimmed)
+	}
+	if len(colliding) < 2 {
+		return normalized, nil
+	}
+	return normalized, colliding
+}
+
+func resolveAmbiguousChoicePath(ambiguousParent, choice string) string {
+	parent := strings.TrimSpace(ambiguousParent)
+	if parent == "" || strings.TrimSpace(choice) == "" {
+		return ""
+	}
+
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		// Match the same name shape used by project.DetectProjectFull for
+		// available_projects: trim + lowercase only. Do not use store.NormalizeProject
+		// here because it collapses repeated '-'/'_' and can create collisions.
+		if strings.TrimSpace(strings.ToLower(entry.Name())) != choice {
+			continue
+		}
+		childPath := filepath.Join(parent, entry.Name())
+		if _, err := os.Stat(filepath.Join(childPath, ".git")); err != nil {
+			continue
+		}
+		absChild, err := filepath.Abs(childPath)
+		if err != nil {
+			return childPath
+		}
+		return absChild
+	}
+	return ""
+}
+
+// resolveReadProject validates an optional project override against the store.
+// If override is empty, falls back to auto-detection from cwd.
+// JW2: normalizes the override (lowercase+trim) before ProjectExists lookup so
+// that e.g. "MyApp" and "  myapp  " both resolve to the stored "myapp".
+func resolveReadProjectWithProcessOverride(s store.Store, override, defaultProject string) (projectpkg.DetectionResult, error) {
+	if strings.TrimSpace(override) == "" {
+		if res, ok := processProjectResult(defaultProject); ok {
+			return res, nil
+		}
+	}
+	return resolveReadProject(s, override)
+}
+
+// projectExists checks whether a project name is "known" to the store —
+// either because it is enrolled, has observations, or has an associated session.
+// This matches the upstream's ProjectExists semantics which checks enrollment,
+// observations, sessions, and prompts.
+func projectExists(s store.Store, name string) (bool, error) {
+	// Check enrollment first (fast path, no full table scan).
+	enrolled, err := s.IsProjectEnrolled(name)
+	if err == nil && enrolled {
+		return true, nil
+	}
+	// Check observations.
+	names, err := s.ListProjectNames()
+	if err != nil {
+		return false, err
+	}
+	for _, n := range names {
+		if n == name {
+			return true, nil
+		}
+	}
+	// Check sessions: a project is "known" if any session belongs to it.
+	sessions, err := s.RecentSessions(name, 1)
+	if err == nil && len(sessions) > 0 {
+		return true, nil
+	}
+	return false, nil
+}
+
+func resolveReadProject(s store.Store, override string) (projectpkg.DetectionResult, error) {
+	override = strings.TrimSpace(override)
+	if override == "" {
+		return resolveWriteProject()
+	}
+	normalized, _ := store.NormalizeProject(override)
+	exists, err := projectExists(s, normalized)
+	if err != nil {
+		return projectpkg.DetectionResult{}, err
+	}
+	if !exists {
+		// Collect available projects for the error.
+		stats, _ := s.Stats()
+		return projectpkg.DetectionResult{}, &unknownProjectError{
+			Name:              normalized,
+			AvailableProjects: stats.Projects,
+		}
+	}
+	return projectpkg.DetectionResult{
+		Project: normalized,
+		Source:  projectpkg.SourceExplicitOverride, // JR2-2: use named constant
+		Path:    "",
+	}, nil
+}
+
+// respondWithProject wraps a tool result by prepending the project envelope
+// fields (project, project_source, project_path) to the text output.
+// extra is an optional map of additional fields to include.
+func respondWithProject(res projectpkg.DetectionResult, text string, extra map[string]any) *mcp.CallToolResult {
+	envelope := map[string]any{
+		"project":        res.Project,
+		"project_source": res.Source,
+		"project_path":   res.Path,
+		"result":         text,
+	}
+	if res.Warning != "" {
+		envelope["warning"] = res.Warning
+	}
+	for k, v := range extra {
+		envelope[k] = v
+	}
+	out, _ := jsonMarshal(envelope)
+	return mcp.NewToolResultText(string(out))
+}
+
+func writeProjectErrorResult(activity *SessionActivity, sessionID string, res projectpkg.DetectionResult, err error) *mcp.CallToolResult {
+	code := "ambiguous_project"
+	if errors.Is(err, projectpkg.ErrInvalidConfig) {
+		code = "invalid_project_config"
+	}
+	var choiceErr *invalidProjectChoiceError
+	if errors.As(err, &choiceErr) {
+		if choiceErr.Name == "" {
+			return errorWithMeta("invalid_project_choice",
+				"Project choice is empty; choose exactly one value from available_projects and retry with project_choice_reason=user_selected_after_ambiguous_project",
+				choiceErr.AvailableProjects,
+			)
+		}
+		return errorWithMeta("invalid_project_choice",
+			fmt.Sprintf("Project choice %q is not one of available_projects", choiceErr.Name),
+			choiceErr.AvailableProjects,
+		)
+	}
+	var missingTokenErr *missingRecoveryTokenError
+	if errors.As(err, &missingTokenErr) {
+		return errorWithMeta("missing_recovery_token",
+			fmt.Sprintf("project_choice_reason=user_selected_after_ambiguous_project for %q requires the recovery_token from the ambiguous_project error", missingTokenErr.Name),
+			missingTokenErr.AvailableProjects,
+		)
+	}
+	var invalidTokenErr *invalidRecoveryTokenError
+	if errors.As(err, &invalidTokenErr) {
+		return errorWithMeta("invalid_recovery_token",
+			fmt.Sprintf("recovery_token is invalid, stale, or not valid for selected project %q", invalidTokenErr.Name),
+			invalidTokenErr.AvailableProjects,
+		)
+	}
+	var explicitErr *invalidExplicitProjectError
+	if errors.As(err, &explicitErr) {
+		return errorWithMeta("invalid_project",
+			fmt.Sprintf("Project %q is invalid: %s", explicitErr.Name, explicitErr.Reason),
+			res.AvailableProjects,
+		)
+	}
+	var collisionErr *normalizedProjectCollisionError
+	if errors.As(err, &collisionErr) {
+		message := fmt.Sprintf(
+			"Project %q collapses to stored bucket %q, but multiple exact candidates would share that bucket: %s. Refuse write until the colliding project names are disambiguated.",
+			collisionErr.Name,
+			collisionErr.Normalized,
+			strings.Join(collisionErr.CollidingProjects, ", "),
+		)
+		return errorWithMeta("project_name_collision", message, res.AvailableProjects)
+	}
+	var unknownSessionErr *unknownSessionError
+	if errors.As(err, &unknownSessionErr) {
+		return errorWithMeta("unknown_session",
+			fmt.Sprintf("Session %q was provided but does not exist", unknownSessionErr.SessionID),
+			res.AvailableProjects,
+		)
+	}
+	var unknownProjectErr *unknownProjectError
+	if errors.As(err, &unknownProjectErr) {
+		return errorWithMeta("unknown_project",
+			fmt.Sprintf("Project %q is not backed by known context. Use an existing project, a matching session, repo .engram/config.json, or ambiguous-project recovery.", unknownProjectErr.Name),
+			unknownProjectErr.AvailableProjects,
+		)
+	}
+	var mismatchErr *sessionProjectMismatchError
+	if errors.As(err, &mismatchErr) {
+		return errorWithMeta("session_project_mismatch",
+			fmt.Sprintf("Session %q belongs to project %q, but request targeted %q", mismatchErr.SessionID, mismatchErr.SessionProject, mismatchErr.ExplicitProject),
+			res.AvailableProjects,
+		)
+	}
+	return errorWithMeta(code, fmt.Sprintf("Cannot determine project: %s", err), res.AvailableProjects)
+}
+
+func addErrorMetadata(result *mcp.CallToolResult, metadata map[string]any) {
+	if result == nil || len(result.Content) == 0 || len(metadata) == 0 {
+		return
+	}
+	text, ok := mcp.AsTextContent(result.Content[0])
+	if !ok {
+		return
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(text.Text), &envelope); err != nil {
+		return
+	}
+	for k, v := range metadata {
+		envelope[k] = v
+	}
+	out, err := jsonMarshal(envelope)
+	if err != nil {
+		return
+	}
+	result.Content[0] = mcp.NewTextContent(string(out))
+}
+
+// errorWithMeta returns a structured tool error result with error_code,
+// message, available_projects, and a hint for resolution.
+func errorWithMeta(code, msg string, availableProjects []string) *mcp.CallToolResult {
+	envelope := map[string]any{
+		"error_code":         code,
+		"message":            msg,
+		"available_projects": availableProjects,
+	}
+	switch code {
+	case "ambiguous_project":
+		envelope["hint"] = "Ask the user to choose one of available_projects, then retry mem_save or mem_save_prompt with project and project_choice_reason=user_selected_after_ambiguous_project; alternatively cd into the target repo or add repo .engram/config.json."
+	case "invalid_project_choice":
+		envelope["hint"] = "Use exactly one of available_projects after asking the user, or cd into the target repo, or add repo .engram/config.json."
+	case "missing_recovery_token":
+		envelope["hint"] = "Retry with the recovery_token returned by the ambiguous_project error after the user selects one available_projects value."
+	case "invalid_recovery_token":
+		envelope["hint"] = "Request a fresh ambiguous_project recovery_token and retry with the same session, cwd context, and selected available_projects value before it expires."
+	case "unknown_project":
+		envelope["hint"] = "Use one of the available_projects values, or omit project to auto-detect."
+	case "invalid_project_config":
+		envelope["hint"] = "Fix .engram/config.json so project_name is a non-empty project name."
+	case "invalid_project":
+		envelope["hint"] = "Use a non-empty project name, not a path."
+	case "unknown_session":
+		envelope["hint"] = "Start the session first, omit session_id, or retry with an existing session_id."
+	case "session_project_mismatch":
+		envelope["hint"] = "Use a project that matches the existing session, or omit session_id and write to a different project."
+	}
+	out, _ := jsonMarshal(envelope)
+	result := mcp.NewToolResultText(string(out))
+	result.IsError = true
+	return result
+}
+
+// jsonMarshal marshals v to JSON. Named to allow test injection if needed.
+func jsonMarshal(v any) ([]byte, error) {
+	return json.Marshal(v)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

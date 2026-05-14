@@ -420,7 +420,7 @@ func TestHandleSearchAndCRUDHandlers(t *testing.T) {
 		t.Fatalf("unexpected update error: %s", callResultText(t, updateRes))
 	}
 
-	getObs := handleGetObservation(s)
+	getObs := handleGetObservation(s, MCPConfig{})
 	getReq := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"id": float64(obsID),
 	}}}
@@ -466,7 +466,7 @@ func TestHandlePromptContextStatsTimelineAndSessionHandlers(t *testing.T) {
 		t.Fatalf("add observation: %v", err)
 	}
 
-	savePrompt := handleSavePrompt(s, MCPConfig{})
+	savePrompt := handleSavePrompt(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
 	savePromptReq := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"content": "how do we fix auth race conditions?",
 		"project": "engram",
@@ -495,7 +495,7 @@ func TestHandlePromptContextStatsTimelineAndSessionHandlers(t *testing.T) {
 		t.Fatalf("expected context output with memory stats")
 	}
 
-	statsHandler := handleStats(s)
+	statsHandler := handleStats(s, MCPConfig{})
 	statsRes, err := statsHandler(context.Background(), mcppkg.CallToolRequest{})
 	if err != nil {
 		t.Fatalf("stats handler error: %v", err)
@@ -509,7 +509,7 @@ func TestHandlePromptContextStatsTimelineAndSessionHandlers(t *testing.T) {
 		t.Fatalf("recent observations for timeline: %v len=%d", err, len(recent))
 	}
 
-	timelineHandler := handleTimeline(s)
+	timelineHandler := handleTimeline(s, MCPConfig{})
 	timelineReq := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"observation_id": float64(recent[0].ID),
 		"before":         2.0,
@@ -607,7 +607,7 @@ func TestMCPHandlersErrorBranches(t *testing.T) {
 		t.Fatalf("expected delete missing id to return tool error")
 	}
 
-	timeline := handleTimeline(s)
+	timeline := handleTimeline(s, MCPConfig{})
 	timelineMissingIDRes, err := timeline(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{}}})
 	if err != nil {
 		t.Fatalf("timeline missing id error: %v", err)
@@ -616,7 +616,7 @@ func TestMCPHandlersErrorBranches(t *testing.T) {
 		t.Fatalf("expected timeline missing id to return tool error")
 	}
 
-	getObs := handleGetObservation(s)
+	getObs := handleGetObservation(s, MCPConfig{})
 	getMissingIDRes, err := getObs(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{}}})
 	if err != nil {
 		t.Fatalf("get observation missing id error: %v", err)
@@ -680,7 +680,7 @@ func TestMCPHandlersReturnErrorsWhenStoreClosed(t *testing.T) {
 		t.Fatalf("expected delete to return tool error when store is closed")
 	}
 
-	promptRes, err := handleSavePrompt(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"content": "prompt", "project": "engram"}}})
+	promptRes, err := handleSavePrompt(s, MCPConfig{}, NewSessionActivity(10*time.Minute))(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"content": "prompt", "project": "engram"}}})
 	if err != nil {
 		t.Fatalf("closed store save prompt call: %v", err)
 	}
@@ -696,7 +696,7 @@ func TestMCPHandlersReturnErrorsWhenStoreClosed(t *testing.T) {
 		t.Fatalf("expected context to return tool error when store is closed")
 	}
 
-	statsRes, err := handleStats(s)(context.Background(), mcppkg.CallToolRequest{})
+	statsRes, err := handleStats(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{})
 	if err != nil {
 		t.Fatalf("closed store stats call: %v", err)
 	}
@@ -704,7 +704,7 @@ func TestMCPHandlersReturnErrorsWhenStoreClosed(t *testing.T) {
 		t.Fatalf("expected stats fallback result even when store is closed")
 	}
 
-	timelineRes, err := handleTimeline(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"observation_id": 1.0}}})
+	timelineRes, err := handleTimeline(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"observation_id": 1.0}}})
 	if err != nil {
 		t.Fatalf("closed store timeline call: %v", err)
 	}
@@ -712,7 +712,7 @@ func TestMCPHandlersReturnErrorsWhenStoreClosed(t *testing.T) {
 		t.Fatalf("expected timeline to return tool error when store is closed")
 	}
 
-	getObsRes, err := handleGetObservation(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": 1.0}}})
+	getObsRes, err := handleGetObservation(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"id": 1.0}}})
 	if err != nil {
 		t.Fatalf("closed store get observation call: %v", err)
 	}
@@ -759,7 +759,7 @@ func TestMCPAdditionalCoverageBranches(t *testing.T) {
 		t.Fatalf("expected empty context message")
 	}
 
-	statsRes, err := handleStats(s)(context.Background(), mcppkg.CallToolRequest{})
+	statsRes, err := handleStats(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{})
 	if err != nil {
 		t.Fatalf("stats empty store: %v", err)
 	}
@@ -783,7 +783,7 @@ func TestMCPAdditionalCoverageBranches(t *testing.T) {
 	}
 
 	timelineReq := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{"observation_id": float64(firstID), "before": 1.0, "after": 2.0}}}
-	timelineRes, err := handleTimeline(s)(context.Background(), timelineReq)
+	timelineRes, err := handleTimeline(s, MCPConfig{})(context.Background(), timelineReq)
 	if err != nil {
 		t.Fatalf("timeline with header branches: %v", err)
 	}
@@ -908,7 +908,7 @@ func TestHandleStatsReturnsErrorWhenLoaderFails(t *testing.T) {
 	})
 
 	s := newMCPTestStore(t)
-	res, err := handleStats(s)(context.Background(), mcppkg.CallToolRequest{})
+	res, err := handleStats(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{})
 	if err != nil {
 		t.Fatalf("stats handler error: %v", err)
 	}
@@ -938,7 +938,7 @@ func TestHandleTimelineBeforeSectionAndSummaryBranches(t *testing.T) {
 		t.Fatalf("end session: %v", err)
 	}
 
-	res, err := handleTimeline(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+	res, err := handleTimeline(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"observation_id": float64(focusID),
 		"before":         2.0,
 		"after":          1.0,
@@ -973,7 +973,7 @@ func TestHandleGetObservationIncludesTopicAndToolMetadata(t *testing.T) {
 		t.Fatalf("add observation: %v", err)
 	}
 
-	res, err := handleGetObservation(s)(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+	res, err := handleGetObservation(s, MCPConfig{})(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"id": float64(id),
 	}}})
 	if err != nil {
@@ -1017,6 +1017,7 @@ func TestResolveToolsAgentProfile(t *testing.T) {
 		"mem_update", // skills explicitly say "use mem_update when you have an exact ID to correct"
 		"mem_projects", "mem_deprecate_project", "mem_activate_project",
 		"mem_promote", "mem_who",
+		"mem_current_project", // detect current project — discovery before writing
 	}
 	for _, tool := range expectedTools {
 		if !result[tool] {
@@ -1043,7 +1044,7 @@ func TestResolveToolsAdminProfile(t *testing.T) {
 		t.Fatal("expected non-nil allowlist for 'admin'")
 	}
 
-	expectedTools := []string{"mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects"}
+	expectedTools := []string{"mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects", "mem_doctor"}
 	for _, tool := range expectedTools {
 		if !result[tool] {
 			t.Errorf("admin profile missing tool: %s", tool)
@@ -1061,14 +1062,15 @@ func TestResolveToolsCombinedProfiles(t *testing.T) {
 		t.Fatal("expected non-nil allowlist for combined profiles")
 	}
 
-	// Should have all 20 tools (16 agent + 4 admin)
+	// Should have all 22 tools (17 agent + 5 admin)
 	allTools := []string{
 		"mem_save", "mem_search", "mem_context", "mem_session_summary",
 		"mem_session_start", "mem_session_end", "mem_get_observation",
 		"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
 		"mem_update", "mem_projects", "mem_deprecate_project",
 		"mem_activate_project", "mem_promote", "mem_who",
-		"mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects",
+		"mem_current_project",
+		"mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects", "mem_doctor",
 	}
 	for _, tool := range allTools {
 		if !result[tool] {
@@ -1255,7 +1257,8 @@ func TestNewServerWithToolsNilRegistersAll(t *testing.T) {
 		"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
 		"mem_update", "mem_projects", "mem_deprecate_project",
 		"mem_activate_project", "mem_promote", "mem_who",
-		"mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects",
+		"mem_current_project",
+		"mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects", "mem_doctor",
 	}
 
 	for _, name := range allTools {
@@ -1295,13 +1298,13 @@ func TestNewServerBackwardsCompatible(t *testing.T) {
 	tools := srv.ListTools()
 
 	// 16 agent + 4 admin = 20 total
-	if len(tools) != 20 {
-		t.Errorf("NewServer should register all 20 tools, got %d", len(tools))
+	if len(tools) != 22 {
+		t.Errorf("NewServer should register all 22 tools, got %d", len(tools))
 	}
 }
 
 func TestProfileConsistency(t *testing.T) {
-	// Verify that agent + admin = all 20 tools
+	// Verify that agent + admin = all 22 tools
 	combined := make(map[string]bool)
 	for tool := range ProfileAgent {
 		combined[tool] = true
@@ -1310,8 +1313,8 @@ func TestProfileConsistency(t *testing.T) {
 		combined[tool] = true
 	}
 
-	if len(combined) != 20 {
-		t.Errorf("agent + admin should cover all 20 tools, got %d", len(combined))
+	if len(combined) != 22 {
+		t.Errorf("agent + admin should cover all 22 tools, got %d", len(combined))
 	}
 
 	// Verify no overlap between profiles
@@ -1489,7 +1492,7 @@ func TestHandleSaveCreatesProjectScopedSession(t *testing.T) {
 
 func TestHandleSavePromptCreatesProjectScopedSession(t *testing.T) {
 	s := newMCPTestStore(t)
-	h := handleSavePrompt(s, MCPConfig{})
+	h := handleSavePrompt(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
 
 	reqA := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
 		"content": "How do I set up auth?",
@@ -1609,9 +1612,9 @@ func TestNewServerWithConfig(t *testing.T) {
 		t.Fatal("expected MCP server instance")
 	}
 	tools := srv.ListTools()
-	// Should have all 20 tools
-	if len(tools) != 20 {
-		t.Errorf("NewServerWithConfig should register all 20 tools, got %d", len(tools))
+	// Should have all 22 tools
+	if len(tools) != 22 {
+		t.Errorf("NewServerWithConfig should register all 22 tools, got %d", len(tools))
 	}
 }
 

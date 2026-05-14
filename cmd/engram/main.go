@@ -288,9 +288,8 @@ func cmdServe(cfg store.Config) {
 }
 
 func cmdMCP(cfg store.Config) {
-	// Parse --tools and --project flags
 	toolsFilter := ""
-	projectOverride := ""
+	projectOverride := strings.TrimSpace(os.Getenv("ENGRAM_PROJECT"))
 	for i := 2; i < len(os.Args); i++ {
 		if strings.HasPrefix(os.Args[i], "--tools=") {
 			toolsFilter = strings.TrimPrefix(os.Args[i], "--tools=")
@@ -298,25 +297,21 @@ func cmdMCP(cfg store.Config) {
 			toolsFilter = os.Args[i+1]
 			i++
 		} else if strings.HasPrefix(os.Args[i], "--project=") {
-			projectOverride = strings.TrimPrefix(os.Args[i], "--project=")
-		} else if os.Args[i] == "--project" && i+1 < len(os.Args) {
-			projectOverride = os.Args[i+1]
+			projectOverride = strings.TrimSpace(strings.TrimPrefix(os.Args[i], "--project="))
+			if projectOverride == "" {
+				fatal(fmt.Errorf("--project requires a value"))
+			}
+		} else if os.Args[i] == "--project" {
+			if i+1 >= len(os.Args) {
+				fatal(fmt.Errorf("--project requires a value"))
+			}
+			projectOverride = strings.TrimSpace(os.Args[i+1])
+			if projectOverride == "" {
+				fatal(fmt.Errorf("--project requires a value"))
+			}
 			i++
 		}
 	}
-
-	// Project detection chain: --project flag → ENGRAM_PROJECT env → git detection
-	detectedProject := projectOverride
-	if detectedProject == "" {
-		detectedProject = os.Getenv("ENGRAM_PROJECT")
-	}
-	if detectedProject == "" {
-		if cwd, err := os.Getwd(); err == nil {
-			detectedProject = detectProject(cwd)
-		}
-	}
-	// Always normalize (lowercase + trim)
-	detectedProject, _ = store.NormalizeProject(detectedProject)
 
 	s, err := storeNew(cfg)
 	if err != nil {
@@ -324,9 +319,7 @@ func cmdMCP(cfg store.Config) {
 	}
 	defer s.Close()
 
-	mcpCfg := mcp.MCPConfig{
-		DefaultProject: detectedProject,
-	}
+	mcpCfg := mcp.MCPConfig{DefaultProject: projectOverride}
 
 	allowlist := resolveMCPTools(toolsFilter)
 	mcpSrv := newMCPServerWithConfig(s, mcpCfg, allowlist)
