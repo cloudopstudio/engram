@@ -930,6 +930,8 @@ func TestResolveToolsAgentProfile(t *testing.T) {
 		"mem_session_start", "mem_session_end", "mem_get_observation",
 		"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
 		"mem_update", // skills explicitly say "use mem_update when you have an exact ID to correct"
+		"mem_projects", "mem_deprecate_project", "mem_activate_project",
+		"mem_promote", "mem_who",
 	}
 	for _, tool := range expectedTools {
 		if !result[tool] {
@@ -938,7 +940,7 @@ func TestResolveToolsAgentProfile(t *testing.T) {
 	}
 
 	// Admin-only tools should NOT be in agent profile
-	adminOnly := []string{"mem_delete", "mem_stats", "mem_timeline"}
+	adminOnly := []string{"mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects"}
 	for _, tool := range adminOnly {
 		if result[tool] {
 			t.Errorf("agent profile should NOT contain admin tool: %s", tool)
@@ -974,12 +976,14 @@ func TestResolveToolsCombinedProfiles(t *testing.T) {
 		t.Fatal("expected non-nil allowlist for combined profiles")
 	}
 
-	// Should have all 15 tools
+	// Should have all 20 tools (16 agent + 4 admin)
 	allTools := []string{
 		"mem_save", "mem_search", "mem_context", "mem_session_summary",
 		"mem_session_start", "mem_session_end", "mem_get_observation",
 		"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
-		"mem_update", "mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects",
+		"mem_update", "mem_projects", "mem_deprecate_project",
+		"mem_activate_project", "mem_promote", "mem_who",
+		"mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects",
 	}
 	for _, tool := range allTools {
 		if !result[tool] {
@@ -1164,7 +1168,9 @@ func TestNewServerWithToolsNilRegistersAll(t *testing.T) {
 		"mem_save", "mem_search", "mem_context", "mem_session_summary",
 		"mem_session_start", "mem_session_end", "mem_get_observation",
 		"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
-		"mem_update", "mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects",
+		"mem_update", "mem_projects", "mem_deprecate_project",
+		"mem_activate_project", "mem_promote", "mem_who",
+		"mem_delete", "mem_stats", "mem_timeline", "mem_merge_projects",
 	}
 
 	for _, name := range allTools {
@@ -1203,14 +1209,14 @@ func TestNewServerBackwardsCompatible(t *testing.T) {
 	srv := NewServer(s)
 	tools := srv.ListTools()
 
-	// 11 agent + 4 admin = 15 total
-	if len(tools) != 15 {
-		t.Errorf("NewServer should register all 15 tools, got %d", len(tools))
+	// 16 agent + 4 admin = 20 total
+	if len(tools) != 20 {
+		t.Errorf("NewServer should register all 20 tools, got %d", len(tools))
 	}
 }
 
 func TestProfileConsistency(t *testing.T) {
-	// Verify that agent + admin = all 15 tools
+	// Verify that agent + admin = all 20 tools
 	combined := make(map[string]bool)
 	for tool := range ProfileAgent {
 		combined[tool] = true
@@ -1219,8 +1225,8 @@ func TestProfileConsistency(t *testing.T) {
 		combined[tool] = true
 	}
 
-	if len(combined) != 15 {
-		t.Errorf("agent + admin should cover all 15 tools, got %d", len(combined))
+	if len(combined) != 20 {
+		t.Errorf("agent + admin should cover all 20 tools, got %d", len(combined))
 	}
 
 	// Verify no overlap between profiles
@@ -1518,9 +1524,9 @@ func TestNewServerWithConfig(t *testing.T) {
 		t.Fatal("expected MCP server instance")
 	}
 	tools := srv.ListTools()
-	// Should have all 15 tools
-	if len(tools) != 15 {
-		t.Errorf("NewServerWithConfig should register all 15 tools, got %d", len(tools))
+	// Should have all 20 tools
+	if len(tools) != 20 {
+		t.Errorf("NewServerWithConfig should register all 20 tools, got %d", len(tools))
 	}
 }
 
