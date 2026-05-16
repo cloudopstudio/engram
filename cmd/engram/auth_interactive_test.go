@@ -181,17 +181,17 @@ func TestMainDispatchLogin(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("ENGRAM_DATA_DIR", dataDir)
 
-	// Login should fail because it's a stub in !pgstore build, but it should
+	// Login should fail because it requires PostgreSQL backend, but it should
 	// be recognized as a command (not "unknown command").
 	withArgs(t, "engram", "login")
 	_, stderr, recovered := captureOutputAndRecover(t, func() { main() })
 
-	// In non-pgstore build, it should exit with the stub message.
+	// With SQLite default backend, login must exit with the backend guard message.
 	if _, ok := recovered.(exitCode); !ok {
-		t.Fatalf("expected exit for login stub, got %v", recovered)
+		t.Fatalf("expected exit for login without postgres backend, got %v", recovered)
 	}
-	if !strings.Contains(stderr, "pgstore") {
-		t.Fatalf("expected pgstore build tag message, got: %q", stderr)
+	if !strings.Contains(stderr, "requires PostgreSQL backend") {
+		t.Fatalf("expected PostgreSQL backend message, got: %q", stderr)
 	}
 }
 
@@ -220,7 +220,7 @@ func TestAuthInteractiveInMainFlow(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("ENGRAM_DATA_DIR", dataDir)
 
-	// With --auth-interactive, the login stub should still be dispatched
+	// With --auth-interactive, the login command should still be dispatched
 	// (this tests that the flag is parsed AND the command still routes).
 	withArgs(t, "engram", "--auth-interactive", "login")
 	_, stderr, recovered := captureOutputAndRecover(t, func() { main() })
@@ -228,9 +228,9 @@ func TestAuthInteractiveInMainFlow(t *testing.T) {
 	if _, ok := recovered.(exitCode); !ok {
 		t.Fatalf("expected exit, got %v", recovered)
 	}
-	// Should still get the pgstore stub message, proving the flag was parsed
-	// and the command dispatched correctly.
-	if !strings.Contains(stderr, "pgstore") {
-		t.Fatalf("expected pgstore stub message, got: %q", stderr)
+	// Should hit the backend guard (SQLite default → reject), proving the flag
+	// was parsed and the command dispatched correctly.
+	if !strings.Contains(stderr, "requires PostgreSQL backend") {
+		t.Fatalf("expected PostgreSQL backend message, got: %q", stderr)
 	}
 }
