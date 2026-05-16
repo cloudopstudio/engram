@@ -15,7 +15,7 @@ import (
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
-func newE2EServer(t *testing.T) (*store.Store, *httptest.Server) {
+func newE2EServer(t *testing.T) (store.Store, *httptest.Server) {
 	t.Helper()
 	cfg, err := store.DefaultConfig()
 	if err != nil {

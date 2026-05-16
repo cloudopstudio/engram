@@ -1,5 +1,3 @@
-//go:build pgstore
-
 // Package store implements the persistent memory engine for Engram.
 //
 // This file provides the PostgreSQL backend, activated via the `pgstore`
@@ -9,16 +7,11 @@ package store
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -28,318 +21,31 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Sentinel errors returned by delete operations so callers can use errors.Is.
-var (
-	ErrSessionNotFound        = errors.New("session not found")
-	ErrSessionHasObservations = errors.New("session still has observations")
-	ErrPromptNotFound         = errors.New("prompt not found")
-)
-
-// ─── Types (duplicated from store.go for build-tag isolation) ────────────────
-
-type Session struct {
-	ID        string  `json:"id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	StartedAt string  `json:"started_at"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
-}
-
-type Observation struct {
-	ID             int64   `json:"id"`
-	SyncID         string  `json:"sync_id"`
-	SessionID      string  `json:"session_id"`
-	Type           string  `json:"type"`
-	Title          string  `json:"title"`
-	Content        string  `json:"content"`
-	ToolName       *string `json:"tool_name,omitempty"`
-	Project        *string `json:"project,omitempty"`
-	Scope          string  `json:"scope"`
-	TopicKey       *string `json:"topic_key,omitempty"`
-	RevisionCount  int     `json:"revision_count"`
-	DuplicateCount int     `json:"duplicate_count"`
-	LastSeenAt     *string `json:"last_seen_at,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	DeletedAt      *string `json:"deleted_at,omitempty"`
-}
-
-type SearchResult struct {
-	Observation
-	Rank float64 `json:"rank"`
-}
-
-type SessionSummary struct {
-	ID               string  `json:"id"`
-	Project          string  `json:"project"`
-	StartedAt        string  `json:"started_at"`
-	EndedAt          *string `json:"ended_at,omitempty"`
-	Summary          *string `json:"summary,omitempty"`
-	ObservationCount int     `json:"observation_count"`
-}
-
-type Stats struct {
-	TotalSessions     int      `json:"total_sessions"`
-	TotalObservations int      `json:"total_observations"`
-	TotalPrompts      int      `json:"total_prompts"`
-	Projects          []string `json:"projects"`
-}
-
-type TimelineEntry struct {
-	ID             int64   `json:"id"`
-	SessionID      string  `json:"session_id"`
-	Type           string  `json:"type"`
-	Title          string  `json:"title"`
-	Content        string  `json:"content"`
-	ToolName       *string `json:"tool_name,omitempty"`
-	Project        *string `json:"project,omitempty"`
-	Scope          string  `json:"scope"`
-	TopicKey       *string `json:"topic_key,omitempty"`
-	RevisionCount  int     `json:"revision_count"`
-	DuplicateCount int     `json:"duplicate_count"`
-	LastSeenAt     *string `json:"last_seen_at,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	DeletedAt      *string `json:"deleted_at,omitempty"`
-	IsFocus        bool    `json:"is_focus"`
-}
-
-type TimelineResult struct {
-	Focus        Observation     `json:"focus"`
-	Before       []TimelineEntry `json:"before"`
-	After        []TimelineEntry `json:"after"`
-	SessionInfo  *Session        `json:"session_info"`
-	TotalInRange int             `json:"total_in_range"`
-}
-
-type SearchOptions struct {
-	Type    string `json:"type,omitempty"`
-	Project string `json:"project,omitempty"`
-	Scope   string `json:"scope,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
-	User    string `json:"user,omitempty"`
-	Since   string `json:"since,omitempty"`
-}
-
-// ProjectStats holds aggregated stats for a single project.
-type ProjectStats struct {
-	Project      string `json:"project"`
-	Observations int    `json:"observations"`
-	Contributors int    `json:"contributors"`
-	LastActivity string `json:"last_activity"`
-	Deprecated   bool   `json:"deprecated,omitempty"`
-}
-
-// ContributorStats holds activity stats for a single contributor.
-type ContributorStats struct {
-	Identity     string   `json:"identity"`
-	Observations int      `json:"observations"`
-	Prompts      int      `json:"prompts"`
-	LastActive   string   `json:"last_active"`
-	TopTypes     []string `json:"top_types,omitempty"`
-}
-
-type AddObservationParams struct {
-	SessionID string `json:"session_id"`
-	Type      string `json:"type"`
-	Title     string `json:"title"`
-	Content   string `json:"content"`
-	ToolName  string `json:"tool_name,omitempty"`
-	Project   string `json:"project,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	TopicKey  string `json:"topic_key,omitempty"`
-}
-
-type UpdateObservationParams struct {
-	Type     *string `json:"type,omitempty"`
-	Title    *string `json:"title,omitempty"`
-	Content  *string `json:"content,omitempty"`
-	Project  *string `json:"project,omitempty"`
-	Scope    *string `json:"scope,omitempty"`
-	TopicKey *string `json:"topic_key,omitempty"`
-}
-
-type Prompt struct {
-	ID        int64  `json:"id"`
-	SyncID    string `json:"sync_id"`
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-	CreatedAt string `json:"created_at"`
-}
-
-type AddPromptParams struct {
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-}
-
-// ─── Constants ───────────────────────────────────────────────────────────────
-
-const (
-	DefaultSyncTargetKey = "cloud"
-
-	SyncLifecycleIdle     = "idle"
-	SyncLifecyclePending  = "pending"
-	SyncLifecycleRunning  = "running"
-	SyncLifecycleHealthy  = "healthy"
-	SyncLifecycleDegraded = "degraded"
-
-	SyncEntitySession     = "session"
-	SyncEntityObservation = "observation"
-	SyncEntityPrompt      = "prompt"
-
-	SyncOpUpsert = "upsert"
-	SyncOpDelete = "delete"
-
-	SyncSourceLocal  = "local"
-	SyncSourceRemote = "remote"
-)
-
-type SyncState struct {
-	TargetKey           string  `json:"target_key"`
-	Lifecycle           string  `json:"lifecycle"`
-	LastEnqueuedSeq     int64   `json:"last_enqueued_seq"`
-	LastAckedSeq        int64   `json:"last_acked_seq"`
-	LastPulledSeq       int64   `json:"last_pulled_seq"`
-	ConsecutiveFailures int     `json:"consecutive_failures"`
-	BackoffUntil        *string `json:"backoff_until,omitempty"`
-	LeaseOwner          *string `json:"lease_owner,omitempty"`
-	LeaseUntil          *string `json:"lease_until,omitempty"`
-	LastError           *string `json:"last_error,omitempty"`
-	UpdatedAt           string  `json:"updated_at"`
-}
-
-type SyncMutation struct {
-	Seq        int64   `json:"seq"`
-	TargetKey  string  `json:"target_key"`
-	Entity     string  `json:"entity"`
-	EntityKey  string  `json:"entity_key"`
-	Op         string  `json:"op"`
-	Payload    string  `json:"payload"`
-	Source     string  `json:"source"`
-	Project    string  `json:"project"`
-	OccurredAt string  `json:"occurred_at"`
-	AckedAt    *string `json:"acked_at,omitempty"`
-}
-
-type EnrolledProject struct {
-	Project    string `json:"project"`
-	EnrolledAt string `json:"enrolled_at"`
-}
-
-type syncSessionPayload struct {
-	ID        string  `json:"id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
-}
-
-type syncObservationPayload struct {
-	SyncID     string  `json:"sync_id"`
-	SessionID  string  `json:"session_id"`
-	Type       string  `json:"type"`
-	Title      string  `json:"title"`
-	Content    string  `json:"content"`
-	ToolName   *string `json:"tool_name,omitempty"`
-	Project    *string `json:"project,omitempty"`
-	Scope      string  `json:"scope"`
-	TopicKey   *string `json:"topic_key,omitempty"`
-	Deleted    bool    `json:"deleted,omitempty"`
-	DeletedAt  *string `json:"deleted_at,omitempty"`
-	HardDelete bool    `json:"hard_delete,omitempty"`
-}
-
-type syncPromptPayload struct {
-	SyncID    string  `json:"sync_id"`
-	SessionID string  `json:"session_id"`
-	Content   string  `json:"content"`
-	Project   *string `json:"project,omitempty"`
-}
-
-type ExportData struct {
-	Version      string        `json:"version"`
-	ExportedAt   string        `json:"exported_at"`
-	Sessions     []Session     `json:"sessions"`
-	Observations []Observation `json:"observations"`
-	Prompts      []Prompt      `json:"prompts"`
-}
-
-type ImportResult struct {
-	SessionsImported     int `json:"sessions_imported"`
-	ObservationsImported int `json:"observations_imported"`
-	PromptsImported      int `json:"prompts_imported"`
-}
-
-type MigrateResult struct {
-	Migrated            bool  `json:"migrated"`
-	ObservationsUpdated int64 `json:"observations_updated"`
-	SessionsUpdated     int64 `json:"sessions_updated"`
-	PromptsUpdated      int64 `json:"prompts_updated"`
-}
-
-type PassiveCaptureParams struct {
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-	Source    string `json:"source,omitempty"`
-}
-
-type PassiveCaptureResult struct {
-	Extracted  int `json:"extracted"`
-	Saved      int `json:"saved"`
-	Duplicates int `json:"duplicates"`
-}
-
-// ─── Config ──────────────────────────────────────────────────────────────────
-
-type Config struct {
-	DataDir              string
-	Profile              string // Active profile name (from --profile flag or default-profile)
-	AuthInteractive      bool   // Enable device code flow for Azure auth
-	MaxObservationLength int
-	MaxContextResults    int
-	MaxSearchResults     int
-	DedupeWindow         time.Duration
-}
-
-func DefaultConfig() (Config, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return Config{}, fmt.Errorf("engram: determine home directory: %w", err)
-	}
-	return Config{
-		DataDir:              filepath.Join(home, ".engram"),
-		MaxObservationLength: 50000,
-		MaxContextResults:    20,
-		MaxSearchResults:     20,
-		DedupeWindow:         15 * time.Minute,
-	}, nil
-}
-
-func FallbackConfig(dataDir string) Config {
-	return Config{
-		DataDir:              dataDir,
-		MaxObservationLength: 50000,
-		MaxContextResults:    20,
-		MaxSearchResults:     20,
-		DedupeWindow:         15 * time.Minute,
-	}
-}
+// ─── Types ───────────────────────────────────────────────────────────────────
+//
+// Public types (Session, Observation, SearchResult, etc.) and the Config
+// struct now live in types.go and config.go (no build tags) so they are
+// shared with the SQLite backend.
+//
+// Sentinel errors (ErrSessionNotFound, ErrSessionHasObservations,
+// ErrPromptNotFound) now live in errors.go.
+//
+// Sync-related constants (DefaultSyncTargetKey, SyncLifecycle*, SyncEntity*,
+// SyncOp*, SyncSource*) now live in sync_constants.go.
 
 // ─── Store ───────────────────────────────────────────────────────────────────
 
-// Store is the PostgreSQL-backed persistent memory engine.
-type Store struct {
+// PostgresStore is the PostgreSQL-backed implementation of the Store interface.
+type PostgresStore struct {
 	pool     *pgxpool.Pool
 	cfg      Config
 	identity string // Entra ID email, populated if auth method is entra.
 }
 
-// New creates a PG-backed Store by reading ENGRAM_DATABASE_URL.
-func New(cfg Config) (*Store, error) {
+// NewPostgresStore creates a PG-backed Store by reading ENGRAM_DATABASE_URL.
+// It returns the Store interface so callers depend on behavior rather than
+// the concrete *PostgresStore type.
+func NewPostgresStore(cfg Config) (Store, error) {
 	connStr := os.Getenv("ENGRAM_DATABASE_URL")
 	if connStr == "" {
 		if v, err := config.GetWithProfile(cfg.DataDir, cfg.Profile, "database-url"); err == nil && v != "" {
@@ -450,7 +156,7 @@ func New(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("engram: pg migration: %w", err)
 	}
 
-	s := &Store{pool: pool, cfg: cfg, identity: identity}
+	s := &PostgresStore{pool: pool, cfg: cfg, identity: identity}
 	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("engram: repair enrolled sync journal: %w", err)
@@ -459,23 +165,23 @@ func New(cfg Config) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) Close() error {
+func (s *PostgresStore) Close() error {
 	s.pool.Close()
 	return nil
 }
 
 // Identity returns the Entra ID identity (UPN) associated with the store.
-func (s *Store) Identity() string {
+func (s *PostgresStore) Identity() string {
 	return s.identity
 }
 
-func (s *Store) MaxObservationLength() int {
+func (s *PostgresStore) MaxObservationLength() int {
 	return s.cfg.MaxObservationLength
 }
 
 // ─── Transaction helper ──────────────────────────────────────────────────────
 
-func (s *Store) withTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
+func (s *PostgresStore) withTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -488,8 +194,9 @@ func (s *Store) withTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 }
 
 // ─── Timestamp helpers ───────────────────────────────────────────────────────
-
-const tsFormat = "2006-01-02 15:04:05"
+//
+// tsFormat and Now() now live in time_helpers.go (no build tags) so they are
+// shared between the SQLite and PostgreSQL backends.
 
 func formatTS(t time.Time) string {
 	return t.UTC().Format(tsFormat)
@@ -503,14 +210,9 @@ func formatNullableTS(t *time.Time) *string {
 	return &s
 }
 
-// Now returns the current time formatted for compatibility with the SQLite store.
-func Now() string {
-	return time.Now().UTC().Format(tsFormat)
-}
-
 // ─── Sessions ────────────────────────────────────────────────────────────────
 
-func (s *Store) CreateSession(id, project, directory string) error {
+func (s *PostgresStore) CreateSession(id, project, directory string) error {
 	ctx := context.Background()
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		if err := s.createSessionTx(ctx, tx, id, project, directory); err != nil {
@@ -524,7 +226,7 @@ func (s *Store) CreateSession(id, project, directory string) error {
 	})
 }
 
-func (s *Store) createSessionTx(ctx context.Context, tx pgx.Tx, id, project, directory string) error {
+func (s *PostgresStore) createSessionTx(ctx context.Context, tx pgx.Tx, id, project, directory string) error {
 	_, err := tx.Exec(ctx,
 		`INSERT INTO sessions (id, project, directory, created_by) VALUES ($1, $2, $3, $4)
 		 ON CONFLICT(id) DO UPDATE SET
@@ -535,7 +237,7 @@ func (s *Store) createSessionTx(ctx context.Context, tx pgx.Tx, id, project, dir
 	return err
 }
 
-func (s *Store) EndSession(id string, summary string) error {
+func (s *PostgresStore) EndSession(id string, summary string) error {
 	ctx := context.Background()
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx,
@@ -569,7 +271,7 @@ func (s *Store) EndSession(id string, summary string) error {
 	})
 }
 
-func (s *Store) GetSession(id string) (*Session, error) {
+func (s *PostgresStore) GetSession(id string) (*Session, error) {
 	ctx := context.Background()
 	var sess Session
 	var startedAt time.Time
@@ -584,7 +286,7 @@ func (s *Store) GetSession(id string) (*Session, error) {
 	return &sess, nil
 }
 
-func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {
+func (s *PostgresStore) RecentSessions(project string, limit int) ([]SessionSummary, error) {
 	if limit <= 0 {
 		limit = 5
 	}
@@ -630,7 +332,7 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 	return results, rows.Err()
 }
 
-func (s *Store) AllSessions(project string, limit int) ([]SessionSummary, error) {
+func (s *PostgresStore) AllSessions(project string, limit int) ([]SessionSummary, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -678,7 +380,7 @@ func (s *Store) AllSessions(project string, limit int) ([]SessionSummary, error)
 
 // ─── Observations ────────────────────────────────────────────────────────────
 
-func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
+func (s *PostgresStore) AddObservation(p AddObservationParams) (int64, error) {
 	title := stripPrivateTags(p.Title)
 	content := stripPrivateTags(p.Content)
 
@@ -802,7 +504,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	return observationID, nil
 }
 
-func (s *Store) GetObservation(id int64) (*Observation, error) {
+func (s *PostgresStore) GetObservation(id int64) (*Observation, error) {
 	ctx := context.Background()
 	return s.scanObservation(ctx, s.pool,
 		`SELECT id, COALESCE(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
@@ -810,7 +512,7 @@ func (s *Store) GetObservation(id int64) (*Observation, error) {
 		 FROM observations WHERE id = $1 AND deleted_at IS NULL`, id)
 }
 
-func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observation, error) {
+func (s *PostgresStore) UpdateObservation(id int64, p UpdateObservationParams) (*Observation, error) {
 	ctx := context.Background()
 	var updated *Observation
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
@@ -872,7 +574,7 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 	return updated, nil
 }
 
-func (s *Store) DeleteObservation(id int64, hardDelete bool) error {
+func (s *PostgresStore) DeleteObservation(id int64, hardDelete bool) error {
 	ctx := context.Background()
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		obs, err := s.getObservationTx(ctx, tx, id)
@@ -911,7 +613,7 @@ func (s *Store) DeleteObservation(id int64, hardDelete bool) error {
 	})
 }
 
-func (s *Store) AllObservations(project, scope string, limit int) ([]Observation, error) {
+func (s *PostgresStore) AllObservations(project, scope string, limit int) ([]Observation, error) {
 	if limit <= 0 {
 		limit = s.cfg.MaxContextResults
 	}
@@ -943,7 +645,7 @@ func (s *Store) AllObservations(project, scope string, limit int) ([]Observation
 	return s.queryObservationsPG(ctx, query, args...)
 }
 
-func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation, error) {
+func (s *PostgresStore) SessionObservations(sessionID string, limit int) ([]Observation, error) {
 	if limit <= 0 {
 		limit = 200
 	}
@@ -959,7 +661,7 @@ func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation,
 	)
 }
 
-func (s *Store) RecentObservations(project, scope string, limit int) ([]Observation, error) {
+func (s *PostgresStore) RecentObservations(project, scope string, limit int) ([]Observation, error) {
 	if limit <= 0 {
 		limit = s.cfg.MaxContextResults
 	}
@@ -991,7 +693,7 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 	return s.queryObservationsPG(ctx, query, args...)
 }
 
-func (s *Store) GetObservationBySyncID(syncID string) (*Observation, error) {
+func (s *PostgresStore) GetObservationBySyncID(syncID string) (*Observation, error) {
 	ctx := context.Background()
 	return s.scanObservation(ctx, s.pool,
 		`SELECT id, COALESCE(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
@@ -1001,7 +703,7 @@ func (s *Store) GetObservationBySyncID(syncID string) (*Observation, error) {
 
 // ─── User Prompts ────────────────────────────────────────────────────────────
 
-func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
+func (s *PostgresStore) AddPrompt(p AddPromptParams) (int64, error) {
 	content := stripPrivateTags(p.Content)
 	if len(content) > s.cfg.MaxObservationLength {
 		content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
@@ -1030,7 +732,7 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 	return promptID, nil
 }
 
-func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
+func (s *PostgresStore) RecentPrompts(project string, limit int) ([]Prompt, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -1068,7 +770,7 @@ func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
 	return results, rows.Err()
 }
 
-func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt, error) {
+func (s *PostgresStore) SearchPrompts(query string, project string, limit int) ([]Prompt, error) {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -1138,7 +840,7 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 
 // ─── Search (tsvector) ───────────────────────────────────────────────────────
 
-func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error) {
+func (s *PostgresStore) Search(query string, opts SearchOptions) ([]SearchResult, error) {
 	limit := opts.Limit
 	if limit <= 0 {
 		limit = 10
@@ -1334,7 +1036,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 
 // ─── Timeline ────────────────────────────────────────────────────────────────
 
-func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResult, error) {
+func (s *PostgresStore) Timeline(observationID int64, before, after int) (*TimelineResult, error) {
 	if before <= 0 {
 		before = 5
 	}
@@ -1425,7 +1127,7 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
 
-func (s *Store) Stats() (*Stats, error) {
+func (s *PostgresStore) Stats() (*Stats, error) {
 	ctx := context.Background()
 	stats := &Stats{}
 
@@ -1451,7 +1153,7 @@ func (s *Store) Stats() (*Stats, error) {
 
 // ─── Context Formatting ─────────────────────────────────────────────────────
 
-func (s *Store) FormatContext(project, scope string) (string, error) {
+func (s *PostgresStore) FormatContext(project, scope string) (string, error) {
 	sessions, err := s.RecentSessions(project, 5)
 	if err != nil {
 		return "", err
@@ -1509,7 +1211,7 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 
 // ─── Export / Import ─────────────────────────────────────────────────────────
 
-func (s *Store) Export() (*ExportData, error) {
+func (s *PostgresStore) Export() (*ExportData, error) {
 	ctx := context.Background()
 	data := &ExportData{
 		Version:    "0.1.0",
@@ -1581,7 +1283,7 @@ func (s *Store) Export() (*ExportData, error) {
 	return data, nil
 }
 
-func (s *Store) Import(data *ExportData) (*ImportResult, error) {
+func (s *PostgresStore) Import(data *ExportData) (*ImportResult, error) {
 	ctx := context.Background()
 	result := &ImportResult{}
 
@@ -1640,7 +1342,7 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 
 // ─── Sync Chunk Tracking ─────────────────────────────────────────────────────
 
-func (s *Store) GetSyncedChunks() (map[string]bool, error) {
+func (s *PostgresStore) GetSyncedChunks() (map[string]bool, error) {
 	ctx := context.Background()
 	rows, err := s.pool.Query(ctx, "SELECT chunk_id FROM sync_chunks")
 	if err != nil {
@@ -1659,7 +1361,7 @@ func (s *Store) GetSyncedChunks() (map[string]bool, error) {
 	return chunks, rows.Err()
 }
 
-func (s *Store) RecordSyncedChunk(chunkID string) error {
+func (s *PostgresStore) RecordSyncedChunk(chunkID string) error {
 	ctx := context.Background()
 	_, err := s.pool.Exec(ctx,
 		"INSERT INTO sync_chunks (chunk_id) VALUES ($1) ON CONFLICT(chunk_id) DO NOTHING", chunkID)
@@ -1668,7 +1370,7 @@ func (s *Store) RecordSyncedChunk(chunkID string) error {
 
 // ─── Sync State ──────────────────────────────────────────────────────────────
 
-func (s *Store) GetSyncState(targetKey string) (*SyncState, error) {
+func (s *PostgresStore) GetSyncState(targetKey string) (*SyncState, error) {
 	ctx := context.Background()
 	targetKey = normalizeSyncTargetKey(targetKey)
 	if err := s.ensureSyncState(ctx, targetKey); err != nil {
@@ -1677,7 +1379,7 @@ func (s *Store) GetSyncState(targetKey string) (*SyncState, error) {
 	return s.getSyncState(ctx, targetKey)
 }
 
-func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMutation, error) {
+func (s *PostgresStore) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMutation, error) {
 	ctx := context.Background()
 	targetKey = normalizeSyncTargetKey(targetKey)
 	if limit <= 0 {
@@ -1707,7 +1409,7 @@ func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMut
 	return mutations, rows.Err()
 }
 
-func (s *Store) SkipAckNonEnrolledMutations(targetKey string) (int64, error) {
+func (s *PostgresStore) SkipAckNonEnrolledMutations(targetKey string) (int64, error) {
 	ctx := context.Background()
 	targetKey = normalizeSyncTargetKey(targetKey)
 	tag, err := s.pool.Exec(ctx, `
@@ -1724,7 +1426,7 @@ func (s *Store) SkipAckNonEnrolledMutations(targetKey string) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
-func (s *Store) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
+func (s *PostgresStore) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
 	if lastAckedSeq <= 0 {
 		return nil
 	}
@@ -1756,7 +1458,7 @@ func (s *Store) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
 	})
 }
 
-func (s *Store) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
+func (s *PostgresStore) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
 	if len(seqs) == 0 {
 		return nil
 	}
@@ -1799,7 +1501,7 @@ func (s *Store) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
 	})
 }
 
-func (s *Store) AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error) {
+func (s *PostgresStore) AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error) {
 	ctx := context.Background()
 	targetKey = normalizeSyncTargetKey(targetKey)
 	if ttl <= 0 {
@@ -1834,7 +1536,7 @@ func (s *Store) AcquireSyncLease(targetKey, owner string, ttl time.Duration, now
 	return acquired, err
 }
 
-func (s *Store) ReleaseSyncLease(targetKey, owner string) error {
+func (s *PostgresStore) ReleaseSyncLease(targetKey, owner string) error {
 	ctx := context.Background()
 	targetKey = normalizeSyncTargetKey(targetKey)
 	_, err := s.pool.Exec(ctx,
@@ -1844,7 +1546,7 @@ func (s *Store) ReleaseSyncLease(targetKey, owner string) error {
 	return err
 }
 
-func (s *Store) MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error {
+func (s *PostgresStore) MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error {
 	ctx := context.Background()
 	targetKey = normalizeSyncTargetKey(targetKey)
 	backoff := backoffUntil.UTC().Format(time.RFC3339)
@@ -1862,7 +1564,7 @@ func (s *Store) MarkSyncFailure(targetKey, message string, backoffUntil time.Tim
 	})
 }
 
-func (s *Store) MarkSyncHealthy(targetKey string) error {
+func (s *PostgresStore) MarkSyncHealthy(targetKey string) error {
 	ctx := context.Background()
 	targetKey = normalizeSyncTargetKey(targetKey)
 	_, err := s.pool.Exec(ctx,
@@ -1873,7 +1575,7 @@ func (s *Store) MarkSyncHealthy(targetKey string) error {
 	return err
 }
 
-func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) error {
+func (s *PostgresStore) ApplyPulledMutation(targetKey string, mutation SyncMutation) error {
 	ctx := context.Background()
 	targetKey = normalizeSyncTargetKey(targetKey)
 	return s.withTx(ctx, func(tx pgx.Tx) error {
@@ -1931,7 +1633,7 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 
 // ─── Project Enrollment ──────────────────────────────────────────────────────
 
-func (s *Store) EnrollProject(project string) error {
+func (s *PostgresStore) EnrollProject(project string) error {
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -1949,7 +1651,7 @@ func (s *Store) EnrollProject(project string) error {
 	})
 }
 
-func (s *Store) UnenrollProject(project string) error {
+func (s *PostgresStore) UnenrollProject(project string) error {
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -1959,7 +1661,7 @@ func (s *Store) UnenrollProject(project string) error {
 	return err
 }
 
-func (s *Store) ListEnrolledProjects() ([]EnrolledProject, error) {
+func (s *PostgresStore) ListEnrolledProjects() ([]EnrolledProject, error) {
 	ctx := context.Background()
 	rows, err := s.pool.Query(ctx,
 		`SELECT project, enrolled_at FROM sync_enrolled_projects ORDER BY project ASC`)
@@ -1981,7 +1683,7 @@ func (s *Store) ListEnrolledProjects() ([]EnrolledProject, error) {
 	return projects, rows.Err()
 }
 
-func (s *Store) IsProjectEnrolled(project string) (bool, error) {
+func (s *PostgresStore) IsProjectEnrolled(project string) (bool, error) {
 	ctx := context.Background()
 	var exists int
 	err := s.pool.QueryRow(ctx,
@@ -1998,7 +1700,7 @@ func (s *Store) IsProjectEnrolled(project string) (bool, error) {
 
 // ─── Project Migration ───────────────────────────────────────────────────────
 
-func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) {
+func (s *PostgresStore) MigrateProject(oldName, newName string) (*MigrateResult, error) {
 	if oldName == "" || newName == "" || oldName == newName {
 		return &MigrateResult{}, nil
 	}
@@ -2054,7 +1756,7 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 // ListProjects returns all projects with observation counts, contributor counts,
 // and last activity date, ordered by most recently active first.
 // When includeDeprecated is false, deprecated projects are excluded.
-func (s *Store) ListProjects(includeDeprecated bool) ([]ProjectStats, error) {
+func (s *PostgresStore) ListProjects(includeDeprecated bool) ([]ProjectStats, error) {
 	ctx := context.Background()
 	rows, err := s.pool.Query(ctx, `
 		SELECT o.project,
@@ -2090,7 +1792,7 @@ func (s *Store) ListProjects(includeDeprecated bool) ([]ProjectStats, error) {
 
 // DeprecateProject marks a project as deprecated in project_metadata.
 // It upserts the row setting deprecated=true, deprecated_at=NOW(), deprecated_by=identity.
-func (s *Store) DeprecateProject(project, identity string) error {
+func (s *PostgresStore) DeprecateProject(project, identity string) error {
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -2112,7 +1814,7 @@ func (s *Store) DeprecateProject(project, identity string) error {
 
 // ActivateProject removes the deprecated flag from a project.
 // If the row doesn't exist, this is a no-op (project is active by default).
-func (s *Store) ActivateProject(project string) error {
+func (s *PostgresStore) ActivateProject(project string) error {
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -2132,7 +1834,7 @@ func (s *Store) ActivateProject(project string) error {
 }
 
 // IsProjectDeprecated returns true if the project exists in project_metadata with deprecated=true.
-func (s *Store) IsProjectDeprecated(project string) (bool, error) {
+func (s *PostgresStore) IsProjectDeprecated(project string) (bool, error) {
 	if project == "" {
 		return false, nil
 	}
@@ -2153,7 +1855,7 @@ func (s *Store) IsProjectDeprecated(project string) (bool, error) {
 // PromoteObservation changes an observation's scope from 'personal' to 'project'.
 // It validates that the observation exists, is personal, and is owned by identity.
 // This operation is irreversible by design.
-func (s *Store) PromoteObservation(id int64, identity string) error {
+func (s *PostgresStore) PromoteObservation(id int64, identity string) error {
 	ctx := context.Background()
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE observations
@@ -2171,7 +1873,7 @@ func (s *Store) PromoteObservation(id int64, identity string) error {
 }
 
 // ListContributors returns contributor activity stats, optionally filtered by project.
-func (s *Store) ListContributors(project string) ([]ContributorStats, error) {
+func (s *PostgresStore) ListContributors(project string) ([]ContributorStats, error) {
 	ctx := context.Background()
 
 	// Build the observations aggregation.
@@ -2319,7 +2021,7 @@ func (s *Store) ListContributors(project string) ([]ContributorStats, error) {
 // DeleteSession hard-deletes a session and its prompts.
 // Returns ErrSessionHasObservations if the session has any observations,
 // and ErrSessionNotFound if no session with that ID exists.
-func (s *Store) DeleteSession(id string) error {
+func (s *PostgresStore) DeleteSession(id string) error {
 	ctx := context.Background()
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		// Count ALL observations for the session (including soft-deleted).
@@ -2350,7 +2052,7 @@ func (s *Store) DeleteSession(id string) error {
 
 // DeletePrompt hard-deletes a single prompt by ID.
 // Returns ErrPromptNotFound if no prompt with that ID exists.
-func (s *Store) DeletePrompt(id int64) error {
+func (s *PostgresStore) DeletePrompt(id int64) error {
 	ctx := context.Background()
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `DELETE FROM user_prompts WHERE id = $1`, id)
@@ -2366,32 +2068,9 @@ func (s *Store) DeletePrompt(id int64) error {
 
 // ─── Project Queries ──────────────────────────────────────────────────────────
 
-// NormalizeProject applies canonical project name normalization:
-// lowercase + trim whitespace + collapse consecutive hyphens/underscores.
-// Returns the normalized name and a warning message if the name was changed.
-// Exported so MCP and CLI handlers can surface the warning to users.
-func NormalizeProject(project string) (normalized string, warning string) {
-	if project == "" {
-		return "", ""
-	}
-	n := strings.TrimSpace(strings.ToLower(project))
-	// Collapse multiple consecutive hyphens
-	for strings.Contains(n, "--") {
-		n = strings.ReplaceAll(n, "--", "-")
-	}
-	// Collapse multiple consecutive underscores
-	for strings.Contains(n, "__") {
-		n = strings.ReplaceAll(n, "__", "_")
-	}
-	if n == project {
-		return n, ""
-	}
-	return n, fmt.Sprintf("⚠️ Project name normalized: %q → %q", project, n)
-}
-
 // ListProjectNames returns all distinct project names from observations,
 // ordered alphabetically. Used for fuzzy matching and consolidation.
-func (s *Store) ListProjectNames() ([]string, error) {
+func (s *PostgresStore) ListProjectNames() ([]string, error) {
 	ctx := context.Background()
 	rows, err := s.pool.Query(ctx,
 		`SELECT DISTINCT project FROM observations
@@ -2416,7 +2095,7 @@ func (s *Store) ListProjectNames() ([]string, error) {
 
 // CountObservationsForProject returns the number of non-deleted observations
 // for the given project name.
-func (s *Store) CountObservationsForProject(name string) (int, error) {
+func (s *PostgresStore) CountObservationsForProject(name string) (int, error) {
 	ctx := context.Background()
 	var count int
 	err := s.pool.QueryRow(ctx,
@@ -2425,20 +2104,9 @@ func (s *Store) CountObservationsForProject(name string) (int, error) {
 	return count, err
 }
 
-// ProjectDetailStats holds aggregate statistics for a single project including
-// session and prompt counts. Used by ListProjectsWithStats and the consolidate CLI.
-type ProjectDetailStats struct {
-	Name             string   `json:"name"`
-	ObservationCount int      `json:"observation_count"`
-	SessionCount     int      `json:"session_count"`
-	PromptCount      int      `json:"prompt_count"`
-	Directories      []string `json:"directories"` // unique directories from sessions
-	Deprecated       bool     `json:"deprecated,omitempty"`
-}
-
 // ListProjectsWithStats returns all projects with aggregated counts.
 // Ordered by observation count descending.
-func (s *Store) ListProjectsWithStats() ([]ProjectDetailStats, error) {
+func (s *PostgresStore) ListProjectsWithStats() ([]ProjectDetailStats, error) {
 	ctx := context.Background()
 
 	// Observation counts per project.
@@ -2568,27 +2236,10 @@ func (s *Store) ListProjectsWithStats() ([]ProjectDetailStats, error) {
 	return results, nil
 }
 
-// MergeResult summarizes the result of merging multiple project name variants
-// into a single canonical project name.
-type MergeResult struct {
-	Canonical           string   `json:"canonical"`
-	SourcesMerged       []string `json:"sources_merged"`
-	ObservationsUpdated int64    `json:"observations_updated"`
-	SessionsUpdated     int64    `json:"sessions_updated"`
-	PromptsUpdated      int64    `json:"prompts_updated"`
-}
-
-// PruneResult holds the outcome of pruning a single project.
-type PruneResult struct {
-	Project         string `json:"project"`
-	SessionsDeleted int64  `json:"sessions_deleted"`
-	PromptsDeleted  int64  `json:"prompts_deleted"`
-}
-
 // PruneProject removes all sessions and prompts for a project that has zero
 // (non-deleted) observations. Returns an error if the project still has
 // observations — the caller must verify first.
-func (s *Store) PruneProject(project string) (*PruneResult, error) {
+func (s *PostgresStore) PruneProject(project string) (*PruneResult, error) {
 	if project == "" {
 		return nil, fmt.Errorf("project name must not be empty")
 	}
@@ -2628,7 +2279,7 @@ func (s *Store) PruneProject(project string) (*PruneResult, error) {
 // MergeProjects migrates all records from each source project name into the
 // canonical name. Sources that equal the canonical (after normalization) or
 // have no records are silently skipped — the operation is idempotent.
-func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult, error) {
+func (s *PostgresStore) MergeProjects(sources []string, canonical string) (*MergeResult, error) {
 	canonical, _ = NormalizeProject(canonical)
 	if canonical == "" {
 		return nil, fmt.Errorf("canonical project name must not be empty")
@@ -2675,7 +2326,7 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 
 // ─── Passive Capture ─────────────────────────────────────────────────────────
 
-func (s *Store) PassiveCapture(p PassiveCaptureParams) (*PassiveCaptureResult, error) {
+func (s *PostgresStore) PassiveCapture(p PassiveCaptureParams) (*PassiveCaptureResult, error) {
 	result := &PassiveCaptureResult{}
 	learnings := ExtractLearnings(p.Content)
 	result.Extracted = len(learnings)
@@ -2731,7 +2382,7 @@ type pgQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-func (s *Store) scanObservation(ctx context.Context, q pgQuerier, sql string, args ...any) (*Observation, error) {
+func (s *PostgresStore) scanObservation(ctx context.Context, q pgQuerier, sql string, args ...any) (*Observation, error) {
 	row := q.QueryRow(ctx, sql, args...)
 	var o Observation
 	var createdAt, updatedAt time.Time
@@ -2750,14 +2401,14 @@ func (s *Store) scanObservation(ctx context.Context, q pgQuerier, sql string, ar
 	return &o, nil
 }
 
-func (s *Store) getObservationTx(ctx context.Context, tx pgx.Tx, id int64) (*Observation, error) {
+func (s *PostgresStore) getObservationTx(ctx context.Context, tx pgx.Tx, id int64) (*Observation, error) {
 	return s.scanObservation(ctx, tx,
 		`SELECT id, COALESCE(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
 		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
 		 FROM observations WHERE id = $1 AND deleted_at IS NULL`, id)
 }
 
-func (s *Store) getObservationBySyncIDTx(ctx context.Context, tx pgx.Tx, syncID string, includeDeleted bool) (*Observation, error) {
+func (s *PostgresStore) getObservationBySyncIDTx(ctx context.Context, tx pgx.Tx, syncID string, includeDeleted bool) (*Observation, error) {
 	query := `SELECT id, COALESCE(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
 		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
 		 FROM observations WHERE sync_id = $1`
@@ -2786,7 +2437,7 @@ func scanObservationRow(rows pgx.Rows) (Observation, error) {
 	return o, nil
 }
 
-func (s *Store) queryObservationsPG(ctx context.Context, query string, args ...any) ([]Observation, error) {
+func (s *PostgresStore) queryObservationsPG(ctx context.Context, query string, args ...any) ([]Observation, error) {
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -2837,28 +2488,14 @@ func scanSyncMutation(rows pgx.Rows) (SyncMutation, error) {
 	return m, nil
 }
 
-func observationPayloadFromObservation(obs *Observation) syncObservationPayload {
-	return syncObservationPayload{
-		SyncID:    obs.SyncID,
-		SessionID: obs.SessionID,
-		Type:      obs.Type,
-		Title:     obs.Title,
-		Content:   obs.Content,
-		ToolName:  obs.ToolName,
-		Project:   obs.Project,
-		Scope:     obs.Scope,
-		TopicKey:  obs.TopicKey,
-	}
-}
-
-func (s *Store) ensureSyncState(ctx context.Context, targetKey string) error {
+func (s *PostgresStore) ensureSyncState(ctx context.Context, targetKey string) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO sync_state (target_key, lifecycle, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT(target_key) DO NOTHING`,
 		targetKey, SyncLifecycleIdle)
 	return err
 }
 
-func (s *Store) getSyncState(ctx context.Context, targetKey string) (*SyncState, error) {
+func (s *PostgresStore) getSyncState(ctx context.Context, targetKey string) (*SyncState, error) {
 	var state SyncState
 	var updatedAt time.Time
 	var backoffUntil, leaseUntil *time.Time
@@ -2883,7 +2520,7 @@ func (s *Store) getSyncState(ctx context.Context, targetKey string) (*SyncState,
 	return &state, nil
 }
 
-func (s *Store) getSyncStateTx(ctx context.Context, tx pgx.Tx, targetKey string) (*SyncState, error) {
+func (s *PostgresStore) getSyncStateTx(ctx context.Context, tx pgx.Tx, targetKey string) (*SyncState, error) {
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO sync_state (target_key, lifecycle, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT(target_key) DO NOTHING`,
 		targetKey, SyncLifecycleIdle,
@@ -2914,7 +2551,7 @@ func (s *Store) getSyncStateTx(ctx context.Context, tx pgx.Tx, targetKey string)
 	return &state, nil
 }
 
-func (s *Store) enqueueSyncMutationTx(ctx context.Context, tx pgx.Tx, entity, entityKey, op string, payload any) error {
+func (s *PostgresStore) enqueueSyncMutationTx(ctx context.Context, tx pgx.Tx, entity, entityKey, op string, payload any) error {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -2941,51 +2578,7 @@ func (s *Store) enqueueSyncMutationTx(ctx context.Context, tx pgx.Tx, entity, en
 	return err
 }
 
-func extractProjectFromPayload(payload any) string {
-	switch p := payload.(type) {
-	case syncSessionPayload:
-		return p.Project
-	case syncObservationPayload:
-		if p.Project != nil {
-			return *p.Project
-		}
-		return ""
-	case syncPromptPayload:
-		if p.Project != nil {
-			return *p.Project
-		}
-		return ""
-	default:
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return ""
-		}
-		var generic struct {
-			Project *string `json:"project"`
-		}
-		if err := json.Unmarshal(data, &generic); err != nil || generic.Project == nil {
-			return ""
-		}
-		return *generic.Project
-	}
-}
-
-func decodeSyncPayload(payload []byte, dest any) error {
-	trimmed := strings.TrimSpace(string(payload))
-	if trimmed == "" {
-		return fmt.Errorf("empty payload")
-	}
-	if trimmed[0] != '"' {
-		return json.Unmarshal([]byte(trimmed), dest)
-	}
-	var encoded string
-	if err := json.Unmarshal([]byte(trimmed), &encoded); err != nil {
-		return err
-	}
-	return json.Unmarshal([]byte(encoded), dest)
-}
-
-func (s *Store) applySessionPayloadTx(ctx context.Context, tx pgx.Tx, payload syncSessionPayload) error {
+func (s *PostgresStore) applySessionPayloadTx(ctx context.Context, tx pgx.Tx, payload syncSessionPayload) error {
 	_, err := tx.Exec(ctx,
 		`INSERT INTO sessions (id, project, directory, ended_at, summary)
 		 VALUES ($1, $2, $3, $4, $5)
@@ -2998,7 +2591,7 @@ func (s *Store) applySessionPayloadTx(ctx context.Context, tx pgx.Tx, payload sy
 	return err
 }
 
-func (s *Store) applyObservationUpsertTx(ctx context.Context, tx pgx.Tx, payload syncObservationPayload) error {
+func (s *PostgresStore) applyObservationUpsertTx(ctx context.Context, tx pgx.Tx, payload syncObservationPayload) error {
 	existing, err := s.getObservationBySyncIDTx(ctx, tx, payload.SyncID, true)
 	if err == pgx.ErrNoRows {
 		_, err = tx.Exec(ctx,
@@ -3018,7 +2611,7 @@ func (s *Store) applyObservationUpsertTx(ctx context.Context, tx pgx.Tx, payload
 	return err
 }
 
-func (s *Store) applyObservationDeleteTx(ctx context.Context, tx pgx.Tx, payload syncObservationPayload) error {
+func (s *PostgresStore) applyObservationDeleteTx(ctx context.Context, tx pgx.Tx, payload syncObservationPayload) error {
 	existing, err := s.getObservationBySyncIDTx(ctx, tx, payload.SyncID, true)
 	if err == pgx.ErrNoRows {
 		return nil
@@ -3041,7 +2634,7 @@ func (s *Store) applyObservationDeleteTx(ctx context.Context, tx pgx.Tx, payload
 	return err
 }
 
-func (s *Store) applyPromptUpsertTx(ctx context.Context, tx pgx.Tx, payload syncPromptPayload) error {
+func (s *PostgresStore) applyPromptUpsertTx(ctx context.Context, tx pgx.Tx, payload syncPromptPayload) error {
 	var existingID int64
 	err := tx.QueryRow(ctx, `SELECT id FROM user_prompts WHERE sync_id = $1 ORDER BY id DESC LIMIT 1`, payload.SyncID).Scan(&existingID)
 	if err == pgx.ErrNoRows {
@@ -3059,7 +2652,7 @@ func (s *Store) applyPromptUpsertTx(ctx context.Context, tx pgx.Tx, payload sync
 	return err
 }
 
-func (s *Store) backfillProjectSyncMutationsTx(ctx context.Context, tx pgx.Tx, project string) error {
+func (s *PostgresStore) backfillProjectSyncMutationsTx(ctx context.Context, tx pgx.Tx, project string) error {
 	if err := s.backfillSessionSyncMutationsTx(ctx, tx, project); err != nil {
 		return err
 	}
@@ -3069,7 +2662,7 @@ func (s *Store) backfillProjectSyncMutationsTx(ctx context.Context, tx pgx.Tx, p
 	return s.backfillPromptSyncMutationsTx(ctx, tx, project)
 }
 
-func (s *Store) repairEnrolledProjectSyncMutations() error {
+func (s *PostgresStore) repairEnrolledProjectSyncMutations() error {
 	ctx := context.Background()
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT project FROM sync_enrolled_projects ORDER BY project ASC`)
@@ -3099,7 +2692,7 @@ func (s *Store) repairEnrolledProjectSyncMutations() error {
 	})
 }
 
-func (s *Store) backfillSessionSyncMutationsTx(ctx context.Context, tx pgx.Tx, project string) error {
+func (s *PostgresStore) backfillSessionSyncMutationsTx(ctx context.Context, tx pgx.Tx, project string) error {
 	rows, err := tx.Query(ctx, `
 		SELECT id, project, directory, ended_at, summary
 		FROM sessions
@@ -3137,7 +2730,7 @@ func (s *Store) backfillSessionSyncMutationsTx(ctx context.Context, tx pgx.Tx, p
 	return nil
 }
 
-func (s *Store) backfillObservationSyncMutationsTx(ctx context.Context, tx pgx.Tx, project string) error {
+func (s *PostgresStore) backfillObservationSyncMutationsTx(ctx context.Context, tx pgx.Tx, project string) error {
 	rows, err := tx.Query(ctx, `
 		SELECT sync_id, session_id, type, title, content, tool_name, project, scope, topic_key
 		FROM observations
@@ -3174,7 +2767,7 @@ func (s *Store) backfillObservationSyncMutationsTx(ctx context.Context, tx pgx.T
 	return nil
 }
 
-func (s *Store) backfillPromptSyncMutationsTx(ctx context.Context, tx pgx.Tx, project string) error {
+func (s *PostgresStore) backfillPromptSyncMutationsTx(ctx context.Context, tx pgx.Tx, project string) error {
 	rows, err := tx.Query(ctx, `
 		SELECT sync_id, session_id, content, project
 		FROM user_prompts
@@ -3211,42 +2804,14 @@ func (s *Store) backfillPromptSyncMutationsTx(ctx context.Context, tx pgx.Tx, pr
 }
 
 // ─── Shared Helpers (duplicated from store.go for build-tag isolation) ───────
-
-func nullableString(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
-}
-
-func truncate(s string, max int) string {
-	runes := []rune(s)
-	if len(runes) <= max {
-		return s
-	}
-	return string(runes[:max]) + "..."
-}
-
-func normalizeScope(scope string) string {
-	v := strings.TrimSpace(strings.ToLower(scope))
-	if v == "personal" {
-		return "personal"
-	}
-	return "project"
-}
-
-func derefString(v *string) string {
-	if v == nil {
-		return ""
-	}
-	return *v
-}
-
-func hashNormalized(content string) string {
-	normalized := strings.ToLower(strings.Join(strings.Fields(content), " "))
-	h := sha256.Sum256([]byte(normalized))
-	return hex.EncodeToString(h[:])
-}
+//
+// Pure helpers (nullableString, truncate, normalizeScope, derefString,
+// hashNormalized, maxInt, newSyncID, normalizeExistingSyncID,
+// normalizeSyncTargetKey, stripPrivateTags, sanitizeFTS, normalizeTopicKey,
+// normalizeTopicSegment, SuggestTopicKey, inferTopicFamily, hasAny,
+// ExtractLearnings, cleanMarkdown, ClassifyTool, NormalizeProject) now live
+// in dedicated files without build tags. See common.go, project.go,
+// passive_capture.go, sync_payload.go, text_helpers.go, topic_key.go.
 
 func dedupeWindowPG(window time.Duration) string {
 	if window <= 0 {
@@ -3259,13 +2824,6 @@ func dedupeWindowPG(window time.Duration) string {
 	return strconv.Itoa(minutes) + " minutes"
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 // topicKeyAdvisoryLock produces a deterministic int64 from a topic_key+project+scope
 // triple, used as a PG advisory lock key to serialize concurrent upserts.
 func topicKeyAdvisoryLock(topicKey, project, scope string) int64 {
@@ -3276,35 +2834,6 @@ func topicKeyAdvisoryLock(topicKey, project, scope string) int64 {
 		v = (v << 8) | int64(h[i])
 	}
 	return v
-}
-
-func normalizeSyncTargetKey(targetKey string) string {
-	if strings.TrimSpace(targetKey) == "" {
-		return DefaultSyncTargetKey
-	}
-	return strings.TrimSpace(strings.ToLower(targetKey))
-}
-
-func newSyncID(prefix string) string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%s-%d", prefix, time.Now().UTC().UnixNano())
-	}
-	return prefix + "-" + hex.EncodeToString(b)
-}
-
-func normalizeExistingSyncID(existing, prefix string) string {
-	if strings.TrimSpace(existing) != "" {
-		return existing
-	}
-	return newSyncID(prefix)
-}
-
-var privateTagRegex = regexp.MustCompile(`(?is)<private>.*?</private>`)
-
-func stripPrivateTags(s string) string {
-	result := privateTagRegex.ReplaceAllString(s, "[REDACTED]")
-	return strings.TrimSpace(result)
 }
 
 // resolveSince converts a human-readable time filter to a UTC timestamp string
@@ -3338,207 +2867,6 @@ func resolveSince(since string) string {
 	return ""
 }
 
-func sanitizeFTS(query string) string {
-	words := strings.Fields(query)
-	for i, w := range words {
-		w = strings.Trim(w, `"`)
-		words[i] = `"` + w + `"`
-	}
-	return strings.Join(words, " ")
-}
-
-func normalizeTopicKey(topic string) string {
-	v := strings.TrimSpace(strings.ToLower(topic))
-	if v == "" {
-		return ""
-	}
-	v = strings.Join(strings.Fields(v), "-")
-	if len(v) > 120 {
-		v = v[:120]
-	}
-	return v
-}
-
-func normalizeTopicSegment(s string) string {
-	v := strings.ToLower(strings.TrimSpace(s))
-	if v == "" {
-		return ""
-	}
-	re := regexp.MustCompile(`[^a-z0-9]+`)
-	v = re.ReplaceAllString(v, " ")
-	v = strings.Join(strings.Fields(v), "-")
-	if len(v) > 100 {
-		v = v[:100]
-	}
-	return v
-}
-
-// SuggestTopicKey generates a stable topic key suggestion from type/title/content.
-func SuggestTopicKey(typ, title, content string) string {
-	family := inferTopicFamily(typ, title, content)
-	cleanTitle := stripPrivateTags(title)
-	segment := normalizeTopicSegment(cleanTitle)
-
-	if segment == "" {
-		cleanContent := stripPrivateTags(content)
-		words := strings.Fields(strings.ToLower(cleanContent))
-		if len(words) > 8 {
-			words = words[:8]
-		}
-		segment = normalizeTopicSegment(strings.Join(words, " "))
-	}
-
-	if segment == "" {
-		segment = "general"
-	}
-
-	if strings.HasPrefix(segment, family+"-") {
-		segment = strings.TrimPrefix(segment, family+"-")
-	}
-	if segment == "" || segment == family {
-		segment = "general"
-	}
-
-	return family + "/" + segment
-}
-
-func inferTopicFamily(typ, title, content string) string {
-	t := strings.TrimSpace(strings.ToLower(typ))
-	switch t {
-	case "architecture", "design", "adr", "refactor":
-		return "architecture"
-	case "bug", "bugfix", "fix", "incident", "hotfix":
-		return "bug"
-	case "decision":
-		return "decision"
-	case "pattern", "convention", "guideline":
-		return "pattern"
-	case "config", "setup", "infra", "infrastructure", "ci":
-		return "config"
-	case "discovery", "investigation", "root_cause", "root-cause":
-		return "discovery"
-	case "learning", "learn":
-		return "learning"
-	case "session_summary":
-		return "session"
-	}
-
-	text := strings.ToLower(title + " " + content)
-	if hasAny(text, "bug", "fix", "panic", "error", "crash", "regression", "incident", "hotfix") {
-		return "bug"
-	}
-	if hasAny(text, "architecture", "design", "adr", "boundary", "hexagonal", "refactor") {
-		return "architecture"
-	}
-	if hasAny(text, "decision", "tradeoff", "chose", "choose", "decide") {
-		return "decision"
-	}
-	if hasAny(text, "pattern", "convention", "naming", "guideline") {
-		return "pattern"
-	}
-	if hasAny(text, "config", "setup", "environment", "env", "docker", "pipeline") {
-		return "config"
-	}
-	if hasAny(text, "discovery", "investigate", "investigation", "found", "root cause") {
-		return "discovery"
-	}
-	if hasAny(text, "learned", "learning") {
-		return "learning"
-	}
-
-	if t != "" && t != "manual" {
-		return normalizeTopicSegment(t)
-	}
-
-	return "topic"
-}
-
-func hasAny(text string, words ...string) bool {
-	for _, w := range words {
-		if strings.Contains(text, w) {
-			return true
-		}
-	}
-	return false
-}
-
-// ExtractLearnings parses structured learning items from text.
-var learningHeaderPattern = regexp.MustCompile(
-	`(?im)^#{2,3}\s+(?:Aprendizajes(?:\s+Clave)?|Key\s+Learnings?|Learnings?):?\s*$`,
-)
-
-const (
-	minLearningLength = 20
-	minLearningWords  = 4
-)
-
-func ExtractLearnings(text string) []string {
-	matches := learningHeaderPattern.FindAllStringIndex(text, -1)
-	if len(matches) == 0 {
-		return nil
-	}
-
-	for i := len(matches) - 1; i >= 0; i-- {
-		sectionStart := matches[i][1]
-		sectionText := text[sectionStart:]
-
-		if nextHeader := regexp.MustCompile(`\n#{1,3} `).FindStringIndex(sectionText); nextHeader != nil {
-			sectionText = sectionText[:nextHeader[0]]
-		}
-
-		var learnings []string
-
-		numbered := regexp.MustCompile(`(?m)^\s*\d+[.)]\s+(.+)`).FindAllStringSubmatch(sectionText, -1)
-		if len(numbered) > 0 {
-			for _, m := range numbered {
-				cleaned := cleanMarkdown(m[1])
-				if len(cleaned) >= minLearningLength && len(strings.Fields(cleaned)) >= minLearningWords {
-					learnings = append(learnings, cleaned)
-				}
-			}
-		}
-
-		if len(learnings) == 0 {
-			bullets := regexp.MustCompile(`(?m)^\s*[-*]\s+(.+)`).FindAllStringSubmatch(sectionText, -1)
-			for _, m := range bullets {
-				cleaned := cleanMarkdown(m[1])
-				if len(cleaned) >= minLearningLength && len(strings.Fields(cleaned)) >= minLearningWords {
-					learnings = append(learnings, cleaned)
-				}
-			}
-		}
-
-		if len(learnings) > 0 {
-			return learnings
-		}
-	}
-
-	return nil
-}
-
-func cleanMarkdown(text string) string {
-	text = regexp.MustCompile(`\*\*([^*]+)\*\*`).ReplaceAllString(text, "$1")
-	text = regexp.MustCompile("`([^`]+)`").ReplaceAllString(text, "$1")
-	text = regexp.MustCompile(`\*([^*]+)\*`).ReplaceAllString(text, "$1")
-	return strings.TrimSpace(strings.Join(strings.Fields(text), " "))
-}
-
-// ClassifyTool returns the observation type for a given tool name.
-func ClassifyTool(toolName string) string {
-	switch toolName {
-	case "write", "edit", "patch":
-		return "file_change"
-	case "bash":
-		return "command"
-	case "read", "view":
-		return "file_read"
-	case "grep", "glob", "ls":
-		return "search"
-	default:
-		return "tool_use"
-	}
-}
-
 // ─── Exported helpers for migrate command ────────────────────────────────────
 
 // ResolveAuthMethodExported exposes resolveAuthMethod for the migration CLI.
@@ -3567,3 +2895,7 @@ func NewSyncIDExported(prefix string) string {
 func ResolveInteractiveAuthExported(dataDir, profile string) (tenantID, clientID string, err error) {
 	return resolveInteractiveAuth(dataDir, profile)
 }
+
+// Compile-time assertion that *PostgresStore satisfies the Store interface.
+var _ Store = (*PostgresStore)(nil)
+

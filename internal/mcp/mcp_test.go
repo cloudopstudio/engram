@@ -11,7 +11,7 @@ import (
 	mcppkg "github.com/mark3labs/mcp-go/mcp"
 )
 
-func newMCPTestStore(t *testing.T) *store.Store {
+func newMCPTestStore(t *testing.T) store.Store {
 	t.Helper()
 	cfg, err := store.DefaultConfig()
 	if err != nil {
@@ -815,7 +815,7 @@ func TestHandleContextWithSessionOnlyUsesNoneProjects(t *testing.T) {
 
 func TestHandleStatsReturnsErrorWhenLoaderFails(t *testing.T) {
 	prev := loadMCPStats
-	loadMCPStats = func(s *store.Store) (*store.Stats, error) {
+	loadMCPStats = func(s store.Store) (*store.Stats, error) {
 		return nil, errors.New("stats unavailable")
 	}
 	t.Cleanup(func() {

@@ -1,5 +1,3 @@
-//go:build !pgstore
-
 // Package store implements the persistent memory engine for Engram.
 //
 // It uses SQLite with FTS5 full-text search to store and retrieve
@@ -8,16 +6,12 @@
 package store
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -32,292 +26,33 @@ var openDB = sql.Open
 // See https://www.sqlite.org/rescode.html#constraint_foreignkey
 const sqliteConstraintForeignKey = 787
 
-// Sentinel errors returned by delete operations so callers can use errors.Is.
-var (
-	ErrSessionNotFound        = errors.New("session not found")
-	ErrSessionHasObservations = errors.New("session still has observations")
-	ErrPromptNotFound         = errors.New("prompt not found")
-)
-
 // ─── Types ───────────────────────────────────────────────────────────────────
-
-type Session struct {
-	ID        string  `json:"id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	StartedAt string  `json:"started_at"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
-}
-
-type Observation struct {
-	ID             int64   `json:"id"`
-	SyncID         string  `json:"sync_id"`
-	SessionID      string  `json:"session_id"`
-	Type           string  `json:"type"`
-	Title          string  `json:"title"`
-	Content        string  `json:"content"`
-	ToolName       *string `json:"tool_name,omitempty"`
-	Project        *string `json:"project,omitempty"`
-	Scope          string  `json:"scope"`
-	TopicKey       *string `json:"topic_key,omitempty"`
-	RevisionCount  int     `json:"revision_count"`
-	DuplicateCount int     `json:"duplicate_count"`
-	LastSeenAt     *string `json:"last_seen_at,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	DeletedAt      *string `json:"deleted_at,omitempty"`
-}
-
-type SearchResult struct {
-	Observation
-	Rank float64 `json:"rank"`
-}
-
-type SessionSummary struct {
-	ID               string  `json:"id"`
-	Project          string  `json:"project"`
-	StartedAt        string  `json:"started_at"`
-	EndedAt          *string `json:"ended_at,omitempty"`
-	Summary          *string `json:"summary,omitempty"`
-	ObservationCount int     `json:"observation_count"`
-}
-
-type Stats struct {
-	TotalSessions     int      `json:"total_sessions"`
-	TotalObservations int      `json:"total_observations"`
-	TotalPrompts      int      `json:"total_prompts"`
-	Projects          []string `json:"projects"`
-}
-
-type TimelineEntry struct {
-	ID             int64   `json:"id"`
-	SessionID      string  `json:"session_id"`
-	Type           string  `json:"type"`
-	Title          string  `json:"title"`
-	Content        string  `json:"content"`
-	ToolName       *string `json:"tool_name,omitempty"`
-	Project        *string `json:"project,omitempty"`
-	Scope          string  `json:"scope"`
-	TopicKey       *string `json:"topic_key,omitempty"`
-	RevisionCount  int     `json:"revision_count"`
-	DuplicateCount int     `json:"duplicate_count"`
-	LastSeenAt     *string `json:"last_seen_at,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	DeletedAt      *string `json:"deleted_at,omitempty"`
-	IsFocus        bool    `json:"is_focus"` // true for the anchor observation
-}
-
-type TimelineResult struct {
-	Focus        Observation     `json:"focus"`        // The anchor observation
-	Before       []TimelineEntry `json:"before"`       // Observations before the focus (chronological)
-	After        []TimelineEntry `json:"after"`        // Observations after the focus (chronological)
-	SessionInfo  *Session        `json:"session_info"` // Session that contains the focus observation
-	TotalInRange int             `json:"total_in_range"`
-}
-
-type SearchOptions struct {
-	Type    string `json:"type,omitempty"`
-	Project string `json:"project,omitempty"`
-	Scope   string `json:"scope,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
-	User    string `json:"user,omitempty"`
-	Since   string `json:"since,omitempty"`
-}
-
-// ProjectStats holds aggregated stats for a single project.
-type ProjectStats struct {
-	Project      string `json:"project"`
-	Observations int    `json:"observations"`
-	Contributors int    `json:"contributors"`
-	LastActivity string `json:"last_activity"`
-	Deprecated   bool   `json:"deprecated,omitempty"`
-}
-
-// ContributorStats holds activity stats for a single contributor.
-type ContributorStats struct {
-	Identity     string   `json:"identity"`
-	Observations int      `json:"observations"`
-	Prompts      int      `json:"prompts"`
-	LastActive   string   `json:"last_active"`
-	TopTypes     []string `json:"top_types,omitempty"`
-}
-
-type AddObservationParams struct {
-	SessionID string `json:"session_id"`
-	Type      string `json:"type"`
-	Title     string `json:"title"`
-	Content   string `json:"content"`
-	ToolName  string `json:"tool_name,omitempty"`
-	Project   string `json:"project,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	TopicKey  string `json:"topic_key,omitempty"`
-}
-
-type UpdateObservationParams struct {
-	Type     *string `json:"type,omitempty"`
-	Title    *string `json:"title,omitempty"`
-	Content  *string `json:"content,omitempty"`
-	Project  *string `json:"project,omitempty"`
-	Scope    *string `json:"scope,omitempty"`
-	TopicKey *string `json:"topic_key,omitempty"`
-}
-
-type Prompt struct {
-	ID        int64  `json:"id"`
-	SyncID    string `json:"sync_id"`
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-	CreatedAt string `json:"created_at"`
-}
-
-type AddPromptParams struct {
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-}
-
-const (
-	DefaultSyncTargetKey = "cloud"
-
-	SyncLifecycleIdle     = "idle"
-	SyncLifecyclePending  = "pending"
-	SyncLifecycleRunning  = "running"
-	SyncLifecycleHealthy  = "healthy"
-	SyncLifecycleDegraded = "degraded"
-
-	SyncEntitySession     = "session"
-	SyncEntityObservation = "observation"
-	SyncEntityPrompt      = "prompt"
-
-	SyncOpUpsert = "upsert"
-	SyncOpDelete = "delete"
-
-	SyncSourceLocal  = "local"
-	SyncSourceRemote = "remote"
-)
-
-type SyncState struct {
-	TargetKey           string  `json:"target_key"`
-	Lifecycle           string  `json:"lifecycle"`
-	LastEnqueuedSeq     int64   `json:"last_enqueued_seq"`
-	LastAckedSeq        int64   `json:"last_acked_seq"`
-	LastPulledSeq       int64   `json:"last_pulled_seq"`
-	ConsecutiveFailures int     `json:"consecutive_failures"`
-	BackoffUntil        *string `json:"backoff_until,omitempty"`
-	LeaseOwner          *string `json:"lease_owner,omitempty"`
-	LeaseUntil          *string `json:"lease_until,omitempty"`
-	LastError           *string `json:"last_error,omitempty"`
-	UpdatedAt           string  `json:"updated_at"`
-}
-
-type SyncMutation struct {
-	Seq        int64   `json:"seq"`
-	TargetKey  string  `json:"target_key"`
-	Entity     string  `json:"entity"`
-	EntityKey  string  `json:"entity_key"`
-	Op         string  `json:"op"`
-	Payload    string  `json:"payload"`
-	Source     string  `json:"source"`
-	Project    string  `json:"project"`
-	OccurredAt string  `json:"occurred_at"`
-	AckedAt    *string `json:"acked_at,omitempty"`
-}
-
-// EnrolledProject represents a project enrolled for cloud sync.
-type EnrolledProject struct {
-	Project    string `json:"project"`
-	EnrolledAt string `json:"enrolled_at"`
-}
-
-type syncSessionPayload struct {
-	ID        string  `json:"id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
-}
-
-type syncObservationPayload struct {
-	SyncID     string  `json:"sync_id"`
-	SessionID  string  `json:"session_id"`
-	Type       string  `json:"type"`
-	Title      string  `json:"title"`
-	Content    string  `json:"content"`
-	ToolName   *string `json:"tool_name,omitempty"`
-	Project    *string `json:"project,omitempty"`
-	Scope      string  `json:"scope"`
-	TopicKey   *string `json:"topic_key,omitempty"`
-	Deleted    bool    `json:"deleted,omitempty"`
-	DeletedAt  *string `json:"deleted_at,omitempty"`
-	HardDelete bool    `json:"hard_delete,omitempty"`
-}
-
-type syncPromptPayload struct {
-	SyncID    string  `json:"sync_id"`
-	SessionID string  `json:"session_id"`
-	Content   string  `json:"content"`
-	Project   *string `json:"project,omitempty"`
-}
-
-// ExportData is the full serializable dump of the engram database.
-type ExportData struct {
-	Version      string        `json:"version"`
-	ExportedAt   string        `json:"exported_at"`
-	Sessions     []Session     `json:"sessions"`
-	Observations []Observation `json:"observations"`
-	Prompts      []Prompt      `json:"prompts"`
-}
-
-// ─── Config ──────────────────────────────────────────────────────────────────
-
-type Config struct {
-	DataDir              string
-	Profile              string // Active profile name (from --profile flag or default-profile)
-	AuthInteractive      bool   // Enable device code flow for Azure auth
-	MaxObservationLength int
-	MaxContextResults    int
-	MaxSearchResults     int
-	DedupeWindow         time.Duration
-}
-
-func DefaultConfig() (Config, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return Config{}, fmt.Errorf("engram: determine home directory: %w", err)
-	}
-	return Config{
-		DataDir:              filepath.Join(home, ".engram"),
-		MaxObservationLength: 50000,
-		MaxContextResults:    20,
-		MaxSearchResults:     20,
-		DedupeWindow:         15 * time.Minute,
-	}, nil
-}
-
-// FallbackConfig returns a Config with the given DataDir and default values.
-// Use this when DefaultConfig fails and you have resolved the home directory
-// through alternative means.
-func FallbackConfig(dataDir string) Config {
-	return Config{
-		DataDir:              dataDir,
-		MaxObservationLength: 50000,
-		MaxContextResults:    20,
-		MaxSearchResults:     20,
-		DedupeWindow:         15 * time.Minute,
-	}
-}
+//
+// Public types (Session, Observation, SearchResult, etc.) and the Config
+// struct now live in types.go and config.go (no build tags) so they are
+// shared between the SQLite and PostgreSQL backends.
+//
+// Sentinel errors (ErrSessionNotFound, ErrSessionHasObservations,
+// ErrPromptNotFound) now live in errors.go.
+//
+// Sync-related constants (DefaultSyncTargetKey, SyncLifecycle*, SyncEntity*,
+// SyncOp*, SyncSource*) now live in sync_constants.go.
+//
+// Sync payload types (syncSessionPayload, syncObservationPayload,
+// syncPromptPayload) and pure-text helpers (passive capture, topic key,
+// project normalization, etc.) now live in dedicated files without build
+// tags. See passive_capture.go, sync_payload.go, topic_key.go,
+// text_helpers.go, project.go, common.go.
 
 // MaxObservationLength returns the configured maximum content length for observations.
-func (s *Store) MaxObservationLength() int {
+func (s *SQLiteStore) MaxObservationLength() int {
 	return s.cfg.MaxObservationLength
 }
 
 // ─── Store ───────────────────────────────────────────────────────────────────
 
-type Store struct {
+// SQLiteStore is the SQLite-backed implementation of the Store interface.
+type SQLiteStore struct {
 	db    *sql.DB
 	cfg   Config
 	hooks storeHooks
@@ -390,21 +125,21 @@ func defaultStoreHooks() storeHooks {
 	}
 }
 
-func (s *Store) execHook(db execer, query string, args ...any) (sql.Result, error) {
+func (s *SQLiteStore) execHook(db execer, query string, args ...any) (sql.Result, error) {
 	if s.hooks.exec != nil {
 		return s.hooks.exec(db, query, args...)
 	}
 	return db.Exec(query, args...)
 }
 
-func (s *Store) queryHook(db queryer, query string, args ...any) (*sql.Rows, error) {
+func (s *SQLiteStore) queryHook(db queryer, query string, args ...any) (*sql.Rows, error) {
 	if s.hooks.query != nil {
 		return s.hooks.query(db, query, args...)
 	}
 	return db.Query(query, args...)
 }
 
-func (s *Store) queryItHook(db queryer, query string, args ...any) (rowScanner, error) {
+func (s *SQLiteStore) queryItHook(db queryer, query string, args ...any) (rowScanner, error) {
 	if s.hooks.queryIt != nil {
 		return s.hooks.queryIt(db, query, args...)
 	}
@@ -415,21 +150,23 @@ func (s *Store) queryItHook(db queryer, query string, args ...any) (rowScanner, 
 	return sqlRowScanner{rows: rows}, nil
 }
 
-func (s *Store) beginTxHook() (*sql.Tx, error) {
+func (s *SQLiteStore) beginTxHook() (*sql.Tx, error) {
 	if s.hooks.beginTx != nil {
 		return s.hooks.beginTx(s.db)
 	}
 	return s.db.Begin()
 }
 
-func (s *Store) commitHook(tx *sql.Tx) error {
+func (s *SQLiteStore) commitHook(tx *sql.Tx) error {
 	if s.hooks.commit != nil {
 		return s.hooks.commit(tx)
 	}
 	return tx.Commit()
 }
 
-func New(cfg Config) (*Store, error) {
+// NewSQLiteStore opens the SQLite-backed Store. It returns the Store interface
+// so callers depend on behavior rather than the concrete *SQLiteStore type.
+func NewSQLiteStore(cfg Config) (Store, error) {
 	if !filepath.IsAbs(cfg.DataDir) {
 		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
 	}
@@ -456,7 +193,7 @@ func New(cfg Config) (*Store, error) {
 		}
 	}
 
-	s := &Store{db: db, cfg: cfg, hooks: defaultStoreHooks()}
+	s := &SQLiteStore{db: db, cfg: cfg, hooks: defaultStoreHooks()}
 	if err := s.migrate(); err != nil {
 		return nil, fmt.Errorf("engram: migration: %w", err)
 	}
@@ -467,19 +204,19 @@ func New(cfg Config) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) Close() error {
+func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
 // Identity returns the identity associated with the store.
 // For the SQLite backend, this is empty unless explicitly set.
-func (s *Store) Identity() string {
+func (s *SQLiteStore) Identity() string {
 	return ""
 }
 
 // ─── Migrations ──────────────────────────────────────────────────────────────
 
-func (s *Store) migrate() error {
+func (s *SQLiteStore) migrate() error {
 	schema := `
 			CREATE TABLE IF NOT EXISTS sessions (
 				id         TEXT PRIMARY KEY,
@@ -758,7 +495,7 @@ func (s *Store) migrate() error {
 	return nil
 }
 
-func (s *Store) migrateFTSTopicKey() error {
+func (s *SQLiteStore) migrateFTSTopicKey() error {
 	var colCount int
 	err := s.db.QueryRow("SELECT COUNT(*) FROM pragma_table_xinfo('observations_fts') WHERE name = 'topic_key'").Scan(&colCount)
 	if err != nil || colCount > 0 {
@@ -809,7 +546,7 @@ func (s *Store) migrateFTSTopicKey() error {
 
 // ─── Sessions ────────────────────────────────────────────────────────────────
 
-func (s *Store) CreateSession(id, project, directory string) error {
+func (s *SQLiteStore) CreateSession(id, project, directory string) error {
 	// Normalize project name before storing
 	project, _ = NormalizeProject(project)
 
@@ -825,7 +562,7 @@ func (s *Store) CreateSession(id, project, directory string) error {
 	})
 }
 
-func (s *Store) EndSession(id string, summary string) error {
+func (s *SQLiteStore) EndSession(id string, summary string) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		res, err := s.execHook(tx,
 			`UPDATE sessions SET ended_at = datetime('now'), summary = ? WHERE id = ?`,
@@ -862,7 +599,7 @@ func (s *Store) EndSession(id string, summary string) error {
 	})
 }
 
-func (s *Store) GetSession(id string) (*Session, error) {
+func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 	row := s.db.QueryRow(
 		`SELECT id, project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`, id,
 	)
@@ -873,7 +610,7 @@ func (s *Store) GetSession(id string) (*Session, error) {
 	return &sess, nil
 }
 
-func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {
+func (s *SQLiteStore) RecentSessions(project string, limit int) ([]SessionSummary, error) {
 	// Normalize project filter for case-insensitive matching
 	project, _ = NormalizeProject(project)
 
@@ -916,7 +653,7 @@ func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, err
 }
 
 // AllSessions returns recent sessions ordered by most recent first (for TUI browsing).
-func (s *Store) AllSessions(project string, limit int) ([]SessionSummary, error) {
+func (s *SQLiteStore) AllSessions(project string, limit int) ([]SessionSummary, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -956,7 +693,7 @@ func (s *Store) AllSessions(project string, limit int) ([]SessionSummary, error)
 }
 
 // AllObservations returns recent observations ordered by most recent first (for TUI browsing).
-func (s *Store) AllObservations(project, scope string, limit int) ([]Observation, error) {
+func (s *SQLiteStore) AllObservations(project, scope string, limit int) ([]Observation, error) {
 	if limit <= 0 {
 		limit = s.cfg.MaxContextResults
 	}
@@ -985,7 +722,7 @@ func (s *Store) AllObservations(project, scope string, limit int) ([]Observation
 }
 
 // SessionObservations returns all observations for a specific session.
-func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation, error) {
+func (s *SQLiteStore) SessionObservations(sessionID string, limit int) ([]Observation, error) {
 	if limit <= 0 {
 		limit = 200
 	}
@@ -1003,7 +740,7 @@ func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation,
 
 // ─── Observations ────────────────────────────────────────────────────────────
 
-func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
+func (s *SQLiteStore) AddObservation(p AddObservationParams) (int64, error) {
 	// Normalize project name (lowercase + trim) before any persistence
 	p.Project, _ = NormalizeProject(p.Project)
 
@@ -1131,7 +868,7 @@ func (s *Store) AddObservation(p AddObservationParams) (int64, error) {
 	return observationID, nil
 }
 
-func (s *Store) RecentObservations(project, scope string, limit int) ([]Observation, error) {
+func (s *SQLiteStore) RecentObservations(project, scope string, limit int) ([]Observation, error) {
 	// Normalize project filter for case-insensitive matching
 	project, _ = NormalizeProject(project)
 
@@ -1164,7 +901,7 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 
 // ─── User Prompts ────────────────────────────────────────────────────────────
 
-func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
+func (s *SQLiteStore) AddPrompt(p AddPromptParams) (int64, error) {
 	// Normalize project name before storing
 	p.Project, _ = NormalizeProject(p.Project)
 
@@ -1200,7 +937,7 @@ func (s *Store) AddPrompt(p AddPromptParams) (int64, error) {
 	return promptID, nil
 }
 
-func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
+func (s *SQLiteStore) RecentPrompts(project string, limit int) ([]Prompt, error) {
 	// Normalize project filter for case-insensitive matching
 	project, _ = NormalizeProject(project)
 
@@ -1236,7 +973,7 @@ func (s *Store) RecentPrompts(project string, limit int) ([]Prompt, error) {
 	return results, rows.Err()
 }
 
-func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt, error) {
+func (s *SQLiteStore) SearchPrompts(query string, project string, limit int) ([]Prompt, error) {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -1287,7 +1024,7 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 // sync mutation, but any previously enqueued mutations for the session or its
 // prompts may still be synced later if autosync is enabled, and a later pull
 // may recreate the deleted rows locally.
-func (s *Store) DeleteSession(id string) error {
+func (s *SQLiteStore) DeleteSession(id string) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		// Count ALL observations for the session, including soft-deleted ones,
 		// because the FK constraint on observations.session_id has no ON DELETE CASCADE.
@@ -1340,7 +1077,7 @@ func (s *Store) DeleteSession(id string) error {
 // sync mutation, but any previously enqueued mutations for the prompt
 // may still be synced later if autosync is enabled, and a later pull
 // may recreate the deleted row locally.
-func (s *Store) DeletePrompt(id int64) error {
+func (s *SQLiteStore) DeletePrompt(id int64) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		res, err := s.execHook(tx, `DELETE FROM user_prompts WHERE id = ?`, id)
 		if err != nil {
@@ -1359,7 +1096,7 @@ func (s *Store) DeletePrompt(id int64) error {
 
 // ─── Get Single Observation ──────────────────────────────────────────────────
 
-func (s *Store) GetObservation(id int64) (*Observation, error) {
+func (s *SQLiteStore) GetObservation(id int64) (*Observation, error) {
 	row := s.db.QueryRow(
 		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
 		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
@@ -1376,7 +1113,7 @@ func (s *Store) GetObservation(id int64) (*Observation, error) {
 	return &o, nil
 }
 
-func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observation, error) {
+func (s *SQLiteStore) UpdateObservation(id int64, p UpdateObservationParams) (*Observation, error) {
 	var updated *Observation
 	err := s.withTx(func(tx *sql.Tx) error {
 		obs, err := s.getObservationTx(tx, id)
@@ -1449,7 +1186,7 @@ func (s *Store) UpdateObservation(id int64, p UpdateObservationParams) (*Observa
 	return updated, nil
 }
 
-func (s *Store) DeleteObservation(id int64, hardDelete bool) error {
+func (s *SQLiteStore) DeleteObservation(id int64, hardDelete bool) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		obs, err := s.getObservationTx(tx, id)
 		if err == sql.ErrNoRows {
@@ -1496,7 +1233,7 @@ func (s *Store) DeleteObservation(id int64, hardDelete bool) error {
 // from claude-mem — agents first search, then use timeline to drill into
 // the chronological neighborhood of a result.
 
-func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResult, error) {
+func (s *SQLiteStore) Timeline(observationID int64, before, after int) (*TimelineResult, error) {
 	if before <= 0 {
 		before = 5
 	}
@@ -1598,7 +1335,7 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 
 // ─── Search (FTS5) ───────────────────────────────────────────────────────────
 
-func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error) {
+func (s *SQLiteStore) Search(query string, opts SearchOptions) ([]SearchResult, error) {
 	// Normalize project filter so "Engram" finds records stored as "engram"
 	opts.Project, _ = NormalizeProject(opts.Project)
 
@@ -1746,7 +1483,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
 
-func (s *Store) Stats() (*Stats, error) {
+func (s *SQLiteStore) Stats() (*Stats, error) {
 	stats := &Stats{}
 
 	s.db.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&stats.TotalSessions)
@@ -1771,7 +1508,7 @@ func (s *Store) Stats() (*Stats, error) {
 
 // ─── Context Formatting ─────────────────────────────────────────────────────
 
-func (s *Store) FormatContext(project, scope string) (string, error) {
+func (s *SQLiteStore) FormatContext(project, scope string) (string, error) {
 	sessions, err := s.RecentSessions(project, 5)
 	if err != nil {
 		return "", err
@@ -1829,7 +1566,7 @@ func (s *Store) FormatContext(project, scope string) (string, error) {
 
 // ─── Export / Import ─────────────────────────────────────────────────────────
 
-func (s *Store) Export() (*ExportData, error) {
+func (s *SQLiteStore) Export() (*ExportData, error) {
 	data := &ExportData{
 		Version:    "0.1.0",
 		ExportedAt: Now(),
@@ -1901,7 +1638,7 @@ func (s *Store) Export() (*ExportData, error) {
 	return data, nil
 }
 
-func (s *Store) Import(data *ExportData) (*ImportResult, error) {
+func (s *SQLiteStore) Import(data *ExportData) (*ImportResult, error) {
 	tx, err := s.beginTxHook()
 	if err != nil {
 		return nil, fmt.Errorf("import: begin tx: %w", err)
@@ -1972,16 +1709,10 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 	return result, nil
 }
 
-type ImportResult struct {
-	SessionsImported     int `json:"sessions_imported"`
-	ObservationsImported int `json:"observations_imported"`
-	PromptsImported      int `json:"prompts_imported"`
-}
-
 // ─── Sync Chunk Tracking ─────────────────────────────────────────────────────
 
 // GetSyncedChunks returns a set of chunk IDs that have been imported/exported.
-func (s *Store) GetSyncedChunks() (map[string]bool, error) {
+func (s *SQLiteStore) GetSyncedChunks() (map[string]bool, error) {
 	rows, err := s.queryItHook(s.db, "SELECT chunk_id FROM sync_chunks")
 	if err != nil {
 		return nil, fmt.Errorf("get synced chunks: %w", err)
@@ -2000,7 +1731,7 @@ func (s *Store) GetSyncedChunks() (map[string]bool, error) {
 }
 
 // RecordSyncedChunk marks a chunk as imported/exported so it won't be processed again.
-func (s *Store) RecordSyncedChunk(chunkID string) error {
+func (s *SQLiteStore) RecordSyncedChunk(chunkID string) error {
 	_, err := s.execHook(s.db,
 		"INSERT OR IGNORE INTO sync_chunks (chunk_id) VALUES (?)",
 		chunkID,
@@ -2010,7 +1741,7 @@ func (s *Store) RecordSyncedChunk(chunkID string) error {
 
 // ─── Local Sync State & Mutation Journal ─────────────────────────────────────
 
-func (s *Store) GetSyncState(targetKey string) (*SyncState, error) {
+func (s *SQLiteStore) GetSyncState(targetKey string) (*SyncState, error) {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	if err := s.ensureSyncState(targetKey); err != nil {
 		return nil, err
@@ -2018,7 +1749,7 @@ func (s *Store) GetSyncState(targetKey string) (*SyncState, error) {
 	return s.getSyncState(targetKey)
 }
 
-func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMutation, error) {
+func (s *SQLiteStore) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMutation, error) {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	if limit <= 0 {
 		limit = 100
@@ -2052,7 +1783,7 @@ func (s *Store) ListPendingSyncMutations(targetKey string, limit int) ([]SyncMut
 // SkipAckNonEnrolledMutations acks (marks as skipped) all pending mutations
 // that belong to non-enrolled projects, preventing journal bloat. Empty-project
 // mutations are never skipped — they always sync regardless of enrollment.
-func (s *Store) SkipAckNonEnrolledMutations(targetKey string) (int64, error) {
+func (s *SQLiteStore) SkipAckNonEnrolledMutations(targetKey string) (int64, error) {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	res, err := s.execHook(s.db, `
 		UPDATE sync_mutations
@@ -2069,7 +1800,7 @@ func (s *Store) SkipAckNonEnrolledMutations(targetKey string) (int64, error) {
 	return res.RowsAffected()
 }
 
-func (s *Store) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
+func (s *SQLiteStore) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
 	if lastAckedSeq <= 0 {
 		return nil
 	}
@@ -2105,7 +1836,7 @@ func (s *Store) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
 
 // AckSyncMutationSeqs acknowledges specific mutation sequence numbers without
 // requiring them to be contiguous.
-func (s *Store) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
+func (s *SQLiteStore) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
 	if len(seqs) == 0 {
 		return nil
 	}
@@ -2146,7 +1877,7 @@ func (s *Store) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
 	})
 }
 
-func (s *Store) AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error) {
+func (s *SQLiteStore) AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error) {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	if ttl <= 0 {
 		ttl = time.Minute
@@ -2183,7 +1914,7 @@ func (s *Store) AcquireSyncLease(targetKey, owner string, ttl time.Duration, now
 	return acquired, err
 }
 
-func (s *Store) ReleaseSyncLease(targetKey, owner string) error {
+func (s *SQLiteStore) ReleaseSyncLease(targetKey, owner string) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	_, err := s.execHook(s.db,
 		`UPDATE sync_state
@@ -2194,7 +1925,7 @@ func (s *Store) ReleaseSyncLease(targetKey, owner string) error {
 	return err
 }
 
-func (s *Store) MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error {
+func (s *SQLiteStore) MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	backoff := backoffUntil.UTC().Format(time.RFC3339)
 	return s.withTx(func(tx *sql.Tx) error {
@@ -2212,7 +1943,7 @@ func (s *Store) MarkSyncFailure(targetKey, message string, backoffUntil time.Tim
 	})
 }
 
-func (s *Store) MarkSyncHealthy(targetKey string) error {
+func (s *SQLiteStore) MarkSyncHealthy(targetKey string) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	_, err := s.execHook(s.db,
 		`UPDATE sync_state
@@ -2223,7 +1954,7 @@ func (s *Store) MarkSyncHealthy(targetKey string) error {
 	return err
 }
 
-func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) error {
+func (s *SQLiteStore) ApplyPulledMutation(targetKey string, mutation SyncMutation) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	return s.withTx(func(tx *sql.Tx) error {
 		state, err := s.getSyncStateTx(tx, targetKey)
@@ -2279,7 +2010,7 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 	})
 }
 
-func (s *Store) GetObservationBySyncID(syncID string) (*Observation, error) {
+func (s *SQLiteStore) GetObservationBySyncID(syncID string) (*Observation, error) {
 	row := s.db.QueryRow(
 		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
 		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
@@ -2297,7 +2028,7 @@ func (s *Store) GetObservationBySyncID(syncID string) (*Observation, error) {
 
 // EnrollProject registers a project for cloud sync. Idempotent — re-enrolling
 // an already-enrolled project is a no-op.
-func (s *Store) EnrollProject(project string) error {
+func (s *SQLiteStore) EnrollProject(project string) error {
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -2322,7 +2053,7 @@ func (s *Store) EnrollProject(project string) error {
 
 // UnenrollProject removes a project from cloud sync enrollment. Idempotent —
 // unenrolling a non-enrolled project is a no-op.
-func (s *Store) UnenrollProject(project string) error {
+func (s *SQLiteStore) UnenrollProject(project string) error {
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -2335,7 +2066,7 @@ func (s *Store) UnenrollProject(project string) error {
 
 // ListEnrolledProjects returns all projects currently enrolled for cloud sync,
 // ordered alphabetically by project name.
-func (s *Store) ListEnrolledProjects() ([]EnrolledProject, error) {
+func (s *SQLiteStore) ListEnrolledProjects() ([]EnrolledProject, error) {
 	rows, err := s.queryItHook(s.db,
 		`SELECT project, enrolled_at FROM sync_enrolled_projects ORDER BY project ASC`)
 	if err != nil {
@@ -2355,7 +2086,7 @@ func (s *Store) ListEnrolledProjects() ([]EnrolledProject, error) {
 }
 
 // IsProjectEnrolled returns true if the given project is enrolled for cloud sync.
-func (s *Store) IsProjectEnrolled(project string) (bool, error) {
+func (s *SQLiteStore) IsProjectEnrolled(project string) (bool, error) {
 	var exists int
 	err := s.db.QueryRow(
 		`SELECT 1 FROM sync_enrolled_projects WHERE project = ? LIMIT 1`,
@@ -2372,14 +2103,7 @@ func (s *Store) IsProjectEnrolled(project string) (bool, error) {
 
 // ─── Project Migration ───────────────────────────────────────────────────────
 
-type MigrateResult struct {
-	Migrated            bool  `json:"migrated"`
-	ObservationsUpdated int64 `json:"observations_updated"`
-	SessionsUpdated     int64 `json:"sessions_updated"`
-	PromptsUpdated      int64 `json:"prompts_updated"`
-}
-
-func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) {
+func (s *SQLiteStore) MigrateProject(oldName, newName string) (*MigrateResult, error) {
 	if oldName == "" || newName == "" || oldName == newName {
 		return &MigrateResult{}, nil
 	}
@@ -2445,7 +2169,7 @@ type ProjectNameCount struct {
 
 // ListProjectNames returns all distinct project names from observations,
 // ordered alphabetically. Used for fuzzy matching and consolidation.
-func (s *Store) ListProjectNames() ([]string, error) {
+func (s *SQLiteStore) ListProjectNames() ([]string, error) {
 	rows, err := s.queryItHook(s.db,
 		`SELECT DISTINCT project FROM observations
 		 WHERE project IS NOT NULL AND project != '' AND deleted_at IS NULL
@@ -2467,20 +2191,9 @@ func (s *Store) ListProjectNames() ([]string, error) {
 	return results, rows.Err()
 }
 
-// ProjectDetailStats holds aggregate statistics for a single project including
-// session and prompt counts. Used by ListProjectsWithStats and the consolidate CLI.
-type ProjectDetailStats struct {
-	Name             string   `json:"name"`
-	ObservationCount int      `json:"observation_count"`
-	SessionCount     int      `json:"session_count"`
-	PromptCount      int      `json:"prompt_count"`
-	Directories      []string `json:"directories"` // unique directories from sessions
-	Deprecated       bool     `json:"deprecated,omitempty"`
-}
-
 // ListProjectsWithStats returns all projects with aggregated counts.
 // Ordered by observation count descending.
-func (s *Store) ListProjectsWithStats() ([]ProjectDetailStats, error) {
+func (s *SQLiteStore) ListProjectsWithStats() ([]ProjectDetailStats, error) {
 	// Observation counts per project
 	obsRows, err := s.queryItHook(s.db,
 		`SELECT project, COUNT(*) as cnt
@@ -2613,7 +2326,7 @@ func (s *Store) ListProjectsWithStats() ([]ProjectDetailStats, error) {
 // CountObservationsForProject returns the number of non-deleted observations
 // for the given project name. Used by handleSave for the similar-project
 // warning instead of the heavier ListProjectsWithStats.
-func (s *Store) CountObservationsForProject(name string) (int, error) {
+func (s *SQLiteStore) CountObservationsForProject(name string) (int, error) {
 	var count int
 	err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM observations WHERE project = ? AND deleted_at IS NULL`,
@@ -2622,21 +2335,11 @@ func (s *Store) CountObservationsForProject(name string) (int, error) {
 	return count, err
 }
 
-// MergeResult summarizes the result of merging multiple project name variants
-// into a single canonical project name.
-type MergeResult struct {
-	Canonical           string   `json:"canonical"`
-	SourcesMerged       []string `json:"sources_merged"`
-	ObservationsUpdated int64    `json:"observations_updated"`
-	SessionsUpdated     int64    `json:"sessions_updated"`
-	PromptsUpdated      int64    `json:"prompts_updated"`
-}
-
 // MergeProjects migrates all records from each source project name into the
 // canonical name. Sources that equal the canonical (after normalization) or
 // have no records are silently skipped — the operation is idempotent.
 // All updates are performed inside a single transaction for atomicity.
-func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult, error) {
+func (s *SQLiteStore) MergeProjects(sources []string, canonical string) (*MergeResult, error) {
 	canonical, _ = NormalizeProject(canonical)
 	if canonical == "" {
 		return nil, fmt.Errorf("canonical project name must not be empty")
@@ -2687,17 +2390,10 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 
 // ─── Project Pruning ─────────────────────────────────────────────────────────
 
-// PruneResult holds the outcome of pruning a single project.
-type PruneResult struct {
-	Project         string `json:"project"`
-	SessionsDeleted int64  `json:"sessions_deleted"`
-	PromptsDeleted  int64  `json:"prompts_deleted"`
-}
-
 // PruneProject removes all sessions and prompts for a project that has zero
 // (non-deleted) observations. Returns an error if the project still has
 // observations — the caller must verify first.
-func (s *Store) PruneProject(project string) (*PruneResult, error) {
+func (s *SQLiteStore) PruneProject(project string) (*PruneResult, error) {
 	if project == "" {
 		return nil, fmt.Errorf("project name must not be empty")
 	}
@@ -2737,7 +2433,7 @@ func (s *Store) PruneProject(project string) (*PruneResult, error) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-func (s *Store) withTx(fn func(tx *sql.Tx) error) error {
+func (s *SQLiteStore) withTx(fn func(tx *sql.Tx) error) error {
 	tx, err := s.beginTxHook()
 	if err != nil {
 		return err
@@ -2749,7 +2445,7 @@ func (s *Store) withTx(fn func(tx *sql.Tx) error) error {
 	return s.commitHook(tx)
 }
 
-func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory string) error {
+func (s *SQLiteStore) createSessionTx(tx *sql.Tx, id, project, directory string) error {
 	_, err := s.execHook(tx,
 		`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
@@ -2760,7 +2456,7 @@ func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory string) error
 	return err
 }
 
-func (s *Store) ensureSyncState(targetKey string) error {
+func (s *SQLiteStore) ensureSyncState(targetKey string) error {
 	_, err := s.execHook(s.db,
 		`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
 		targetKey, SyncLifecycleIdle,
@@ -2768,7 +2464,7 @@ func (s *Store) ensureSyncState(targetKey string) error {
 	return err
 }
 
-func (s *Store) getSyncState(targetKey string) (*SyncState, error) {
+func (s *SQLiteStore) getSyncState(targetKey string) (*SyncState, error) {
 	row := s.db.QueryRow(`
 		SELECT target_key, lifecycle, last_enqueued_seq, last_acked_seq, last_pulled_seq,
 		       consecutive_failures, backoff_until, lease_owner, lease_until, last_error, updated_at
@@ -2780,7 +2476,7 @@ func (s *Store) getSyncState(targetKey string) (*SyncState, error) {
 	return &state, nil
 }
 
-func (s *Store) getSyncStateTx(tx *sql.Tx, targetKey string) (*SyncState, error) {
+func (s *SQLiteStore) getSyncStateTx(tx *sql.Tx, targetKey string) (*SyncState, error) {
 	if _, err := s.execHook(tx,
 		`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
 		targetKey, SyncLifecycleIdle,
@@ -2798,7 +2494,7 @@ func (s *Store) getSyncStateTx(tx *sql.Tx, targetKey string) (*SyncState, error)
 	return &state, nil
 }
 
-func (s *Store) backfillProjectSyncMutationsTx(tx *sql.Tx, project string) error {
+func (s *SQLiteStore) backfillProjectSyncMutationsTx(tx *sql.Tx, project string) error {
 	if err := s.backfillSessionSyncMutationsTx(tx, project); err != nil {
 		return err
 	}
@@ -2808,7 +2504,7 @@ func (s *Store) backfillProjectSyncMutationsTx(tx *sql.Tx, project string) error
 	return s.backfillPromptSyncMutationsTx(tx, project)
 }
 
-func (s *Store) repairEnrolledProjectSyncMutations() error {
+func (s *SQLiteStore) repairEnrolledProjectSyncMutations() error {
 	return s.withTx(func(tx *sql.Tx) error {
 		rows, err := s.queryItHook(tx,
 			`SELECT project FROM sync_enrolled_projects ORDER BY project ASC`,
@@ -2839,7 +2535,7 @@ func (s *Store) repairEnrolledProjectSyncMutations() error {
 	})
 }
 
-func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error {
+func (s *SQLiteStore) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error {
 	rows, err := s.queryItHook(tx, `
 		SELECT id, project, directory, ended_at, summary
 		FROM sessions
@@ -2872,7 +2568,7 @@ func (s *Store) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error
 	return rows.Err()
 }
 
-func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) error {
+func (s *SQLiteStore) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) error {
 	rows, err := s.queryItHook(tx, `
 		SELECT sync_id, session_id, type, title, content, tool_name, project, scope, topic_key
 		FROM observations
@@ -2906,7 +2602,7 @@ func (s *Store) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) e
 	return rows.Err()
 }
 
-func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error {
+func (s *SQLiteStore) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error {
 	rows, err := s.queryItHook(tx, `
 		SELECT sync_id, session_id, content, project
 		FROM user_prompts
@@ -2939,7 +2635,7 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error 
 	return rows.Err()
 }
 
-func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, payload any) error {
+func (s *SQLiteStore) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, payload any) error {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -2972,55 +2668,7 @@ func (s *Store) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, 
 	return err
 }
 
-// extractProjectFromPayload returns the project string from a sync payload struct.
-// It handles both string and *string Project fields across all entity payload types.
-// Returns empty string if the payload has no project or project is nil.
-func extractProjectFromPayload(payload any) string {
-	switch p := payload.(type) {
-	case syncSessionPayload:
-		return p.Project
-	case syncObservationPayload:
-		if p.Project != nil {
-			return *p.Project
-		}
-		return ""
-	case syncPromptPayload:
-		if p.Project != nil {
-			return *p.Project
-		}
-		return ""
-	default:
-		// Fallback: marshal to JSON and extract $.project via json.Unmarshal.
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return ""
-		}
-		var generic struct {
-			Project *string `json:"project"`
-		}
-		if err := json.Unmarshal(data, &generic); err != nil || generic.Project == nil {
-			return ""
-		}
-		return *generic.Project
-	}
-}
-
-func decodeSyncPayload(payload []byte, dest any) error {
-	trimmed := strings.TrimSpace(string(payload))
-	if trimmed == "" {
-		return fmt.Errorf("empty payload")
-	}
-	if trimmed[0] != '"' {
-		return json.Unmarshal([]byte(trimmed), dest)
-	}
-	var encoded string
-	if err := json.Unmarshal([]byte(trimmed), &encoded); err != nil {
-		return err
-	}
-	return json.Unmarshal([]byte(encoded), dest)
-}
-
-func (s *Store) getObservationTx(tx *sql.Tx, id int64) (*Observation, error) {
+func (s *SQLiteStore) getObservationTx(tx *sql.Tx, id int64) (*Observation, error) {
 	row := tx.QueryRow(
 		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
 		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
@@ -3033,7 +2681,7 @@ func (s *Store) getObservationTx(tx *sql.Tx, id int64) (*Observation, error) {
 	return &o, nil
 }
 
-func (s *Store) getObservationBySyncIDTx(tx *sql.Tx, syncID string, includeDeleted bool) (*Observation, error) {
+func (s *SQLiteStore) getObservationBySyncIDTx(tx *sql.Tx, syncID string, includeDeleted bool) (*Observation, error) {
 	query := `SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
 		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
 		 FROM observations WHERE sync_id = ?`
@@ -3049,21 +2697,7 @@ func (s *Store) getObservationBySyncIDTx(tx *sql.Tx, syncID string, includeDelet
 	return &o, nil
 }
 
-func observationPayloadFromObservation(obs *Observation) syncObservationPayload {
-	return syncObservationPayload{
-		SyncID:    obs.SyncID,
-		SessionID: obs.SessionID,
-		Type:      obs.Type,
-		Title:     obs.Title,
-		Content:   obs.Content,
-		ToolName:  obs.ToolName,
-		Project:   obs.Project,
-		Scope:     obs.Scope,
-		TopicKey:  obs.TopicKey,
-	}
-}
-
-func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) error {
+func (s *SQLiteStore) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) error {
 	_, err := s.execHook(tx,
 		`INSERT INTO sessions (id, project, directory, ended_at, summary)
 		 VALUES (?, ?, ?, ?, ?)
@@ -3077,7 +2711,7 @@ func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) er
 	return err
 }
 
-func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayload) error {
+func (s *SQLiteStore) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayload) error {
 	existing, err := s.getObservationBySyncIDTx(tx, payload.SyncID, true)
 	if err == sql.ErrNoRows {
 		_, err = s.execHook(tx,
@@ -3099,7 +2733,7 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 	return err
 }
 
-func (s *Store) applyObservationDeleteTx(tx *sql.Tx, payload syncObservationPayload) error {
+func (s *SQLiteStore) applyObservationDeleteTx(tx *sql.Tx, payload syncObservationPayload) error {
 	existing, err := s.getObservationBySyncIDTx(tx, payload.SyncID, true)
 	if err == sql.ErrNoRows {
 		return nil
@@ -3123,7 +2757,7 @@ func (s *Store) applyObservationDeleteTx(tx *sql.Tx, payload syncObservationPayl
 	return err
 }
 
-func (s *Store) applyPromptUpsertTx(tx *sql.Tx, payload syncPromptPayload) error {
+func (s *SQLiteStore) applyPromptUpsertTx(tx *sql.Tx, payload syncPromptPayload) error {
 	var existingID int64
 	err := tx.QueryRow(`SELECT id FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`, payload.SyncID).Scan(&existingID)
 	if err == sql.ErrNoRows {
@@ -3143,7 +2777,7 @@ func (s *Store) applyPromptUpsertTx(tx *sql.Tx, payload syncPromptPayload) error
 	return err
 }
 
-func (s *Store) queryObservations(query string, args ...any) ([]Observation, error) {
+func (s *SQLiteStore) queryObservations(query string, args ...any) ([]Observation, error) {
 	rows, err := s.queryItHook(s.db, query, args...)
 	if err != nil {
 		return nil, err
@@ -3165,7 +2799,7 @@ func (s *Store) queryObservations(query string, args ...any) ([]Observation, err
 	return results, rows.Err()
 }
 
-func (s *Store) addColumnIfNotExists(tableName, columnName, definition string) error {
+func (s *SQLiteStore) addColumnIfNotExists(tableName, columnName, definition string) error {
 	rows, err := s.queryItHook(s.db, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
 		return err
@@ -3193,7 +2827,7 @@ func (s *Store) addColumnIfNotExists(tableName, columnName, definition string) e
 	return err
 }
 
-func (s *Store) migrateLegacyObservationsTable() error {
+func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 	rows, err := s.queryItHook(s.db, "PRAGMA table_info(observations)")
 	if err != nil {
 		return err
@@ -3328,183 +2962,6 @@ func (s *Store) migrateLegacyObservationsTable() error {
 	return nil
 }
 
-func nullableString(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
-}
-
-func truncate(s string, max int) string {
-	runes := []rune(s)
-	if len(runes) <= max {
-		return s
-	}
-	return string(runes[:max]) + "..."
-}
-
-func normalizeScope(scope string) string {
-	v := strings.TrimSpace(strings.ToLower(scope))
-	if v == "personal" {
-		return "personal"
-	}
-	return "project"
-}
-
-// NormalizeProject applies canonical project name normalization:
-// lowercase + trim whitespace + collapse consecutive hyphens/underscores.
-// Returns the normalized name and a warning message if the name was changed
-// (empty string if no change was needed).
-// Exported so MCP and CLI handlers can surface the warning to users.
-func NormalizeProject(project string) (normalized string, warning string) {
-	if project == "" {
-		return "", ""
-	}
-	n := strings.TrimSpace(strings.ToLower(project))
-	// Collapse multiple consecutive hyphens
-	for strings.Contains(n, "--") {
-		n = strings.ReplaceAll(n, "--", "-")
-	}
-	// Collapse multiple consecutive underscores
-	for strings.Contains(n, "__") {
-		n = strings.ReplaceAll(n, "__", "_")
-	}
-	if n == project {
-		return n, ""
-	}
-	return n, fmt.Sprintf("⚠️ Project name normalized: %q → %q", project, n)
-}
-
-// SuggestTopicKey generates a stable topic key suggestion from type/title/content.
-// It infers a topic family (e.g. architecture/*, bug/*) and then appends
-// a normalized segment from title/content for stable cross-session keys.
-func SuggestTopicKey(typ, title, content string) string {
-	family := inferTopicFamily(typ, title, content)
-	cleanTitle := stripPrivateTags(title)
-	segment := normalizeTopicSegment(cleanTitle)
-
-	if segment == "" {
-		cleanContent := stripPrivateTags(content)
-		words := strings.Fields(strings.ToLower(cleanContent))
-		if len(words) > 8 {
-			words = words[:8]
-		}
-		segment = normalizeTopicSegment(strings.Join(words, " "))
-	}
-
-	if segment == "" {
-		segment = "general"
-	}
-
-	if strings.HasPrefix(segment, family+"-") {
-		segment = strings.TrimPrefix(segment, family+"-")
-	}
-	if segment == "" || segment == family {
-		segment = "general"
-	}
-
-	return family + "/" + segment
-}
-
-func inferTopicFamily(typ, title, content string) string {
-	t := strings.TrimSpace(strings.ToLower(typ))
-	switch t {
-	case "architecture", "design", "adr", "refactor":
-		return "architecture"
-	case "bug", "bugfix", "fix", "incident", "hotfix":
-		return "bug"
-	case "decision":
-		return "decision"
-	case "pattern", "convention", "guideline":
-		return "pattern"
-	case "config", "setup", "infra", "infrastructure", "ci":
-		return "config"
-	case "discovery", "investigation", "root_cause", "root-cause":
-		return "discovery"
-	case "learning", "learn":
-		return "learning"
-	case "session_summary":
-		return "session"
-	}
-
-	text := strings.ToLower(title + " " + content)
-	if hasAny(text, "bug", "fix", "panic", "error", "crash", "regression", "incident", "hotfix") {
-		return "bug"
-	}
-	if hasAny(text, "architecture", "design", "adr", "boundary", "hexagonal", "refactor") {
-		return "architecture"
-	}
-	if hasAny(text, "decision", "tradeoff", "chose", "choose", "decide") {
-		return "decision"
-	}
-	if hasAny(text, "pattern", "convention", "naming", "guideline") {
-		return "pattern"
-	}
-	if hasAny(text, "config", "setup", "environment", "env", "docker", "pipeline") {
-		return "config"
-	}
-	if hasAny(text, "discovery", "investigate", "investigation", "found", "root cause") {
-		return "discovery"
-	}
-	if hasAny(text, "learned", "learning") {
-		return "learning"
-	}
-
-	if t != "" && t != "manual" {
-		return normalizeTopicSegment(t)
-	}
-
-	return "topic"
-}
-
-func hasAny(text string, words ...string) bool {
-	for _, w := range words {
-		if strings.Contains(text, w) {
-			return true
-		}
-	}
-	return false
-}
-
-func normalizeTopicSegment(s string) string {
-	v := strings.ToLower(strings.TrimSpace(s))
-	if v == "" {
-		return ""
-	}
-	re := regexp.MustCompile(`[^a-z0-9]+`)
-	v = re.ReplaceAllString(v, " ")
-	v = strings.Join(strings.Fields(v), "-")
-	if len(v) > 100 {
-		v = v[:100]
-	}
-	return v
-}
-
-func normalizeTopicKey(topic string) string {
-	v := strings.TrimSpace(strings.ToLower(topic))
-	if v == "" {
-		return ""
-	}
-	v = strings.Join(strings.Fields(v), "-")
-	if len(v) > 120 {
-		v = v[:120]
-	}
-	return v
-}
-
-func derefString(v *string) string {
-	if v == nil {
-		return ""
-	}
-	return *v
-}
-
-func hashNormalized(content string) string {
-	normalized := strings.ToLower(strings.Join(strings.Fields(content), " "))
-	h := sha256.Sum256([]byte(normalized))
-	return hex.EncodeToString(h[:])
-}
-
 func dedupeWindowExpression(window time.Duration) string {
 	if window <= 0 {
 		window = 15 * time.Minute
@@ -3516,151 +2973,9 @@ func dedupeWindowExpression(window time.Duration) string {
 	return "-" + strconv.Itoa(minutes) + " minutes"
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func normalizeSyncTargetKey(targetKey string) string {
-	if strings.TrimSpace(targetKey) == "" {
-		return DefaultSyncTargetKey
-	}
-	return strings.TrimSpace(strings.ToLower(targetKey))
-}
-
-func newSyncID(prefix string) string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%s-%d", prefix, time.Now().UTC().UnixNano())
-	}
-	return prefix + "-" + hex.EncodeToString(b)
-}
-
-func normalizeExistingSyncID(existing, prefix string) string {
-	if strings.TrimSpace(existing) != "" {
-		return existing
-	}
-	return newSyncID(prefix)
-}
-
-// privateTagRegex matches <private>...</private> tags and their contents.
-// Supports multiline and nested content. Case-insensitive.
-var privateTagRegex = regexp.MustCompile(`(?is)<private>.*?</private>`)
-
-// stripPrivateTags removes all <private>...</private> content from a string.
-// This ensures sensitive information (API keys, passwords, personal data)
-// is never persisted to the memory database.
-func stripPrivateTags(s string) string {
-	result := privateTagRegex.ReplaceAllString(s, "[REDACTED]")
-	// Clean up multiple consecutive [REDACTED] and excessive whitespace
-	result = strings.TrimSpace(result)
-	return result
-}
-
-// sanitizeFTS wraps each word in quotes so FTS5 doesn't choke on special chars.
-// "fix auth bug" → `"fix" "auth" "bug"`
-func sanitizeFTS(query string) string {
-	words := strings.Fields(query)
-	for i, w := range words {
-		// Strip existing quotes to avoid double-quoting
-		w = strings.Trim(w, `"`)
-		words[i] = `"` + w + `"`
-	}
-	return strings.Join(words, " ")
-}
-
-// ─── Passive Capture ─────────────────────────────────────────────────────────
-
-// PassiveCaptureParams holds the input for passive memory capture.
-type PassiveCaptureParams struct {
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-	Source    string `json:"source,omitempty"` // e.g. "subagent-stop", "session-end"
-}
-
-// PassiveCaptureResult holds the output of passive memory capture.
-type PassiveCaptureResult struct {
-	Extracted  int `json:"extracted"`  // Total learnings found in text
-	Saved      int `json:"saved"`      // New observations created
-	Duplicates int `json:"duplicates"` // Skipped because already existed
-}
-
-// learningHeaderPattern matches section headers for learnings in both English and Spanish.
-var learningHeaderPattern = regexp.MustCompile(
-	`(?im)^#{2,3}\s+(?:Aprendizajes(?:\s+Clave)?|Key\s+Learnings?|Learnings?):?\s*$`,
-)
-
-const (
-	minLearningLength = 20
-	minLearningWords  = 4
-)
-
-// ExtractLearnings parses structured learning items from text.
-// It looks for sections like "## Key Learnings:" or "## Aprendizajes Clave:"
-// and extracts numbered (1. text) or bullet (- text) items.
-// Returns learnings from the LAST matching section (most recent output).
-func ExtractLearnings(text string) []string {
-	matches := learningHeaderPattern.FindAllStringIndex(text, -1)
-	if len(matches) == 0 {
-		return nil
-	}
-
-	// Process sections in reverse — use first valid one (most recent)
-	for i := len(matches) - 1; i >= 0; i-- {
-		sectionStart := matches[i][1]
-		sectionText := text[sectionStart:]
-
-		// Cut off at next major section header
-		if nextHeader := regexp.MustCompile(`\n#{1,3} `).FindStringIndex(sectionText); nextHeader != nil {
-			sectionText = sectionText[:nextHeader[0]]
-		}
-
-		var learnings []string
-
-		// Try numbered items: "1. text" or "1) text"
-		numbered := regexp.MustCompile(`(?m)^\s*\d+[.)]\s+(.+)`).FindAllStringSubmatch(sectionText, -1)
-		if len(numbered) > 0 {
-			for _, m := range numbered {
-				cleaned := cleanMarkdown(m[1])
-				if len(cleaned) >= minLearningLength && len(strings.Fields(cleaned)) >= minLearningWords {
-					learnings = append(learnings, cleaned)
-				}
-			}
-		}
-
-		// Fall back to bullet items: "- text" or "* text"
-		if len(learnings) == 0 {
-			bullets := regexp.MustCompile(`(?m)^\s*[-*]\s+(.+)`).FindAllStringSubmatch(sectionText, -1)
-			for _, m := range bullets {
-				cleaned := cleanMarkdown(m[1])
-				if len(cleaned) >= minLearningLength && len(strings.Fields(cleaned)) >= minLearningWords {
-					learnings = append(learnings, cleaned)
-				}
-			}
-		}
-
-		if len(learnings) > 0 {
-			return learnings
-		}
-	}
-
-	return nil
-}
-
-// cleanMarkdown strips basic markdown formatting and collapses whitespace.
-func cleanMarkdown(text string) string {
-	text = regexp.MustCompile(`\*\*([^*]+)\*\*`).ReplaceAllString(text, "$1") // bold
-	text = regexp.MustCompile("`([^`]+)`").ReplaceAllString(text, "$1")       // inline code
-	text = regexp.MustCompile(`\*([^*]+)\*`).ReplaceAllString(text, "$1")     // italic
-	return strings.TrimSpace(strings.Join(strings.Fields(text), " "))
-}
-
 // PassiveCapture extracts learnings from text and saves them as observations.
 // It deduplicates against existing observations using content hash matching.
-func (s *Store) PassiveCapture(p PassiveCaptureParams) (*PassiveCaptureResult, error) {
+func (s *SQLiteStore) PassiveCapture(p PassiveCaptureParams) (*PassiveCaptureResult, error) {
 	// Normalize project name before storing
 	p.Project, _ = NormalizeProject(p.Project)
 
@@ -3716,27 +3031,6 @@ func (s *Store) PassiveCapture(p PassiveCaptureParams) (*PassiveCaptureResult, e
 	return result, nil
 }
 
-// ClassifyTool returns the observation type for a given tool name.
-func ClassifyTool(toolName string) string {
-	switch toolName {
-	case "write", "edit", "patch":
-		return "file_change"
-	case "bash":
-		return "command"
-	case "read", "view":
-		return "file_read"
-	case "grep", "glob", "ls":
-		return "search"
-	default:
-		return "tool_use"
-	}
-}
-
-// Now returns the current time formatted for SQLite.
-func Now() string {
-	return time.Now().UTC().Format("2006-01-02 15:04:05")
-}
-
 // resolveSinceSQLite converts a human-readable time filter to a UTC timestamp
 // string suitable for SQLite comparison.
 func resolveSinceSQLite(since string) string {
@@ -3769,7 +3063,7 @@ func resolveSinceSQLite(since string) string {
 // ListProjects returns all projects with observation counts, contributor counts,
 // and last activity date. SQLite backend.
 // When includeDeprecated is false, deprecated projects are excluded.
-func (s *Store) ListProjects(includeDeprecated bool) ([]ProjectStats, error) {
+func (s *SQLiteStore) ListProjects(includeDeprecated bool) ([]ProjectStats, error) {
 	includeInt := 0
 	if includeDeprecated {
 		includeInt = 1
@@ -3808,7 +3102,7 @@ func (s *Store) ListProjects(includeDeprecated bool) ([]ProjectStats, error) {
 
 // DeprecateProject marks a project as deprecated in project_metadata.
 // It upserts the row setting deprecated=1, deprecated_at=NOW(), deprecated_by=identity.
-func (s *Store) DeprecateProject(project, identity string) error {
+func (s *SQLiteStore) DeprecateProject(project, identity string) error {
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -3829,7 +3123,7 @@ func (s *Store) DeprecateProject(project, identity string) error {
 
 // ActivateProject removes the deprecated flag from a project.
 // If the row doesn't exist, this is a no-op (project is active by default).
-func (s *Store) ActivateProject(project string) error {
+func (s *SQLiteStore) ActivateProject(project string) error {
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -3848,7 +3142,7 @@ func (s *Store) ActivateProject(project string) error {
 }
 
 // IsProjectDeprecated returns true if the project exists in project_metadata with deprecated=1.
-func (s *Store) IsProjectDeprecated(project string) (bool, error) {
+func (s *SQLiteStore) IsProjectDeprecated(project string) (bool, error) {
 	if project == "" {
 		return false, nil
 	}
@@ -3867,7 +3161,7 @@ func (s *Store) IsProjectDeprecated(project string) (bool, error) {
 
 // PromoteObservation changes an observation's scope from 'personal' to 'project'.
 // It validates that the observation exists, is personal, and is owned by identity.
-func (s *Store) PromoteObservation(id int64, identity string) error {
+func (s *SQLiteStore) PromoteObservation(id int64, identity string) error {
 	result, err := s.db.Exec(
 		`UPDATE observations
 		 SET scope = 'project', updated_at = datetime('now'), revision_count = revision_count + 1
@@ -3889,7 +3183,7 @@ func (s *Store) PromoteObservation(id int64, identity string) error {
 
 // ListContributors returns contributor activity stats from observations and prompts.
 // SQLite stub — does not have per-row created_by in all builds, returns empty.
-func (s *Store) ListContributors(project string) ([]ContributorStats, error) {
+func (s *SQLiteStore) ListContributors(project string) ([]ContributorStats, error) {
 	obsQuery := `
 		SELECT COALESCE(created_by, '') as identity,
 		       COUNT(*) AS obs_count,
@@ -3947,3 +3241,7 @@ func (s *Store) ListContributors(project string) ([]ContributorStats, error) {
 
 	return results, nil
 }
+
+// Compile-time assertion that *SQLiteStore satisfies the Store interface.
+var _ Store = (*SQLiteStore)(nil)
+

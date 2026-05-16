@@ -15,7 +15,7 @@ import (
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
-func newTestStore(t *testing.T) *store.Store {
+func newTestStore(t *testing.T) store.Store {
 	t.Helper()
 	cfg, err := store.DefaultConfig()
 	if err != nil {
@@ -33,7 +33,7 @@ func newTestStore(t *testing.T) *store.Store {
 	return s
 }
 
-func seedStoreForSync(t *testing.T, s *store.Store) {
+func seedStoreForSync(t *testing.T, s store.Store) {
 	t.Helper()
 
 	if err := s.CreateSession("s-proj", "proj-a", "/tmp/proj-a"); err != nil {
@@ -294,7 +294,7 @@ func TestExportErrors(t *testing.T) {
 		s := newTestStore(t)
 		sy := New(s, t.TempDir())
 
-		storeExportData = func(_ *store.Store) (*store.ExportData, error) {
+		storeExportData = func(_ store.Store) (*store.ExportData, error) {
 			return nil, errors.New("boom export")
 		}
 
@@ -357,7 +357,7 @@ func TestExportErrors(t *testing.T) {
 		seedStoreForSync(t, s)
 		sy := New(s, t.TempDir())
 
-		storeRecordSynced = func(_ *store.Store, _ string) error {
+		storeRecordSynced = func(_ store.Store, _ string) error {
 			return errors.New("forced record failure")
 		}
 
@@ -514,7 +514,7 @@ func TestImportBranches(t *testing.T) {
 			t.Fatalf("write gzip chunk: %v", err)
 		}
 
-		storeRecordSynced = func(_ *store.Store, _ string) error {
+		storeRecordSynced = func(_ store.Store, _ string) error {
 			return errors.New("forced import record fail")
 		}
 

@@ -101,35 +101,35 @@ func stubRuntimeHooks(t *testing.T) {
 	oldCheckForUpdates := checkForUpdates
 
 	storeNew = store.New
-	newHTTPServer = func(s *store.Store, _ int) *engramsrv.Server { return engramsrv.New(s, 0) }
+	newHTTPServer = func(s store.Store, _ int) *engramsrv.Server { return engramsrv.New(s, 0) }
 	startHTTP = func(_ *engramsrv.Server) error { return nil }
-	newMCPServer = func(s *store.Store) *mcpserver.MCPServer {
+	newMCPServer = func(s store.Store) *mcpserver.MCPServer {
 		return mcpserver.NewMCPServer("test", "0", mcpserver.WithRecovery())
 	}
-	newMCPServerWithTools = func(s *store.Store, allowlist map[string]bool) *mcpserver.MCPServer {
+	newMCPServerWithTools = func(s store.Store, allowlist map[string]bool) *mcpserver.MCPServer {
 		return mcpserver.NewMCPServer("test", "0", mcpserver.WithRecovery())
 	}
 	serveMCP = func(_ *mcpserver.MCPServer, _ ...mcpserver.StdioOption) error { return nil }
-	newTUIModel = func(_ *store.Store) tui.Model { return tui.New(nil, "") }
+	newTUIModel = func(_ store.Store) tui.Model { return tui.New(nil, "") }
 	newTeaProgram = func(tea.Model, ...tea.ProgramOption) *tea.Program { return &tea.Program{} }
 	runTeaProgram = func(*tea.Program) (tea.Model, error) { return nil, nil }
 	setupSupportedAgents = setup.SupportedAgents
 	setupInstallAgent = setup.Install
 	scanInputLine = fmt.Scanln
-	storeSearch = func(s *store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, error) {
+	storeSearch = func(s store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, error) {
 		return s.Search(query, opts)
 	}
-	storeAddObservation = func(s *store.Store, p store.AddObservationParams) (int64, error) {
+	storeAddObservation = func(s store.Store, p store.AddObservationParams) (int64, error) {
 		return s.AddObservation(p)
 	}
-	storeTimeline = func(s *store.Store, observationID int64, before, after int) (*store.TimelineResult, error) {
+	storeTimeline = func(s store.Store, observationID int64, before, after int) (*store.TimelineResult, error) {
 		return s.Timeline(observationID, before, after)
 	}
-	storeFormatContext = func(s *store.Store, project, scope string) (string, error) {
+	storeFormatContext = func(s store.Store, project, scope string) (string, error) {
 		return s.FormatContext(project, scope)
 	}
-	storeStats = func(s *store.Store) (*store.Stats, error) { return s.Stats() }
-	storeExport = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
+	storeStats = func(s store.Store) (*store.Stats, error) { return s.Stats() }
+	storeExport = func(s store.Store) (*store.ExportData, error) { return s.Export() }
 	jsonMarshalIndent = json.MarshalIndent
 	syncStatus = func(sy *engramsync.Syncer) (localChunks int, remoteChunks int, pendingImport int, err error) {
 		return sy.Status()
@@ -220,7 +220,7 @@ func TestCmdServeParsesPortAndErrors(t *testing.T) {
 			withArgs(t, args...)
 
 			seenPort := -1
-			newHTTPServer = func(s *store.Store, port int) *engramsrv.Server {
+			newHTTPServer = func(s store.Store, port int) *engramsrv.Server {
 				seenPort = port
 				return engramsrv.New(s, 0)
 			}
@@ -418,7 +418,7 @@ func TestStoreInitFailurePaths(t *testing.T) {
 		t.Fatalf("write import file: %v", err)
 	}
 
-	storeNew = func(store.Config) (*store.Store, error) {
+	storeNew = func(store.Config) (store.Store, error) {
 		return nil, errors.New("store init failed")
 	}
 
@@ -801,7 +801,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 
 	t.Run("search seam error", func(t *testing.T) {
 		withArgs(t, "engram", "search", "needle")
-		storeSearch = func(*store.Store, string, store.SearchOptions) ([]store.SearchResult, error) {
+		storeSearch = func(store.Store, string, store.SearchOptions) ([]store.SearchResult, error) {
 			return nil, errors.New("forced search error")
 		}
 		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdSearch(cfg) })
@@ -810,7 +810,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 
 	t.Run("save seam error", func(t *testing.T) {
 		withArgs(t, "engram", "save", "title", "content")
-		storeAddObservation = func(*store.Store, store.AddObservationParams) (int64, error) {
+		storeAddObservation = func(store.Store, store.AddObservationParams) (int64, error) {
 			return 0, errors.New("forced save error")
 		}
 		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdSave(cfg) })
@@ -819,7 +819,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 
 	t.Run("timeline seam error", func(t *testing.T) {
 		withArgs(t, "engram", "timeline", "1")
-		storeTimeline = func(*store.Store, int64, int, int) (*store.TimelineResult, error) {
+		storeTimeline = func(store.Store, int64, int, int) (*store.TimelineResult, error) {
 			return nil, errors.New("forced timeline error")
 		}
 		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdTimeline(cfg) })
@@ -829,7 +829,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 	t.Run("timeline prints session summary", func(t *testing.T) {
 		summary := "this session has a non-empty summary"
 		withArgs(t, "engram", "timeline", "1")
-		storeTimeline = func(*store.Store, int64, int, int) (*store.TimelineResult, error) {
+		storeTimeline = func(store.Store, int64, int, int) (*store.TimelineResult, error) {
 			return &store.TimelineResult{
 				Focus:        store.Observation{ID: 1, Type: "note", Title: "focus", Content: "content", CreatedAt: "2026-01-01"},
 				SessionInfo:  &store.Session{Project: "proj", StartedAt: "2026-01-01", Summary: &summary},
@@ -847,7 +847,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 
 	t.Run("context seam error", func(t *testing.T) {
 		withArgs(t, "engram", "context")
-		storeFormatContext = func(*store.Store, string, string) (string, error) {
+		storeFormatContext = func(store.Store, string, string) (string, error) {
 			return "", errors.New("forced context error")
 		}
 		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdContext(cfg) })
@@ -856,7 +856,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 
 	t.Run("stats seam error", func(t *testing.T) {
 		withArgs(t, "engram", "stats")
-		storeStats = func(*store.Store) (*store.Stats, error) {
+		storeStats = func(store.Store) (*store.Stats, error) {
 			return nil, errors.New("forced stats error")
 		}
 		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdStats(cfg) })
@@ -865,7 +865,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 
 	t.Run("export seam error", func(t *testing.T) {
 		withArgs(t, "engram", "export")
-		storeExport = func(*store.Store) (*store.ExportData, error) {
+		storeExport = func(store.Store) (*store.ExportData, error) {
 			return nil, errors.New("forced export error")
 		}
 		_, stderr, recovered := captureOutputAndRecover(t, func() { cmdExport(cfg) })
@@ -874,7 +874,7 @@ func TestCommandErrorSeamsAndUncoveredBranches(t *testing.T) {
 
 	t.Run("export marshal seam error", func(t *testing.T) {
 		withArgs(t, "engram", "export")
-		storeExport = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
+		storeExport = func(s store.Store) (*store.ExportData, error) { return s.Export() }
 		jsonMarshalIndent = func(any, string, string) ([]byte, error) {
 			return nil, errors.New("forced marshal error")
 		}
@@ -941,7 +941,7 @@ func TestCmdMCP(t *testing.T) {
 
 	t.Run("no tools filter uses newMCPServerWithConfig with nil allowlist", func(t *testing.T) {
 		called := false
-		newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		newMCPServerWithConfig = func(s store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
 			called = true
 			if allowlist != nil {
 				t.Errorf("expected nil allowlist for no tools filter, got %v", allowlist)
@@ -960,7 +960,7 @@ func TestCmdMCP(t *testing.T) {
 
 	t.Run("--tools flag uses newMCPServerWithConfig with non-nil allowlist", func(t *testing.T) {
 		var gotAllowlist map[string]bool
-		newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		newMCPServerWithConfig = func(s store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
 			gotAllowlist = allowlist
 			return mcpserver.NewMCPServer("test", "0")
 		}
@@ -976,7 +976,7 @@ func TestCmdMCP(t *testing.T) {
 
 	t.Run("--tools as separate arg uses newMCPServerWithConfig with non-nil allowlist", func(t *testing.T) {
 		var gotAllowlist map[string]bool
-		newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		newMCPServerWithConfig = func(s store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
 			gotAllowlist = allowlist
 			return mcpserver.NewMCPServer("test", "0")
 		}
@@ -991,7 +991,7 @@ func TestCmdMCP(t *testing.T) {
 	})
 
 	t.Run("storeNew failure calls fatal", func(t *testing.T) {
-		storeNew = func(cfg store.Config) (*store.Store, error) {
+		storeNew = func(cfg store.Config) (store.Store, error) {
 			return nil, errors.New("db open failed")
 		}
 		withArgs(t, "engram", "mcp")

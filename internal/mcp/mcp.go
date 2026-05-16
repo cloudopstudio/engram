@@ -33,7 +33,7 @@ type MCPConfig struct {
 
 var suggestTopicKey = store.SuggestTopicKey
 
-var loadMCPStats = func(s *store.Store) (*store.Stats, error) {
+var loadMCPStats = func(s store.Store) (*store.Stats, error) {
 	return s.Stats()
 }
 
@@ -121,7 +121,7 @@ func ResolveTools(input string) map[string]bool {
 }
 
 // NewServer creates an MCP server with ALL tools registered (backwards compatible).
-func NewServer(s *store.Store) *server.MCPServer {
+func NewServer(s store.Store) *server.MCPServer {
 	return NewServerWithConfig(s, MCPConfig{}, nil)
 }
 
@@ -147,17 +147,17 @@ PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, disc
 
 // NewServerWithTools creates an MCP server registering only the tools in
 // the allowlist. If allowlist is nil, all tools are registered.
-func NewServerWithTools(s *store.Store, allowlist map[string]bool) *server.MCPServer {
+func NewServerWithTools(s store.Store, allowlist map[string]bool) *server.MCPServer {
 	return NewServerWithConfig(s, MCPConfig{}, allowlist)
 }
 
 // NewServerWithConfig creates an MCP server with full configuration including
 // default project detection and optional tool allowlist.
-func NewServerWithConfig(s *store.Store, cfg MCPConfig, allowlist map[string]bool) *server.MCPServer {
+func NewServerWithConfig(s store.Store, cfg MCPConfig, allowlist map[string]bool) *server.MCPServer {
 	return newServerWithActivity(s, cfg, allowlist, NewSessionActivity(10*time.Minute))
 }
 
-func newServerWithActivity(s *store.Store, cfg MCPConfig, allowlist map[string]bool, activity *SessionActivity) *server.MCPServer {
+func newServerWithActivity(s store.Store, cfg MCPConfig, allowlist map[string]bool, activity *SessionActivity) *server.MCPServer {
 	srv := server.NewMCPServer(
 		"engram",
 		"0.1.0",
@@ -178,7 +178,7 @@ func shouldRegister(name string, allowlist map[string]bool) bool {
 	return allowlist[name]
 }
 
-func registerTools(srv *server.MCPServer, s *store.Store, cfg MCPConfig, allowlist map[string]bool, activity *SessionActivity) {
+func registerTools(srv *server.MCPServer, s store.Store, cfg MCPConfig, allowlist map[string]bool, activity *SessionActivity) {
 	// ─── mem_search (profile: agent, core — always in context) ─────────
 	if shouldRegister("mem_search", allowlist) {
 		srv.AddTool(
@@ -741,7 +741,7 @@ Duplicates are automatically detected and skipped — safe to call multiple time
 
 // ─── Tool Handlers ───────────────────────────────────────────────────────────
 
-func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+func handleSearch(s store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, _ := req.GetArguments()["query"].(string)
 		typ, _ := req.GetArguments()["type"].(string)
@@ -807,7 +807,7 @@ func handleSearch(s *store.Store, cfg MCPConfig, activity *SessionActivity) serv
 	}
 }
 
-func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+func handleSave(s store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		title, _ := req.GetArguments()["title"].(string)
 		content, _ := req.GetArguments()["content"].(string)
@@ -911,7 +911,7 @@ func handleSuggestTopicKey() server.ToolHandlerFunc {
 	}
 }
 
-func handleUpdate(s *store.Store) server.ToolHandlerFunc {
+func handleUpdate(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id := int64(intArg(req, "id", 0))
 		if id == 0 {
@@ -960,7 +960,7 @@ func handleUpdate(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleDelete(s *store.Store) server.ToolHandlerFunc {
+func handleDelete(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id := int64(intArg(req, "id", 0))
 		if id == 0 {
@@ -980,7 +980,7 @@ func handleDelete(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleSavePrompt(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
+func handleSavePrompt(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		content, _ := req.GetArguments()["content"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
@@ -1012,7 +1012,7 @@ func handleSavePrompt(s *store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	}
 }
 
-func handleContext(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+func handleContext(s store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		project, _ := req.GetArguments()["project"].(string)
 		scope, _ := req.GetArguments()["scope"].(string)
@@ -1054,7 +1054,7 @@ func handleContext(s *store.Store, cfg MCPConfig, activity *SessionActivity) ser
 	}
 }
 
-func handleStats(s *store.Store) server.ToolHandlerFunc {
+func handleStats(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		stats, err := loadMCPStats(s)
 		if err != nil {
@@ -1075,7 +1075,7 @@ func handleStats(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleTimeline(s *store.Store) server.ToolHandlerFunc {
+func handleTimeline(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		observationID := int64(intArg(req, "observation_id", 0))
 		if observationID == 0 {
@@ -1127,7 +1127,7 @@ func handleTimeline(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleGetObservation(s *store.Store) server.ToolHandlerFunc {
+func handleGetObservation(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id := int64(intArg(req, "id", 0))
 		if id == 0 {
@@ -1166,7 +1166,7 @@ func handleGetObservation(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleSessionSummary(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+func handleSessionSummary(s store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		content, _ := req.GetArguments()["content"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
@@ -1204,7 +1204,7 @@ func handleSessionSummary(s *store.Store, cfg MCPConfig, activity *SessionActivi
 	}
 }
 
-func handleSessionStart(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+func handleSessionStart(s store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, _ := req.GetArguments()["id"].(string)
 		project, _ := req.GetArguments()["project"].(string)
@@ -1226,7 +1226,7 @@ func handleSessionStart(s *store.Store, cfg MCPConfig, activity *SessionActivity
 	}
 }
 
-func handleSessionEnd(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+func handleSessionEnd(s store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, _ := req.GetArguments()["id"].(string)
 		summary, _ := req.GetArguments()["summary"].(string)
@@ -1247,7 +1247,7 @@ func handleSessionEnd(s *store.Store, cfg MCPConfig, activity *SessionActivity) 
 	}
 }
 
-func handleCapturePassive(s *store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
+func handleCapturePassive(s store.Store, cfg MCPConfig, activity *SessionActivity) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		content, _ := req.GetArguments()["content"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
@@ -1292,7 +1292,7 @@ func handleCapturePassive(s *store.Store, cfg MCPConfig, activity *SessionActivi
 	}
 }
 
-func handleMergeProjects(s *store.Store) server.ToolHandlerFunc {
+func handleMergeProjects(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		fromStr, _ := req.GetArguments()["from"].(string)
 		to, _ := req.GetArguments()["to"].(string)
@@ -1327,7 +1327,7 @@ func handleMergeProjects(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleProjects(s *store.Store) server.ToolHandlerFunc {
+func handleProjects(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		includeDeprecated, _ := req.GetArguments()["include_deprecated"].(bool)
 		projects, err := s.ListProjects(includeDeprecated)
@@ -1348,7 +1348,7 @@ func handleProjects(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleDeprecateProject(s *store.Store) server.ToolHandlerFunc {
+func handleDeprecateProject(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		project, _ := req.GetArguments()["project"].(string)
 		if strings.TrimSpace(project) == "" {
@@ -1361,7 +1361,7 @@ func handleDeprecateProject(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleActivateProject(s *store.Store) server.ToolHandlerFunc {
+func handleActivateProject(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		project, _ := req.GetArguments()["project"].(string)
 		if strings.TrimSpace(project) == "" {
@@ -1374,7 +1374,7 @@ func handleActivateProject(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handlePromote(s *store.Store) server.ToolHandlerFunc {
+func handlePromote(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id := int64(intArg(req, "id", 0))
 		if id == 0 {
@@ -1396,7 +1396,7 @@ func handlePromote(s *store.Store) server.ToolHandlerFunc {
 	}
 }
 
-func handleWho(s *store.Store) server.ToolHandlerFunc {
+func handleWho(s store.Store) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		project, _ := req.GetArguments()["project"].(string)
 

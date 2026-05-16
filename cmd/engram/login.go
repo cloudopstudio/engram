@@ -1,5 +1,3 @@
-//go:build pgstore
-
 package main
 
 import (
@@ -20,6 +18,8 @@ import (
 //	engram login                         # uses default profile
 //	engram login --profile arquitectura  # uses specific profile
 func cmdLogin(cfg store.Config) {
+	requirePostgresBackend(cfg, "login")
+
 	tenantID, clientID, err := store.ResolveInteractiveAuthExported(cfg.DataDir, cfg.Profile)
 	if err != nil {
 		fatal(err)

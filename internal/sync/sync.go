@@ -40,10 +40,10 @@ var (
 	osCreateFile        = os.Create
 	gzipWriterFactory   = func(f *os.File) gzipWriter { return gzip.NewWriter(f) }
 	osHostname          = os.Hostname
-	storeGetSynced      = func(s *store.Store) (map[string]bool, error) { return s.GetSyncedChunks() }
-	storeExportData     = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
-	storeImportData     = func(s *store.Store, d *store.ExportData) (*store.ImportResult, error) { return s.Import(d) }
-	storeRecordSynced   = func(s *store.Store, chunkID string) error { return s.RecordSyncedChunk(chunkID) }
+	storeGetSynced      = func(s store.Store) (map[string]bool, error) { return s.GetSyncedChunks() }
+	storeExportData     = func(s store.Store) (*store.ExportData, error) { return s.Export() }
+	storeImportData     = func(s store.Store, d *store.ExportData) (*store.ImportResult, error) { return s.Import(d) }
+	storeRecordSynced   = func(s store.Store, chunkID string) error { return s.RecordSyncedChunk(chunkID) }
 )
 
 type gzipWriter interface {
@@ -99,14 +99,14 @@ type ImportResult struct {
 
 // Syncer handles exporting and importing memory chunks.
 type Syncer struct {
-	store     *store.Store
+	store     store.Store
 	syncDir   string    // Path to .engram/ in the project repo (kept for backward compat)
 	transport Transport // Pluggable I/O backend (filesystem, remote, etc.)
 }
 
 // New creates a Syncer with a FileTransport rooted at syncDir.
 // This preserves the original constructor signature for backward compatibility.
-func New(s *store.Store, syncDir string) *Syncer {
+func New(s store.Store, syncDir string) *Syncer {
 	return &Syncer{
 		store:     s,
 		syncDir:   syncDir,
@@ -116,13 +116,13 @@ func New(s *store.Store, syncDir string) *Syncer {
 
 // NewLocal is an alias for New — creates a Syncer backed by the local filesystem.
 // Preferred in call sites where the name makes the intent clearer.
-func NewLocal(s *store.Store, syncDir string) *Syncer {
+func NewLocal(s store.Store, syncDir string) *Syncer {
 	return New(s, syncDir)
 }
 
 // NewWithTransport creates a Syncer with a custom Transport implementation.
 // This is used for remote (cloud) sync where chunks travel over HTTP.
-func NewWithTransport(s *store.Store, transport Transport) *Syncer {
+func NewWithTransport(s store.Store, transport Transport) *Syncer {
 	return &Syncer{
 		store:     s,
 		transport: transport,

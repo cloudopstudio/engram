@@ -18,7 +18,7 @@ import (
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
-var loadServerStats = func(s *store.Store) (*store.Stats, error) {
+var loadServerStats = func(s store.Store) (*store.Stats, error) {
 	return s.Stats()
 }
 
@@ -38,7 +38,7 @@ type SyncStatus struct {
 }
 
 type Server struct {
-	store      *store.Store
+	store      store.Store
 	mux        *http.ServeMux
 	port       int
 	listen     func(network, address string) (net.Listener, error)
@@ -47,7 +47,7 @@ type Server struct {
 	syncStatus SyncStatusProvider
 }
 
-func New(s *store.Store, port int) *Server {
+func New(s store.Store, port int) *Server {
 	srv := &Server{store: s, port: port, listen: net.Listen, serve: http.Serve}
 	srv.mux = http.NewServeMux()
 	srv.routes()

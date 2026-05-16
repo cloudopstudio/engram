@@ -68,7 +68,7 @@ var (
 	// detectProject is injectable for testing; wraps project.DetectProject.
 	detectProject = project.DetectProject
 
-	newTUIModel   = func(s *store.Store) tui.Model { return tui.New(s, version) }
+	newTUIModel   = func(s store.Store) tui.Model { return tui.New(s, version) }
 	newTeaProgram = tea.NewProgram
 	runTeaProgram = (*tea.Program).Run
 
@@ -79,29 +79,29 @@ var (
 	setupAddClaudeCodeAllowlist = setup.AddClaudeCodeAllowlist
 	scanInputLine               = fmt.Scanln
 
-	storeSearch = func(s *store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, error) {
+	storeSearch = func(s store.Store, query string, opts store.SearchOptions) ([]store.SearchResult, error) {
 		return s.Search(query, opts)
 	}
-	storeAddObservation = func(s *store.Store, p store.AddObservationParams) (int64, error) { return s.AddObservation(p) }
-	storeTimeline       = func(s *store.Store, observationID int64, before, after int) (*store.TimelineResult, error) {
+	storeAddObservation = func(s store.Store, p store.AddObservationParams) (int64, error) { return s.AddObservation(p) }
+	storeTimeline       = func(s store.Store, observationID int64, before, after int) (*store.TimelineResult, error) {
 		return s.Timeline(observationID, before, after)
 	}
-	storeFormatContext = func(s *store.Store, project, scope string) (string, error) { return s.FormatContext(project, scope) }
-	storeStats         = func(s *store.Store) (*store.Stats, error) { return s.Stats() }
-	storeExport        = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
+	storeFormatContext = func(s store.Store, project, scope string) (string, error) { return s.FormatContext(project, scope) }
+	storeStats         = func(s store.Store) (*store.Stats, error) { return s.Stats() }
+	storeExport        = func(s store.Store) (*store.ExportData, error) { return s.Export() }
 	jsonMarshalIndent  = json.MarshalIndent
 
-	storeListProjects = func(s *store.Store, includeDeprecated bool) ([]store.ProjectStats, error) {
+	storeListProjects = func(s store.Store, includeDeprecated bool) ([]store.ProjectStats, error) {
 		return s.ListProjects(includeDeprecated)
 	}
-	storeDeprecateProject = func(s *store.Store, project, identity string) error {
+	storeDeprecateProject = func(s store.Store, project, identity string) error {
 		return s.DeprecateProject(project, identity)
 	}
-	storeActivateProject = func(s *store.Store, project string) error {
+	storeActivateProject = func(s store.Store, project string) error {
 		return s.ActivateProject(project)
 	}
-	storePromote          = func(s *store.Store, id int64, identity string) error { return s.PromoteObservation(id, identity) }
-	storeListContributors = func(s *store.Store, project string) ([]store.ContributorStats, error) {
+	storePromote          = func(s store.Store, id int64, identity string) error { return s.PromoteObservation(id, identity) }
+	storeListContributors = func(s store.Store, project string) ([]store.ContributorStats, error) {
 		return s.ListContributors(project)
 	}
 
@@ -160,6 +160,28 @@ func main() {
 
 	// Parse --auth-interactive flag before command dispatch.
 	cfg.AuthInteractive = parseGlobalAuthInteractive()
+
+	// Parse --db-type flag before command dispatch, then fall back to
+	// ENGRAM_DB_TYPE if no flag was provided. Empty string keeps factory
+	// auto-detect (ENGRAM_DATABASE_URL / database-url config key).
+	dbType, dbTypeErr := parseGlobalDBType()
+	if dbTypeErr != nil {
+		fmt.Fprintln(os.Stderr, dbTypeErr)
+		exitFunc(1)
+		return
+	}
+	if dbType == "" {
+		if env := os.Getenv("ENGRAM_DB_TYPE"); env != "" {
+			parsed, err := normalizeDBType(env)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "engram: invalid ENGRAM_DB_TYPE: %v\n", err)
+				exitFunc(1)
+				return
+			}
+			dbType = parsed
+		}
+	}
+	cfg.DBType = dbType
 
 	// Warn if the resolved profile doesn't exist in config (stderr only —
 	// stdout is reserved for MCP/data output).
@@ -850,9 +872,9 @@ func cmdSync(cfg store.Config) {
 	fmt.Printf("  git add .engram/ && git commit -m \"sync engram memories\"\n")
 }
 
-// storeAdapter wraps *store.Store to satisfy obsidian.StoreReader.
+// storeAdapter wraps store.Store to satisfy obsidian.StoreReader.
 // The real store.Stats() returns (*store.Stats, error); the interface expects *store.Stats.
-type storeAdapter struct{ s *store.Store }
+type storeAdapter struct{ s store.Store }
 
 func (a *storeAdapter) Export() (*store.ExportData, error) { return a.s.Export() }
 func (a *storeAdapter) Stats() *store.Stats {
@@ -1061,11 +1083,15 @@ func cmdProjects(cfg store.Config) {
 }
 
 func cmdProjectsList(cfg store.Config) {
-	// Parse --all flag from remaining args (os.Args[3:] when subcommand is "list")
+	// Parse --all flag from remaining args. When invoked via the default route
+	// (e.g. `engram projects` with no subcommand) os.Args may only have 2
+	// elements, so guard the slice.
 	showAll := false
-	for _, arg := range os.Args[3:] {
-		if arg == "--all" {
-			showAll = true
+	if len(os.Args) > 3 {
+		for _, arg := range os.Args[3:] {
+			if arg == "--all" {
+				showAll = true
+			}
 		}
 	}
 
@@ -1931,6 +1957,41 @@ func parseGlobalAuthInteractive() bool {
 		}
 	}
 	return false
+}
+
+// parseGlobalDBType extracts --db-type <value> or --db-type=<value> from
+// os.Args, removes it so downstream commands don't see it, and returns the
+// normalized store.DBType. Empty result means "no flag provided" (caller
+// should then check ENGRAM_DB_TYPE before falling back to factory
+// auto-detect). Returns an error if the flag was present with an unknown
+// value.
+func parseGlobalDBType() (store.DBType, error) {
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "--db-type" && i+1 < len(os.Args) {
+			val := os.Args[i+1]
+			os.Args = append(os.Args[:i], os.Args[i+2:]...)
+			return normalizeDBType(val)
+		}
+		if strings.HasPrefix(os.Args[i], "--db-type=") {
+			val := strings.TrimPrefix(os.Args[i], "--db-type=")
+			os.Args = append(os.Args[:i], os.Args[i+1:]...)
+			return normalizeDBType(val)
+		}
+	}
+	return "", nil
+}
+
+// normalizeDBType validates a raw --db-type / ENGRAM_DB_TYPE value and
+// returns the canonical store.DBType. Matching is case-insensitive.
+func normalizeDBType(raw string) (store.DBType, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "sqlite":
+		return store.DBTypeSQLite, nil
+	case "postgres", "postgresql":
+		return store.DBTypePostgres, nil
+	default:
+		return "", fmt.Errorf("engram: invalid --db-type %q (valid: sqlite, postgres)", raw)
+	}
 }
 
 func truncate(s string, max int) string {

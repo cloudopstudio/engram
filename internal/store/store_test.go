@@ -1,5 +1,3 @@
-//go:build !pgstore
-
 package store
 
 import (
@@ -24,7 +22,7 @@ func mustDefaultConfig(t *testing.T) Config {
 	return cfg
 }
 
-func newTestStore(t *testing.T) *Store {
+func newTestStore(t *testing.T) *SQLiteStore {
 	t.Helper()
 	cfg := mustDefaultConfig(t)
 	cfg.DataDir = t.TempDir()
@@ -37,7 +35,11 @@ func newTestStore(t *testing.T) *Store {
 	t.Cleanup(func() {
 		_ = s.Close()
 	})
-	return s
+	ss, ok := s.(*SQLiteStore)
+	if !ok {
+		t.Fatalf("expected *SQLiteStore, got %T", s)
+	}
+	return ss
 }
 
 type fakeRows struct {
@@ -493,11 +495,15 @@ func TestNewMigratesLegacyUserPromptsSyncIDSchema(t *testing.T) {
 	cfg := mustDefaultConfig(t)
 	cfg.DataDir = dataDir
 
-	s, err := New(cfg)
+	sIface, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new store after legacy prompt schema: %v", err)
 	}
-	t.Cleanup(func() { _ = s.Close() })
+	t.Cleanup(func() { _ = sIface.Close() })
+	s, ok := sIface.(*SQLiteStore)
+	if !ok {
+		t.Fatalf("expected *SQLiteStore, got %T", sIface)
+	}
 
 	var syncID string
 	if err := s.db.QueryRow("SELECT sync_id FROM user_prompts WHERE content = ?", "legacy prompt").Scan(&syncID); err != nil {
@@ -2025,7 +2031,7 @@ func TestMigrationInternalErrorAndNoopBranches(t *testing.T) {
 	})
 
 	t.Run("legacy migrate surfaces begin and commit hook failures", func(t *testing.T) {
-		prepareLegacyStore := func(t *testing.T) *Store {
+		prepareLegacyStore := func(t *testing.T) *SQLiteStore {
 			t.Helper()
 			s := newTestStore(t)
 			if _, err := s.db.Exec(`
@@ -3317,8 +3323,13 @@ func TestNewRepairsAlreadyEnrolledProjectsMissingHistoricalSyncMutations(t *test
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
+	ss, ok := s.(*SQLiteStore)
+	if !ok {
+		t.Fatalf("expected *SQLiteStore, got %T", s)
+	}
+
 	var count int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&count); err != nil {
+	if err := ss.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations`).Scan(&count); err != nil {
 		t.Fatalf("count repaired mutations after reopen: %v", err)
 	}
 	if count != 3 {

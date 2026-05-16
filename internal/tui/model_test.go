@@ -10,7 +10,7 @@ import (
 )
 
 type testFixture struct {
-	store        *store.Store
+	store        store.Store
 	sessionID    string
 	obsID        int64
 	secondObs    int64

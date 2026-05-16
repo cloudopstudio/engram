@@ -1,5 +1,3 @@
-//go:build pgstore
-
 package main
 
 import (
@@ -28,6 +26,8 @@ const migrateBatchSize = 500
 //	engram migrate
 //	ENGRAM_MIGRATE_SOURCE=/path/to/engram.db engram migrate
 func cmdMigrate(cfg store.Config) {
+	requirePostgresBackend(cfg, "migrate")
+
 	sourceDB := os.Getenv("ENGRAM_MIGRATE_SOURCE")
 	if sourceDB == "" {
 		sourceDB = filepath.Join(cfg.DataDir, "engram.db")

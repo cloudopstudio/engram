@@ -1,5 +1,3 @@
-//go:build pgstore
-
 package store
 
 import (
@@ -18,7 +16,7 @@ import (
 
 // ─── Test Infrastructure ─────────────────────────────────────────────────────
 
-func newTestStorePG(t *testing.T) *Store {
+func newTestStorePG(t *testing.T) *PostgresStore {
 	t.Helper()
 
 	pool, err := dockertest.NewPool("")
@@ -71,7 +69,7 @@ func newTestStorePG(t *testing.T) *Store {
 		DedupeWindow:         time.Hour,
 	}
 
-	return &Store{pool: pgPool, cfg: cfg, identity: "test@example.com"}
+	return &PostgresStore{pool: pgPool, cfg: cfg, identity: "test@example.com"}
 }
 
 // ─── Session CRUD Tests ──────────────────────────────────────────────────────
@@ -1214,9 +1212,9 @@ func TestPGGetObservationBySyncID(t *testing.T) {
 // roles (alice and bob), and returns per-user Stores whose connections execute
 // SET ROLE on every checkout so current_user matches the role.
 type rlsTestEnv struct {
-	alice *Store
-	bob   *Store
-	admin *Store // owner role (engram) for direct verification
+	alice *PostgresStore
+	bob   *PostgresStore
+	admin *PostgresStore // owner role (engram) for direct verification
 }
 
 func newRLSTestEnv(t *testing.T) *rlsTestEnv {
@@ -1311,9 +1309,9 @@ func newRLSTestEnv(t *testing.T) *rlsTestEnv {
 	alicePool := makeRolePool("alice")
 	bobPool := makeRolePool("bob")
 
-	aliceStore := &Store{pool: alicePool, cfg: cfg, identity: "alice"}
-	bobStore := &Store{pool: bobPool, cfg: cfg, identity: "bob"}
-	adminStore := &Store{pool: adminPool, cfg: cfg, identity: "engram"}
+	aliceStore := &PostgresStore{pool: alicePool, cfg: cfg, identity: "alice"}
+	bobStore := &PostgresStore{pool: bobPool, cfg: cfg, identity: "bob"}
+	adminStore := &PostgresStore{pool: adminPool, cfg: cfg, identity: "engram"}
 
 	t.Cleanup(func() {
 		alicePool.Close()

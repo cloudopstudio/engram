@@ -35,7 +35,7 @@ func TestStartReturnsListenError(t *testing.T) {
 }
 
 func TestStartUsesInjectedServe(t *testing.T) {
-	s := New(&store.Store{}, 7777)
+	s := New(nil, 7777)
 	s.listen = func(network, address string) (net.Listener, error) {
 		return stubListener{}, nil
 	}
@@ -52,7 +52,7 @@ func TestStartUsesInjectedServe(t *testing.T) {
 	}
 }
 
-func newServerTestStore(t *testing.T) *store.Store {
+func newServerTestStore(t *testing.T) store.Store {
 	t.Helper()
 	cfg, err := store.DefaultConfig()
 	if err != nil {
@@ -399,7 +399,7 @@ func TestOnWriteNotCalledOnFailedWrites(t *testing.T) {
 
 func TestHandleStatsReturnsInternalServerErrorOnLoaderError(t *testing.T) {
 	prev := loadServerStats
-	loadServerStats = func(s *store.Store) (*store.Stats, error) {
+	loadServerStats = func(s store.Store) (*store.Stats, error) {
 		return nil, errors.New("stats unavailable")
 	}
 	t.Cleanup(func() {

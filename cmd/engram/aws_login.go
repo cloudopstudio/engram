@@ -1,5 +1,3 @@
-//go:build pgstore
-
 package main
 
 import (
@@ -27,6 +25,8 @@ import (
 //	engram aws-login                       # uses default profile
 //	engram aws-login --profile femsa       # uses named profile
 func cmdAWSLogin(cfg store.Config) {
+	requirePostgresBackend(cfg, "aws-login")
+
 	region, awsProfile := store.ResolveAWSAuthExported(cfg.DataDir, cfg.Profile)
 
 	// Pick a connection string that has at least a user@host:port — needed by
