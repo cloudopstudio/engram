@@ -32,6 +32,8 @@ Engram (single Go binary)
 SQLite + FTS5 (~/.engram/engram.db)
 ```
 
+By default Engram runs on SQLite for zero-config single-user setups. Teams can switch to PostgreSQL with `--db-type=postgres` for shared deployments — same binary, same tools. See [Backend Selection](docs/engram-cloud-setup.md#backend-selection) for details.
+
 ## Quick Start
 
 ### Install
@@ -125,7 +127,12 @@ Full sync documentation → [DOCS.md](DOCS.md)
 | `engram sync` | Git sync export/import |
 | `engram projects list\|consolidate\|prune` | Manage project names |
 | `engram obsidian-export` | Export to Obsidian vault (beta) |
+| `engram login` | Azure Entra ID device-code login* |
+| `engram aws-login` | AWS SSO / profile login for RDS IAM auth* |
+| `engram migrate` | Run database migrations* |
 | `engram version` | Show version |
+
+*Requires PostgreSQL backend (`--db-type=postgres`).
 
 Full CLI with all flags → [docs/ARCHITECTURE.md#cli-reference](docs/ARCHITECTURE.md#cli-reference)
 

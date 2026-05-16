@@ -173,8 +173,13 @@ engram projects list      Show all projects with obs/session/prompt counts
 engram projects consolidate  Interactive merge of similar project names [--all] [--dry-run]
 engram projects prune     Remove projects with 0 observations [--dry-run]
 engram obsidian-export    Export memories to Obsidian vault (beta)
+engram login              Azure Entra ID device-code login*
+engram aws-login          AWS SSO / profile login for RDS IAM auth*
+engram migrate            Run database migrations*
 engram version            Show version
 ```
+
+\* Requires PostgreSQL backend (`--db-type=postgres`).
 
 ---
 

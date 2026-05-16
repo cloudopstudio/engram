@@ -56,9 +56,9 @@ User types /engram-login →
    - API permissions: `https://ossrdbms-aad.database.windows.net/user_impersonation`
    - Under **Authentication** > **Advanced settings** > **Allow public client flows** = Yes
 
-2. **engram binary** built with PostgreSQL support:
+2. **engram binary** built (PostgreSQL support is included by default):
    ```bash
-   go build -tags pgstore ./cmd/engram/
+   go build ./cmd/engram/
    ```
 
 3. **engram configured** with tenant-id and client-id:
@@ -129,13 +129,7 @@ This is read by engram's Go code to connect to Azure Database for PostgreSQL.
 ### "engram not found"
 The `engram` binary is not installed or not in your PATH. Build it:
 ```bash
-go build -tags pgstore -o engram ./cmd/engram/
-```
-
-### "Build tag missing" / "pgstore build tag"
-The engram binary was built without PostgreSQL support. Rebuild with:
-```bash
-go build -tags pgstore ./cmd/engram/
+go build -o engram ./cmd/engram/
 ```
 
 ### "tenant-id and/or client-id not configured"
