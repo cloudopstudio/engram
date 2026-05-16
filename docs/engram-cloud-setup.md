@@ -7,6 +7,7 @@ PostgreSQL-backed engram for team collaboration with shared persistent memory.
 - [Overview](#overview)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
+- [Backend Selection](#backend-selection)
 - [Azure PostgreSQL Setup](#azure-postgresql-setup)
 - [Authentication Configuration](#authentication-configuration)
 - [Team Onboarding Quickstart](#team-onboarding-quickstart)
@@ -167,15 +168,49 @@ Requires **Go 1.25+**.
 ```bash
 git clone https://github.com/Gentleman-Programming/engram.git
 cd engram
-go build -tags pgstore -o engram ./cmd/engram/
+go build -o engram ./cmd/engram/
 ```
 
-The `-tags pgstore` flag activates the PostgreSQL store backend in addition to SQLite. The resulting `engram` binary auto-selects the backend based on whether a `database-url` is configured.
+The resulting `engram` binary includes both SQLite and PostgreSQL drivers — no build tag is required. Backend selection happens at runtime (see [Backend Selection](#backend-selection)).
 
 > **Version stamping** (optional):
 > ```bash
-> go build -tags pgstore -ldflags="-X main.version=local-$(git describe --tags --always)" -o engram ./cmd/engram/
+> go build -ldflags="-X main.version=local-$(git describe --tags --always)" -o engram ./cmd/engram/
 > ```
+
+> **Migrating from a previous PG-only build?** If you used to run `go build -tags pgstore ./cmd/engram` or shipped the separate `engram-pg` binary, drop the tag and rebuild. The `pgstore` build tag still compiles for backward compatibility with old scripts but is now a no-op — every build includes both backends.
+
+---
+
+## Backend Selection
+
+A single `engram` binary speaks both SQLite and PostgreSQL. The backend is resolved at process startup using this priority order:
+
+1. **`--db-type` flag** (highest) — `engram --db-type=postgres serve`, `engram --db-type=sqlite mcp`
+2. **`ENGRAM_DB_TYPE` env var** — accepts `sqlite`, `postgres`, or the alias `postgresql` (case-insensitive)
+3. **Auto-detect** (when neither of the above is set):
+   - `ENGRAM_DATABASE_URL` is defined → **postgres**
+   - the active config profile has a non-empty `database-url` → **postgres**
+   - otherwise → **sqlite**
+
+The `--db-type` flag is a global flag (parsed before the subcommand), so it works with every command:
+
+```bash
+engram --db-type=postgres serve
+engram --db-type=sqlite stats
+ENGRAM_DB_TYPE=postgres engram mcp
+```
+
+### PostgreSQL-only Commands
+
+Three commands require a PostgreSQL backend: `engram login`, `engram aws-login`, and `engram migrate`. They are always present in the binary, but they validate the resolved backend at startup and fail fast if it isn't PostgreSQL:
+
+```
+engram: 'login' requires PostgreSQL backend.
+Set --db-type=postgres, ENGRAM_DB_TYPE=postgres, or define ENGRAM_DATABASE_URL.
+```
+
+In practice you don't need to set anything explicit: configuring `database-url` (or exporting `ENGRAM_DATABASE_URL`) is enough — auto-detect picks PostgreSQL for you.
 
 ---
 
@@ -337,7 +372,8 @@ Environment variables are supported for CI/CD and container environments. They o
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `ENGRAM_DATABASE_URL` | PostgreSQL connection string (enables PG mode) | — |
+| `ENGRAM_DB_TYPE` | Force backend: `sqlite` or `postgres` (alias: `postgresql`). Overridden by the `--db-type` flag. | unset → auto-detect |
+| `ENGRAM_DATABASE_URL` | PostgreSQL connection string. When set with no other backend hint, auto-detect picks PostgreSQL. | — |
 | `ENGRAM_AUTH_METHOD` | `entra` or `password` | Auto-detected: `entra` for `*.database.azure.com`, `password` otherwise |
 | `ENGRAM_MIGRATE_SOURCE` | Source SQLite DB for migration | `~/.engram/engram.db` |
 | `ENGRAM_DATA_DIR` | Data directory (used for default migration source path) | `~/.engram` |
@@ -890,21 +926,30 @@ engram: connect to PG: tls: ... certificate
   postgres://engram:password@localhost:5432/engram?sslmode=disable
   ```
 
-### Migrate Command Not Available
+### Migrate / Login / AWS-Login Refuses to Run
 
 ```
-engram: 'migrate' command requires the pgstore build tag.
-  Rebuild with: go build -tags pgstore ./cmd/engram/
+engram: 'migrate' requires PostgreSQL backend.
+Set --db-type=postgres, ENGRAM_DB_TYPE=postgres, or define ENGRAM_DATABASE_URL.
 ```
 
-**Cause:** You built engram from source without the `pgstore` build tag.
+**Cause:** The PG-only commands (`login`, `aws-login`, `migrate`) validate the resolved backend at startup. They will only run when engram resolves to PostgreSQL. This usually means no PG connection hint is configured.
 
-**Fix:** Rebuild with the pgstore tag:
+**Fix:** Pick one of the three (in order of preference):
+
 ```bash
-go build -tags pgstore -o engram ./cmd/engram/
+# 1. Configure database-url once — auto-detect handles the rest
+engram config set database-url "postgres://..."
+engram migrate
+
+# 2. Pass the env var inline
+ENGRAM_DATABASE_URL="postgres://..." engram migrate
+
+# 3. Force the backend explicitly with the flag
+engram --db-type=postgres migrate
 ```
 
-> **Note:** Pre-built release binaries always include PostgreSQL support. This error only occurs with custom source builds.
+> **Note:** Engram is now a single binary that includes both SQLite and PostgreSQL drivers. The historical `-tags pgstore` build flag is no longer required (it is preserved as a no-op for backward compatibility with old scripts).
 
 ### Windows: Browser URL Truncation
 
@@ -968,9 +1013,12 @@ go build -tags pgstore -o engram ./cmd/engram/
 engram: ENGRAM_DATABASE_URL must be set for PostgreSQL mode
 ```
 
-**Cause:** engram requires a connection string for PostgreSQL mode, and neither `config.yaml` nor the environment variable is set.
+**Cause:** You forced the PostgreSQL backend (via `--db-type=postgres` or `ENGRAM_DB_TYPE=postgres`) but no connection string is configured in `config.yaml` or in the environment.
 
-**Fix:** Run `engram config set database-url "..."` (see [Authentication Configuration](#authentication-configuration)), or set `ENGRAM_DATABASE_URL` in your environment.
+**Fix:** Either:
+- Run `engram config set database-url "..."` (see [Authentication Configuration](#authentication-configuration)) so the profile carries the URL, or
+- Set `ENGRAM_DATABASE_URL` in your environment, or
+- Drop the explicit backend flag and let auto-detect fall back to SQLite if PostgreSQL isn't ready yet.
 
 ### Linux: Azure CLI Installation Variants
 
@@ -1020,6 +1068,13 @@ You can also unset the database-url from config:
 
 ```bash
 engram config unset database-url
+```
+
+Or force SQLite without touching your PG config (useful when you want to flip back temporarily):
+
+```bash
+engram --db-type=sqlite mcp
+ENGRAM_DB_TYPE=sqlite engram serve
 ```
 
 ### 2. Your Local Data Is Untouched

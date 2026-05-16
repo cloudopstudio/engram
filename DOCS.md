@@ -122,6 +122,30 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 | `ENGRAM_DATA_DIR` | Override data directory | `~/.engram` |
 | `ENGRAM_PORT` | Override HTTP server port | `7437` |
 | `ENGRAM_PROJECT` | Override project name for MCP server | auto-detected via git |
+| `ENGRAM_DB_TYPE` | Force backend: `sqlite` or `postgres` (alias: `postgresql`). Overridden by the global `--db-type` flag. | unset → auto-detect |
+| `ENGRAM_DATABASE_URL` | PostgreSQL connection string. With no other backend hint, auto-detect picks PostgreSQL. | — |
+
+### Backend Selection
+
+A single `engram` binary speaks both SQLite and PostgreSQL. The backend is resolved at startup using this priority:
+
+1. `--db-type` flag (highest) — global flag accepted by every subcommand (e.g. `engram --db-type=postgres serve`)
+2. `ENGRAM_DB_TYPE` env var — accepts `sqlite`, `postgres`, or `postgresql`
+3. Auto-detect (when neither of the above is set):
+   - `ENGRAM_DATABASE_URL` is defined → **postgres**
+   - active profile has a non-empty `database-url` → **postgres**
+   - otherwise → **sqlite**
+
+The build tag `pgstore` is no longer required — every build includes both drivers. The tag is preserved as a no-op for backward compatibility with old scripts.
+
+The PG-only commands (`engram login`, `engram aws-login`, `engram migrate`) are always present in the binary and validate at startup that the resolved backend is PostgreSQL. If not, they fail with:
+
+```
+engram: 'login' requires PostgreSQL backend.
+Set --db-type=postgres, ENGRAM_DB_TYPE=postgres, or define ENGRAM_DATABASE_URL.
+```
+
+For full team / cloud setup, see [Engram Cloud Setup](docs/engram-cloud-setup.md#backend-selection).
 
 ---
 

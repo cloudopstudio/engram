@@ -141,6 +141,10 @@ The binary includes SQLite (via [modernc.org/sqlite](https://pkg.go.dev/modernc.
 |---|---|---|
 | `ENGRAM_DATA_DIR` | Data directory | `~/.engram` (Windows: `%USERPROFILE%\.engram`) |
 | `ENGRAM_PORT` | HTTP server port | `7437` |
+| `ENGRAM_DB_TYPE` | Force backend: `sqlite` or `postgres` (alias: `postgresql`). Overridden by the global `--db-type` flag. | unset → auto-detect (PostgreSQL when `ENGRAM_DATABASE_URL` or a configured `database-url` profile is present; otherwise SQLite) |
+| `ENGRAM_DATABASE_URL` | PostgreSQL connection string. Triggers auto-detect to pick PostgreSQL. Required for the cloud / team mode. | — |
+
+> **Single-binary note:** Engram ships a single binary with both SQLite and PostgreSQL backends. The historical `-tags pgstore` build flag is no longer needed (it remains a no-op for backward compatibility). For PostgreSQL setup, see [Engram Cloud Setup](engram-cloud-setup.md).
 
 ---
 
