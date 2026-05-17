@@ -17,6 +17,7 @@ const (
 	SyncEntitySession     = "session"
 	SyncEntityObservation = "observation"
 	SyncEntityPrompt      = "prompt"
+	SyncEntityRelation    = "relation"
 
 	SyncOpUpsert = "upsert"
 	SyncOpDelete = "delete"

@@ -462,6 +462,72 @@ func (s *SQLiteStore) migrate() error {
 		return err
 	}
 
+	// ── Phase: memory-conflict-surfacing — B.2 ──────────────────────────────
+	// Create the memory_relations table (idempotent via IF NOT EXISTS).
+	// source_id / target_id are TEXT sync_id keys (cross-machine portable).
+	// NO UNIQUE on (source_id, target_id) — multi-actor disagreement allowed.
+	if _, err := s.execHook(s.db, `
+		CREATE TABLE IF NOT EXISTS memory_relations (
+			id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+			sync_id                   TEXT    NOT NULL UNIQUE,
+			source_id                 TEXT,
+			target_id                 TEXT,
+			relation                  TEXT    NOT NULL DEFAULT 'pending',
+			reason                    TEXT,
+			evidence                  TEXT,
+			confidence                REAL,
+			judgment_status           TEXT    NOT NULL DEFAULT 'pending',
+			marked_by_actor           TEXT,
+			marked_by_kind            TEXT,
+			marked_by_model           TEXT,
+			session_id                TEXT,
+			superseded_at             TEXT,
+			superseded_by_relation_id INTEGER REFERENCES memory_relations(id) ON DELETE SET NULL,
+			created_at                TEXT    NOT NULL DEFAULT (datetime('now')),
+			updated_at                TEXT    NOT NULL DEFAULT (datetime('now'))
+		);
+	`); err != nil {
+		return err
+	}
+
+	// ── Phase: memory-conflict-surfacing — B.3 ──────────────────────────────
+	// Indexes for memory_relations (all idempotent via IF NOT EXISTS).
+	if _, err := s.execHook(s.db, `
+		CREATE INDEX IF NOT EXISTS idx_memrel_source    ON memory_relations(source_id, judgment_status);
+		CREATE INDEX IF NOT EXISTS idx_memrel_target    ON memory_relations(target_id, judgment_status);
+		CREATE INDEX IF NOT EXISTS idx_memrel_supersede ON memory_relations(superseded_by_relation_id);
+	`); err != nil {
+		return err
+	}
+
+	// ── Phase: memory-conflict-surfacing — deferred queue ───────────────────
+	// sync_apply_deferred holds relation mutations that could not be applied
+	// immediately (e.g. FK misses). Required by GetRelationStats (deferred/dead counts).
+	if _, err := s.execHook(s.db, `
+		CREATE TABLE IF NOT EXISTS sync_apply_deferred (
+			sync_id           TEXT    PRIMARY KEY,
+			entity            TEXT    NOT NULL,
+			payload           TEXT    NOT NULL,
+			apply_status      TEXT    NOT NULL DEFAULT 'deferred',
+			retry_count       INTEGER NOT NULL DEFAULT 0,
+			last_error        TEXT,
+			last_attempted_at TEXT,
+			first_seen_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_sad_status_seen
+			ON sync_apply_deferred(apply_status, first_seen_at);
+	`); err != nil {
+		return err
+	}
+
+	// Phase 3b: composite index for efficient conflict-audit list/count queries.
+	if _, err := s.execHook(s.db, `
+		CREATE INDEX IF NOT EXISTS idx_memrel_status_created
+			ON memory_relations(judgment_status, created_at DESC);
+	`); err != nil {
+		return err
+	}
+
 	// Prompts FTS triggers (separate idempotent check)
 	var promptTrigger string
 	err = s.db.QueryRow(
@@ -2165,6 +2231,33 @@ func (s *SQLiteStore) MigrateProject(oldName, newName string) (*MigrateResult, e
 type ProjectNameCount struct {
 	Name  string `json:"name"`
 	Count int    `json:"count"`
+}
+
+// ProjectExists returns true if the named project has at least one record in
+// any of observations, sessions, prompts, or enrollment tables.
+// Uses a single UNION ALL LIMIT 1 query for efficiency.
+// The sync_enrolled_projects branch ensures a project enrolled via EnrollProject()
+// without any other data is still recognized.
+func (s *SQLiteStore) ProjectExists(name string) (bool, error) {
+	const query = `
+SELECT 1 FROM (
+  SELECT project FROM observations WHERE project = ? AND deleted_at IS NULL
+  UNION ALL
+  SELECT project FROM sessions WHERE project = ?
+  UNION ALL
+  SELECT project FROM user_prompts WHERE project = ?
+  UNION ALL
+  SELECT project FROM sync_enrolled_projects WHERE project = ?
+) LIMIT 1`
+	var dummy int
+	err := s.db.QueryRow(query, name, name, name, name).Scan(&dummy)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // ListProjectNames returns all distinct project names from observations,

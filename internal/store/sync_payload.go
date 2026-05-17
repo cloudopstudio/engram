@@ -45,6 +45,30 @@ type syncPromptPayload struct {
 	Project   *string `json:"project,omitempty"`
 }
 
+// syncRelationPayload is the wire format for a memory_relations row sent over
+// the sync_mutations / cloud_mutations rails (entity = 'relation', op = 'upsert').
+//
+// Phase 2 design §1: 13-field subset of the 17-column memory_relations row.
+// Excluded: id (local autoincrement, not portable), superseded_at,
+// superseded_by_relation_id (Phase 3 supersede chain).
+type syncRelationPayload struct {
+	SyncID         string   `json:"sync_id"`
+	SourceID       string   `json:"source_id"`
+	TargetID       string   `json:"target_id"`
+	Relation       string   `json:"relation"`
+	Reason         *string  `json:"reason,omitempty"`
+	Evidence       *string  `json:"evidence,omitempty"`
+	Confidence     *float64 `json:"confidence,omitempty"`
+	JudgmentStatus string   `json:"judgment_status"`
+	MarkedByActor  *string  `json:"marked_by_actor,omitempty"`
+	MarkedByKind   *string  `json:"marked_by_kind,omitempty"`
+	MarkedByModel  *string  `json:"marked_by_model,omitempty"`
+	SessionID      *string  `json:"session_id,omitempty"`
+	Project        string   `json:"project"`
+	CreatedAt      string   `json:"created_at"`
+	UpdatedAt      string   `json:"updated_at"`
+}
+
 func observationPayloadFromObservation(obs *Observation) syncObservationPayload {
 	return syncObservationPayload{
 		SyncID:    obs.SyncID,

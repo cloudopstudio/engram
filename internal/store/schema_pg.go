@@ -456,6 +456,49 @@ func migratePG(pool *pgxpool.Pool) error {
 				UPDATE user_prompts SET content = content || '';
 			`,
 		},
+		{
+			version:     10,
+			description: "add memory_relations table and sync_apply_deferred for conflict surfacing",
+			sql: `
+				CREATE TABLE IF NOT EXISTS memory_relations (
+					id                        BIGSERIAL PRIMARY KEY,
+					sync_id                   TEXT      NOT NULL UNIQUE,
+					source_id                 TEXT,
+					target_id                 TEXT,
+					relation                  TEXT      NOT NULL DEFAULT 'pending',
+					reason                    TEXT,
+					evidence                  TEXT,
+					confidence                DOUBLE PRECISION,
+					judgment_status           TEXT      NOT NULL DEFAULT 'pending',
+					marked_by_actor           TEXT,
+					marked_by_kind            TEXT,
+					marked_by_model           TEXT,
+					session_id                TEXT,
+					superseded_at             TIMESTAMPTZ,
+					superseded_by_relation_id BIGINT REFERENCES memory_relations(id) ON DELETE SET NULL,
+					created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+					updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW()
+				);
+
+				CREATE INDEX IF NOT EXISTS idx_memrel_source         ON memory_relations(source_id, judgment_status);
+				CREATE INDEX IF NOT EXISTS idx_memrel_target         ON memory_relations(target_id, judgment_status);
+				CREATE INDEX IF NOT EXISTS idx_memrel_supersede      ON memory_relations(superseded_by_relation_id);
+				CREATE INDEX IF NOT EXISTS idx_memrel_status_created ON memory_relations(judgment_status, created_at DESC);
+
+				CREATE TABLE IF NOT EXISTS sync_apply_deferred (
+					sync_id           TEXT        PRIMARY KEY,
+					entity            TEXT        NOT NULL,
+					payload           TEXT        NOT NULL,
+					apply_status      TEXT        NOT NULL DEFAULT 'deferred',
+					retry_count       INTEGER     NOT NULL DEFAULT 0,
+					last_error        TEXT,
+					last_attempted_at TIMESTAMPTZ,
+					first_seen_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+				);
+
+				CREATE INDEX IF NOT EXISTS idx_sad_status_seen ON sync_apply_deferred(apply_status, first_seen_at);
+			`,
+		},
 	}
 
 	for _, m := range migrations {
