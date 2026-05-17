@@ -1,9 +1,11 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -4802,31 +4804,98 @@ func TestProjectExists_KnownViaEnrollmentOnly(t *testing.T) {
 	}
 }
 
-// ─── Doctor diagnostic helpers — skipped: upstream feature not yet ported ────
-// TODO(merge-upstream-v2 PR #2/#3): port ListDiagnosticSessions from gentle/main to enable
+// ─── Doctor diagnostic helpers ────────────────────────────────────────────────
 
 func TestListDiagnosticSessionsScopesByProject(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ListDiagnosticSessions — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+	if err := s.CreateSession("manual-save-engram", "engram", "/work/engram"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := s.CreateSession("manual-save-other", "other", "/work/other"); err != nil {
+		t.Fatalf("CreateSession other: %v", err)
+	}
+	sessions, err := s.ListDiagnosticSessions("engram")
+	if err != nil {
+		t.Fatalf("ListDiagnosticSessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "manual-save-engram" || sessions[0].Name != "manual-save-engram" {
+		t.Fatalf("sessions=%+v", sessions)
+	}
 }
 
 func TestListPendingProjectMutationsAndPayloadValidation(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ListPendingProjectMutations/ValidateSyncMutationPayload — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+	if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`, DefaultSyncTargetKey, SyncEntityObservation, "obs-1", SyncOpUpsert, `{"sync_id":"obs-1"}`, SyncSourceLocal, "engram"); err != nil {
+		t.Fatalf("insert pending mutation: %v", err)
+	}
+	mutations, err := s.ListPendingProjectMutations("engram")
+	if err != nil {
+		t.Fatalf("ListPendingProjectMutations: %v", err)
+	}
+	if len(mutations) != 1 {
+		t.Fatalf("mutations=%+v", mutations)
+	}
+	validation := ValidateSyncMutationPayload(mutations[0].Entity, mutations[0].Op, mutations[0].Payload, mutations[0].EntityKey)
+	if validation.ReasonCode != "sync_mutation_payload_missing_required_fields" {
+		t.Fatalf("validation=%+v", validation)
+	}
+	if strings.Join(validation.MissingFields, ",") != "session_id,type,title,content,scope" {
+		t.Fatalf("missing fields=%v", validation.MissingFields)
+	}
 }
 
 func TestValidateSyncMutationPayloadRelationRequiresServerFields(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ValidateSyncMutationPayload/SyncEntityRelation — needs merge-upstream-v2 PR #2+")
+	payload := `{"sync_id":"rel-1","source_id":"obs-a","target_id":"obs-b","relation":"conflicts_with","judgment_status":"judged","project":"engram"}`
+	validation := ValidateSyncMutationPayload(SyncEntityRelation, SyncOpUpsert, payload, "rel-1")
+	if validation.ReasonCode != "sync_mutation_payload_missing_required_fields" {
+		t.Fatalf("validation=%+v", validation)
+	}
+	if strings.Join(validation.MissingFields, ",") != "marked_by_actor,marked_by_kind" {
+		t.Fatalf("missing fields=%v", validation.MissingFields)
+	}
 }
 
 func TestReadSQLiteLockSnapshotDoesNotMutateApplicationRows(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ReadSQLiteLockSnapshot — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+	if err := s.CreateSession("s1", "engram", "/work/engram"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	var before int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&before); err != nil {
+		t.Fatalf("count before: %v", err)
+	}
+	snapshot, err := s.ReadSQLiteLockSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("ReadSQLiteLockSnapshot: %v", err)
+	}
+	var after int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&after); err != nil {
+		t.Fatalf("count after: %v", err)
+	}
+	if before != after {
+		t.Fatalf("session count changed: before=%d after=%d", before, after)
+	}
+	if snapshot.JournalMode == "" || snapshot.BusyTimeoutMS <= 0 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
 }
 
 // ─── newTestStoreRaw / countSyncMutations helpers ────────────────────────────
-// TODO(merge-upstream-v2 PR #2/#3): port newWithoutRepair to enable repair tests
 
 func newTestStoreRaw(t *testing.T) *SQLiteStore {
 	t.Helper()
-	return newTestStore(t)
+	cfg := mustDefaultConfig(t)
+	cfg.DataDir = t.TempDir()
+	cfg.DedupeWindow = time.Hour
+
+	s, err := newWithoutRepairSQLite(cfg)
+	if err != nil {
+		t.Fatalf("new raw store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = s.Close()
+	})
+	return s
 }
 
 func countSyncMutations(t *testing.T, s *SQLiteStore, project string) int {
@@ -4841,23 +4910,305 @@ func countSyncMutations(t *testing.T, s *SQLiteStore, project string) int {
 	return n
 }
 
-// ─── Repair tests — skipped: upstream feature not yet ported ─────────────────
-// TODO(merge-upstream-v2 PR #2/#3): port repairEnrolledProjectSyncMutations to enable
+// ─── Repair tests ─────────────────────────────────────────────────────────────
 
+// TestRepairIsIdempotentOnAlreadyRepairedStore verifies that calling
+// repairEnrolledProjectSyncMutations on a store where all sessions/observations/prompts
+// already have corresponding sync_mutations is a no-op (no new mutations added).
 func TestRepairIsIdempotentOnAlreadyRepairedStore(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: repairEnrolledProjectSyncMutations — needs merge-upstream-v2 PR #2+")
+	s := newTestStoreRaw(t)
+
+	// Enroll so repair considers this project.
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO sync_enrolled_projects (project) VALUES (?)`, "engram"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+
+	// Create a session and observation via the normal API (which also enqueues mutations).
+	if err := s.CreateSession("s-repair-1", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s-repair-1",
+		Type:      "decision",
+		Title:     "Title",
+		Content:   "Content",
+		Project:   "engram",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{
+		SessionID: "s-repair-1",
+		Content:   "a prompt",
+		Project:   "engram",
+	}); err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	// At this point mutations exist for session + observation + prompt.
+	before := countSyncMutations(t, s, "engram")
+	if before == 0 {
+		t.Fatalf("expected mutations to exist before repair; got 0")
+	}
+
+	// Run repair — must be idempotent.
+	start := time.Now()
+	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	after := countSyncMutations(t, s, "engram")
+	if after != before {
+		t.Fatalf("repair added mutations on an already-repaired store: before=%d after=%d", before, after)
+	}
+	// Must complete quickly — no busy loop.
+	if elapsed > 2*time.Second {
+		t.Fatalf("repair took too long (%v); possible busy loop", elapsed)
+	}
 }
 
+// TestRepairBackfillsMissingMutations verifies that sessions/observations/prompts
+// that exist without corresponding sync_mutations are backfilled by repair.
 func TestRepairBackfillsMissingMutations(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: repairEnrolledProjectSyncMutations — needs merge-upstream-v2 PR #2+")
+	s := newTestStoreRaw(t)
+
+	// Enroll project.
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO sync_enrolled_projects (project) VALUES (?)`, "engram"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+
+	// Insert a session directly (bypasses mutation enqueue).
+	if _, err := s.db.Exec(
+		`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`,
+		"s-missing", "engram", "/tmp/engram",
+	); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+
+	// Insert an observation directly (bypasses mutation enqueue).
+	obsSync := "obs-sync-uuid-001"
+	if _, err := s.db.Exec(`
+		INSERT INTO observations (session_id, type, title, content, project, scope, normalized_hash,
+		                          revision_count, duplicate_count, last_seen_at, updated_at, sync_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'), ?)`,
+		"s-missing", "decision", "T", "C", "engram", "project", hashNormalized("C"), obsSync,
+	); err != nil {
+		t.Fatalf("insert observation: %v", err)
+	}
+
+	// Insert a prompt directly (bypasses mutation enqueue).
+	promptSync := "prompt-sync-uuid-001"
+	if _, err := s.db.Exec(`
+		INSERT INTO user_prompts (session_id, content, project, created_at, sync_id)
+		VALUES (?, ?, ?, datetime('now'), ?)`,
+		"s-missing", "hello", "engram", promptSync,
+	); err != nil {
+		t.Fatalf("insert prompt: %v", err)
+	}
+
+	// Confirm no mutations exist yet.
+	before := countSyncMutations(t, s, "engram")
+	if before != 0 {
+		t.Fatalf("expected 0 mutations before repair, got %d", before)
+	}
+
+	// Run repair.
+	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+
+	// Mutations must now exist for session, observation, and prompt.
+	after := countSyncMutations(t, s, "engram")
+	if after == 0 {
+		t.Fatalf("repair did not backfill any mutations; expected >=3, got 0")
+	}
+
+	// Session mutation must exist.
+	var sessionMutCount int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND source = ?`,
+		SyncEntitySession, "s-missing", SyncSourceLocal,
+	).Scan(&sessionMutCount); err != nil {
+		t.Fatalf("count session mutations: %v", err)
+	}
+	if sessionMutCount == 0 {
+		t.Fatalf("expected session mutation to be backfilled, got 0")
+	}
+
+	// Observation mutation must exist.
+	var obsMutCount int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND source = ?`,
+		SyncEntityObservation, obsSync, SyncSourceLocal,
+	).Scan(&obsMutCount); err != nil {
+		t.Fatalf("count observation mutations: %v", err)
+	}
+	if obsMutCount == 0 {
+		t.Fatalf("expected observation mutation to be backfilled, got 0")
+	}
+
+	// Prompt mutation must exist.
+	var promptMutCount int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sync_mutations WHERE entity = ? AND entity_key = ? AND source = ?`,
+		SyncEntityPrompt, promptSync, SyncSourceLocal,
+	).Scan(&promptMutCount); err != nil {
+		t.Fatalf("count prompt mutations: %v", err)
+	}
+	if promptMutCount == 0 {
+		t.Fatalf("expected prompt mutation to be backfilled, got 0")
+	}
 }
 
+// TestRepairDoesNotDeadlockWithCursorAndInsert verifies that repair handles
+// 100 sessions without mutations correctly — no deadlock, cursor-insert interference,
+// or busy loop.
 func TestRepairDoesNotDeadlockWithCursorAndInsert(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: repairEnrolledProjectSyncMutations — needs merge-upstream-v2 PR #2+")
+	s := newTestStoreRaw(t)
+
+	// Enroll project.
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO sync_enrolled_projects (project) VALUES (?)`, "engram"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+
+	// Insert 100 sessions directly (no mutations).
+	for i := 0; i < 100; i++ {
+		id := fmt.Sprintf("session-%03d", i)
+		if _, err := s.db.Exec(
+			`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`,
+			id, "engram", "/tmp/engram",
+		); err != nil {
+			t.Fatalf("insert session %s: %v", id, err)
+		}
+	}
+
+	before := countSyncMutations(t, s, "engram")
+	if before != 0 {
+		t.Fatalf("expected 0 mutations before repair, got %d", before)
+	}
+
+	start := time.Now()
+	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	after := countSyncMutations(t, s, "engram")
+	if after != 100 {
+		t.Fatalf("expected 100 session mutations after repair, got %d", after)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("repair took too long (%v) for 100 sessions; possible deadlock or busy loop", elapsed)
+	}
 }
 
+// TestRepairHandlesMixedState verifies that repair only backfills what is missing:
+// project A is fully repaired, project B is partially repaired, project C has nothing.
 func TestRepairHandlesMixedState(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: repairEnrolledProjectSyncMutations — needs merge-upstream-v2 PR #2+")
+	s := newTestStoreRaw(t)
+
+	// Enroll 3 projects.
+	for _, p := range []string{"proj-a", "proj-b", "proj-c"} {
+		if _, err := s.db.Exec(`INSERT OR IGNORE INTO sync_enrolled_projects (project) VALUES (?)`, p); err != nil {
+			t.Fatalf("enroll %s: %v", p, err)
+		}
+	}
+
+	// proj-a: 2 sessions inserted directly, then manually enqueue mutations (fully repaired).
+	for i := 0; i < 2; i++ {
+		id := fmt.Sprintf("a-sess-%d", i)
+		if _, err := s.db.Exec(
+			`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`,
+			id, "proj-a", "/tmp/a",
+		); err != nil {
+			t.Fatalf("insert proj-a session: %v", err)
+		}
+	}
+	// For proj-a: simulate already-repaired by creating sync_state + mutations directly.
+	if _, err := s.db.Exec(
+		`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
+		DefaultSyncTargetKey, SyncLifecycleIdle,
+	); err != nil {
+		t.Fatalf("insert sync_state: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		id := fmt.Sprintf("a-sess-%d", i)
+		if _, err := s.db.Exec(
+			`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			DefaultSyncTargetKey, SyncEntitySession, id, SyncOpUpsert, `{}`, SyncSourceLocal, "proj-a",
+		); err != nil {
+			t.Fatalf("insert proj-a mutation: %v", err)
+		}
+	}
+
+	// proj-b: 3 sessions, only 1 has a mutation (partial).
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("b-sess-%d", i)
+		if _, err := s.db.Exec(
+			`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`,
+			id, "proj-b", "/tmp/b",
+		); err != nil {
+			t.Fatalf("insert proj-b session: %v", err)
+		}
+	}
+	// Only b-sess-0 has a mutation.
+	if _, err := s.db.Exec(
+		`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		DefaultSyncTargetKey, SyncEntitySession, "b-sess-0", SyncOpUpsert, `{}`, SyncSourceLocal, "proj-b",
+	); err != nil {
+		t.Fatalf("insert proj-b partial mutation: %v", err)
+	}
+
+	// proj-c: 2 sessions, no mutations.
+	for i := 0; i < 2; i++ {
+		id := fmt.Sprintf("c-sess-%d", i)
+		if _, err := s.db.Exec(
+			`INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, datetime('now'))`,
+			id, "proj-c", "/tmp/c",
+		); err != nil {
+			t.Fatalf("insert proj-c session: %v", err)
+		}
+	}
+
+	// Snapshot counts before repair.
+	beforeA := countSyncMutations(t, s, "proj-a")
+	beforeB := countSyncMutations(t, s, "proj-b")
+	beforeC := countSyncMutations(t, s, "proj-c")
+
+	if beforeA != 2 {
+		t.Fatalf("proj-a: expected 2 mutations before repair, got %d", beforeA)
+	}
+	if beforeB != 1 {
+		t.Fatalf("proj-b: expected 1 mutation before repair, got %d", beforeB)
+	}
+	if beforeC != 0 {
+		t.Fatalf("proj-c: expected 0 mutations before repair, got %d", beforeC)
+	}
+
+	// Run repair.
+	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+
+	afterA := countSyncMutations(t, s, "proj-a")
+	afterB := countSyncMutations(t, s, "proj-b")
+	afterC := countSyncMutations(t, s, "proj-c")
+
+	// proj-a: fully repaired — count must not change.
+	if afterA != beforeA {
+		t.Fatalf("proj-a: repair must not add mutations to fully repaired project: before=%d after=%d", beforeA, afterA)
+	}
+	// proj-b: was missing 2 sessions — must now have 3 total.
+	if afterB != 3 {
+		t.Fatalf("proj-b: expected 3 mutations after repair (1 existing + 2 backfilled), got %d", afterB)
+	}
+	// proj-c: was missing all 2 sessions — must now have 2.
+	if afterC != 2 {
+		t.Fatalf("proj-c: expected 2 mutations after repair, got %d", afterC)
+	}
 }
 
 // ─── Decay defaults tests — skipped: upstream feature not yet ported ─────────

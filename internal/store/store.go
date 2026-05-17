@@ -208,6 +208,39 @@ func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
+// newWithoutRepairSQLite creates a SQLiteStore that runs migrations but
+// skips the startup repair pass. Used by tests that need to seed raw data
+// before calling repairEnrolledProjectSyncMutations explicitly.
+func newWithoutRepairSQLite(cfg Config) (*SQLiteStore, error) {
+	if !filepath.IsAbs(cfg.DataDir) {
+		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q", cfg.DataDir)
+	}
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		return nil, fmt.Errorf("engram: create data dir: %w", err)
+	}
+	dbPath := filepath.Join(cfg.DataDir, "engram.db")
+	db, err := openDB("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("engram: open database: %w", err)
+	}
+	pragmas := []string{
+		"PRAGMA journal_mode = WAL",
+		"PRAGMA busy_timeout = 5000",
+		"PRAGMA synchronous = NORMAL",
+		"PRAGMA foreign_keys = ON",
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			return nil, fmt.Errorf("engram: pragma %q: %w", p, err)
+		}
+	}
+	s := &SQLiteStore{db: db, cfg: cfg, hooks: defaultStoreHooks()}
+	if err := s.migrate(); err != nil {
+		return nil, fmt.Errorf("engram: migration: %w", err)
+	}
+	return s, nil
+}
+
 // Identity returns the identity associated with the store.
 // For the SQLite backend, this is empty unless explicitly set.
 func (s *SQLiteStore) Identity() string {
