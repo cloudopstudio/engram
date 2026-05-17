@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches:
+      - master
       - main
 
 permissions:
@@ -13,6 +14,8 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    env:
+      ENGRAM_JUDGE_DISABLED: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -28,6 +31,8 @@ jobs:
   e2e-tests:
     name: E2E Tests
     runs-on: ubuntu-latest
+    env:
+      ENGRAM_JUDGE_DISABLED: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
