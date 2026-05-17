@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/cloud"
 	"github.com/Gentleman-Programming/engram/internal/config"
 	"github.com/Gentleman-Programming/engram/internal/mcp"
 	"github.com/Gentleman-Programming/engram/internal/obsidian"
@@ -112,6 +113,11 @@ var (
 	syncExport = func(sy *engramsync.Syncer, createdBy, project string) (*engramsync.SyncResult, error) {
 		return sy.Export(createdBy, project)
 	}
+
+	// newSyncTransport is injectable for testing; resolves --transport flag.
+	// transportType is "file" or "http". syncDir is used for the file transport.
+	// For the HTTP transport the caller must provide remoteURL, token, project.
+	newSyncTransport func(transportType, syncDir, project string) (engramsync.Transport, error) = defaultNewSyncTransport
 
 	exitFunc = os.Exit
 
@@ -766,6 +772,7 @@ func cmdSync(cfg store.Config) {
 	doStatus := false
 	doAll := false
 	project := ""
+	transportFlag := ""
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
 		case "--import":
@@ -779,7 +786,27 @@ func cmdSync(cfg store.Config) {
 				project = os.Args[i+1]
 				i++
 			}
+		case "--transport":
+			if i+1 < len(os.Args) {
+				transportFlag = os.Args[i+1]
+				i++
+			}
+		default:
+			if strings.HasPrefix(os.Args[i], "--transport=") {
+				transportFlag = strings.TrimPrefix(os.Args[i], "--transport=")
+			}
 		}
+	}
+
+	// Resolve transport type: flag → env → default (file).
+	if transportFlag == "" {
+		transportFlag = os.Getenv("ENGRAM_TRANSPORT")
+	}
+	transportType, err := normalizeTransportType(transportFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		exitFunc(1)
+		return
 	}
 
 	// Default project using git detection (so sync only exports
@@ -799,7 +826,17 @@ func cmdSync(cfg store.Config) {
 	}
 	defer s.Close()
 
-	sy := engramsync.NewLocal(s, syncDir)
+	transport, err := newSyncTransport(transportType, syncDir, project)
+	if err != nil {
+		fatal(err)
+	}
+
+	var sy *engramsync.Syncer
+	if transportType == "file" {
+		sy = engramsync.NewLocal(s, syncDir)
+	} else {
+		sy = engramsync.NewWithTransport(s, transport)
+	}
 
 	if doStatus {
 		local, remote, pending, err := syncStatus(sy)
@@ -1994,6 +2031,37 @@ func normalizeDBType(raw string) (store.DBType, error) {
 		return store.DBTypePostgres, nil
 	default:
 		return "", fmt.Errorf("engram: invalid --db-type %q (valid: sqlite, postgres)", raw)
+	}
+}
+
+// normalizeTransportType validates a --transport / ENGRAM_TRANSPORT value.
+// Returns "file" or "http". Returns an error for unrecognized values.
+func normalizeTransportType(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "file", "":
+		return "file", nil
+	case "http", "https":
+		return "http", nil
+	default:
+		return "", fmt.Errorf("engram: invalid transport %q (valid: file, http)", raw)
+	}
+}
+
+// defaultNewSyncTransport builds the appropriate sync.Transport from the
+// resolved transport type. For "file" it creates a FileTransport rooted at
+// syncDir. For "http" it reads ENGRAM_REMOTE_URL, ENGRAM_REMOTE_TOKEN, and
+// uses the provided project as the cloud project name.
+func defaultNewSyncTransport(transportType, syncDir, project string) (engramsync.Transport, error) {
+	switch transportType {
+	case "http":
+		remoteURL := strings.TrimSpace(os.Getenv("ENGRAM_REMOTE_URL"))
+		if remoteURL == "" {
+			return nil, fmt.Errorf("engram: ENGRAM_REMOTE_URL is required for --transport=http")
+		}
+		token := strings.TrimSpace(os.Getenv("ENGRAM_REMOTE_TOKEN"))
+		return cloud.NewHTTPTransport(remoteURL, token, project)
+	default: // "file"
+		return engramsync.NewFileTransport(syncDir), nil
 	}
 }
 
