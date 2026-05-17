@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,6 +34,10 @@ import (
 
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
+
+// ErrChunkNotFound is returned by Transport.ReadChunk when the requested chunk
+// does not exist on the remote or local store.
+var ErrChunkNotFound = errors.New("sync: chunk not found")
 
 var (
 	jsonMarshalChunk    = json.Marshal
