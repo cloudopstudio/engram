@@ -1,0 +1,48 @@
+# PostgreSQL matrix workflow — exercises the store test suite with both SQLite and PostgreSQL backends.
+# Uses dockertest (github.com/ory/dockertest) to spin up a Postgres 16 container inside the test
+# process — no GitHub Actions service container is needed.
+#
+# NOTE: This workflow is OPTIONAL until 2026-06-01. After that date, flip to required
+# via branch protection (Settings → Branches → add status check "Store Tests (postgres)").
+
+name: Store Matrix (SQLite + PostgreSQL)
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  store-tests:
+    name: Store Tests (${{ matrix.db_type }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        db_type: [sqlite, postgres]
+
+    env:
+      ENGRAM_JUDGE_DISABLED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.10"
+
+      - name: Run store tests (SQLite)
+        if: matrix.db_type == 'sqlite'
+        run: go test -count=1 ./...
+
+      - name: Run store tests (PostgreSQL via dockertest)
+        if: matrix.db_type == 'postgres'
+        run: go test -count=1 ./internal/store/...
