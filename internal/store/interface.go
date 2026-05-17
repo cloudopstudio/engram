@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Store is the persistence contract satisfied by every Engram backend. The
 // SQLite-backed *SQLiteStore and the PostgreSQL-backed *PostgresStore both
@@ -97,4 +100,12 @@ type Store interface {
 	CountRelations(opts ListRelationsOptions) (int, error)
 	GetRelationStats(project string) (RelationStats, error)
 	CountDeferredAndDead() (deferred, dead int, err error)
+
+	// Operational diagnostics (doctor subsystem)
+	ListDiagnosticSessions(project string) ([]DiagnosticSessionEvidence, error)
+	ListPendingProjectMutations(project string) ([]SyncMutation, error)
+	ReadSQLiteLockSnapshot(ctx context.Context) (SQLiteLockSnapshot, error)
+	EstimateSessionProjectReclassification(actions []SessionProjectReclassification) (SessionProjectReclassificationCounts, error)
+	ApplySessionProjectReclassification(actions []SessionProjectReclassification) (SessionProjectReclassificationResult, error)
+	BackupSQLite() (string, error)
 }

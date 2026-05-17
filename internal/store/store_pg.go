@@ -2928,6 +2928,156 @@ func ResolveInteractiveAuthExported(dataDir, profile string) (tenantID, clientID
 // GetRelationsForObservations, ListRelations, CountRelations,
 // GetRelationStats, CountDeferredAndDead) live in relations_pg.go.
 
+// ─── Operational diagnostics (doctor subsystem) ──────────────────────────────
+
+// ListDiagnosticSessions returns session evidence scoped by project.
+func (s *PostgresStore) ListDiagnosticSessions(project string) ([]DiagnosticSessionEvidence, error) {
+	ctx := context.Background()
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	query := `SELECT id, project, COALESCE(directory, ''), id FROM sessions`
+	args := []any{}
+	if project != "" {
+		query += ` WHERE project = $1`
+		args = append(args, project)
+	}
+	query += ` ORDER BY started_at DESC, id ASC`
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	sessions := make([]DiagnosticSessionEvidence, 0)
+	for rows.Next() {
+		var ev DiagnosticSessionEvidence
+		if err := rows.Scan(&ev.ID, &ev.Project, &ev.Directory, &ev.Name); err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, ev)
+	}
+	return sessions, rows.Err()
+}
+
+// ListPendingProjectMutations returns pending cloud mutations for one project
+// or all projects when project is empty.
+func (s *PostgresStore) ListPendingProjectMutations(project string) ([]SyncMutation, error) {
+	ctx := context.Background()
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	argN := 1
+	query := fmt.Sprintf(`
+		SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
+		FROM sync_mutations
+		WHERE target_key = $%d AND acked_at IS NULL`, argN)
+	argN++
+	args := []any{DefaultSyncTargetKey}
+	if project != "" {
+		query += fmt.Sprintf(` AND project = $%d`, argN)
+		args = append(args, project)
+	}
+	query += ` ORDER BY seq ASC`
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	mutations := make([]SyncMutation, 0)
+	for rows.Next() {
+		var m SyncMutation
+		if err := rows.Scan(&m.Seq, &m.TargetKey, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.Source, &m.Project, &m.OccurredAt, &m.AckedAt); err != nil {
+			return nil, err
+		}
+		mutations = append(mutations, m)
+	}
+	return mutations, rows.Err()
+}
+
+// ReadSQLiteLockSnapshot returns an empty snapshot on PostgreSQL — there are no
+// SQLite locks to report. The sqlite_lock_contention check sees no contention.
+func (s *PostgresStore) ReadSQLiteLockSnapshot(_ context.Context) (SQLiteLockSnapshot, error) {
+	// PostgreSQL does not use SQLite locks. Return a zero-contention snapshot
+	// with a positive BusyTimeoutMS so the contention check reports clean.
+	return SQLiteLockSnapshot{
+		JournalMode:        "pg",
+		BusyTimeoutMS:      5000,
+		CheckpointBusy:     0,
+		CheckpointLog:      0,
+		CheckpointedFrames: 0,
+	}, nil
+}
+
+// EstimateSessionProjectReclassification counts rows that would change without mutating.
+func (s *PostgresStore) EstimateSessionProjectReclassification(actions []SessionProjectReclassification) (SessionProjectReclassificationCounts, error) {
+	ctx := context.Background()
+	var counts SessionProjectReclassificationCounts
+	for _, action := range normalizeSessionProjectReclassificationActions(actions) {
+		var n int64
+		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE id = $1 AND project = $2`, action.SessionID, action.FromProject).Scan(&n); err != nil {
+			return counts, fmt.Errorf("estimate sessions: %w", err)
+		}
+		counts.Sessions += n
+		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM observations WHERE session_id = $1 AND project = $2 AND deleted_at IS NULL`, action.SessionID, action.FromProject).Scan(&n); err != nil {
+			return counts, fmt.Errorf("estimate observations: %w", err)
+		}
+		counts.Observations += n
+		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM user_prompts WHERE session_id = $1 AND project = $2`, action.SessionID, action.FromProject).Scan(&n); err != nil {
+			return counts, fmt.Errorf("estimate prompts: %w", err)
+		}
+		counts.Prompts += n
+	}
+	return counts, nil
+}
+
+// ApplySessionProjectReclassification reclassifies sessions, observations, and
+// user_prompts atomically. On PostgreSQL there is no SQLite backup; BackupPath is empty.
+func (s *PostgresStore) ApplySessionProjectReclassification(actions []SessionProjectReclassification) (SessionProjectReclassificationResult, error) {
+	normalized := normalizeSessionProjectReclassificationActions(actions)
+	var result SessionProjectReclassificationResult
+	// BackupPath is empty on PG — no SQLite file to back up.
+	err := s.withTx(context.Background(), func(tx pgx.Tx) error {
+		for _, action := range normalized {
+			tag, err := tx.Exec(context.Background(),
+				`UPDATE sessions SET project = $1 WHERE id = $2 AND project = $3`,
+				action.ToProject, action.SessionID, action.FromProject)
+			if err != nil {
+				return fmt.Errorf("reclassify session %q: %w", action.SessionID, err)
+			}
+			result.Counts.Sessions += tag.RowsAffected()
+
+			tag, err = tx.Exec(context.Background(),
+				`UPDATE observations SET project = $1 WHERE session_id = $2 AND project = $3`,
+				action.ToProject, action.SessionID, action.FromProject)
+			if err != nil {
+				return fmt.Errorf("reclassify observations for session %q: %w", action.SessionID, err)
+			}
+			result.Counts.Observations += tag.RowsAffected()
+
+			tag, err = tx.Exec(context.Background(),
+				`UPDATE user_prompts SET project = $1 WHERE session_id = $2 AND project = $3`,
+				action.ToProject, action.SessionID, action.FromProject)
+			if err != nil {
+				return fmt.Errorf("reclassify prompts for session %q: %w", action.SessionID, err)
+			}
+			result.Counts.Prompts += tag.RowsAffected()
+		}
+		return nil
+	})
+	if err != nil {
+		return SessionProjectReclassificationResult{}, err
+	}
+	return result, nil
+}
+
+// BackupSQLite is a no-op on PostgreSQL — there is no SQLite file to back up.
+// Returns an empty backup path without error.
+func (s *PostgresStore) BackupSQLite() (string, error) {
+	return "", nil
+}
+
 // Compile-time assertion that *PostgresStore satisfies the Store interface.
 var _ Store = (*PostgresStore)(nil)
 
