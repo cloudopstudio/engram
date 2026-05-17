@@ -95,6 +95,8 @@ var ProfileAgent = map[string]bool{
 	"mem_promote":           true, // promote personal observation to project scope
 	"mem_who":               true, // list contributors with stats
 	"mem_current_project":   true, // detect current project — discovery before writing
+	"mem_judge":             true, // record verdict on a pending memory conflict (REQ-003)
+	"mem_compare":           true, // persist an agent-judged semantic verdict via JudgeBySemantic (REQ-011)
 }
 
 // ProfileAdmin contains tools for TUI, dashboards, and manual curation
@@ -800,6 +802,83 @@ Duplicates are automatically detected and skipped — safe to call multiple time
 		)
 	}
 
+	// ─── mem_judge (profile: agent, eager) — REQ-003 ─────────────────────
+	if shouldRegister("mem_judge", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_judge",
+				mcp.WithDescription(`Record your verdict on a pending memory conflict.
+
+WHEN TO CALL: After mem_save returns judgment_required=true, iterate candidates[] and call mem_judge once per entry using that entry's judgment_id.
+
+REQUIRED:
+  judgment_id (required) — the sync_id from a pending memory_relations row
+  relation    (required) — one of: related, compatible, scoped, conflicts_with, supersedes, not_conflict
+
+OPTIONAL:
+  reason      — short free-text explanation of your verdict
+  evidence    — supporting text or JSON evidence
+  confidence  — 0.0..1.0 self-reported confidence score
+  session_id  — the session in which you are judging
+
+WHEN TO ASK vs RESOLVE SILENTLY:
+  - relation in {supersedes, conflicts_with} AND type in {architecture, policy, decision}: ask user
+  - all other verdicts: resolve silently
+
+SUCCESS: Returns the updated relation row with judgment_status="judged".
+ERROR: Returns IsError=true if judgment_id is unknown or relation verb is invalid.`),
+				mcp.WithTitleAnnotation("Judge Memory Conflict"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithString("judgment_id", mcp.Description("sync_id of the pending relation row to judge"), mcp.Required()),
+				mcp.WithString("relation", mcp.Description("Verdict verb: related, compatible, scoped, conflicts_with, supersedes, not_conflict"), mcp.Required()),
+				mcp.WithString("reason", mcp.Description("Optional free-text explanation")),
+				mcp.WithString("evidence", mcp.Description("Optional supporting evidence (text or JSON)")),
+				mcp.WithNumber("confidence", mcp.Description("Optional confidence score 0.0..1.0")),
+				mcp.WithString("session_id", mcp.Description("Optional session context")),
+			),
+			handleJudge(s, activity),
+		)
+	}
+
+	// ─── mem_compare (profile: agent, eager) — REQ-011 ───────────────────
+	if shouldRegister("mem_compare", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_compare",
+				mcp.WithDescription(`Persist a semantic verdict you have already judged externally into Engram.
+
+WHEN TO CALL: After you have evaluated two memories and reached a verdict, call mem_compare to PERSIST that verdict into the relation store. You do the judgment; mem_compare records it.
+
+REQUIRED:
+  memory_id_a  (required) — integer id of the first observation
+  memory_id_b  (required) — integer id of the second observation
+  relation     (required) — one of: related, compatible, scoped, conflicts_with, supersedes, not_conflict
+  reasoning    (required) — short explanation of your verdict (max 200 chars recommended)
+  confidence   (required) — 0.0..1.0 confidence score
+
+OPTIONAL:
+  model        — LLM model identifier (stored as marked_by_model)
+
+SUCCESS: Returns {"sync_id": "<rel-...>"} — the persisted relation's sync_id.
+         When relation is "not_conflict", returns {"sync_id": ""} (no-op).
+ERROR: Returns IsError=true if IDs are unknown, relation is invalid, or cross-project pair.`),
+				mcp.WithTitleAnnotation("Compare Memory Pair (Persist Semantic Verdict)"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(false),
+				mcp.WithIdempotentHintAnnotation(false),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithNumber("memory_id_a", mcp.Description("Integer id of the first observation"), mcp.Required()),
+				mcp.WithNumber("memory_id_b", mcp.Description("Integer id of the second observation"), mcp.Required()),
+				mcp.WithString("relation", mcp.Description("Verdict verb: related, compatible, scoped, conflicts_with, supersedes, not_conflict"), mcp.Required()),
+				mcp.WithString("reasoning", mcp.Description("Short explanation of your verdict"), mcp.Required()),
+				mcp.WithNumber("confidence", mcp.Description("Confidence score 0.0..1.0"), mcp.Required()),
+				mcp.WithString("model", mcp.Description("Optional LLM model identifier")),
+			),
+			handleCompare(s),
+		)
+	}
+
 }
 
 // ─── Tool Handlers ───────────────────────────────────────────────────────────
@@ -1249,6 +1328,142 @@ func handleDoctor(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 		}
 		_ = detRes // diagnostic subsystem not yet ported to this fork
 		return mcp.NewToolResultText(`{"status":"ok","message":"mem_doctor not yet available in this build"}`), nil
+	}
+}
+
+// handleJudge implements mem_judge. Records a verdict on a pending memory
+// conflict (REQ-003). Honours ENGRAM_JUDGE_DISABLED=1 env var.
+func handleJudge(s store.Store, activity *SessionActivity) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if os.Getenv("ENGRAM_JUDGE_DISABLED") == "1" {
+			out, _ := jsonMarshal(map[string]any{
+				"disabled": true,
+				"message":  "mem_judge is disabled in this deployment (ENGRAM_JUDGE_DISABLED=1)",
+			})
+			return mcp.NewToolResultText(string(out)), nil
+		}
+
+		judgmentID, _ := req.GetArguments()["judgment_id"].(string)
+		relation, _ := req.GetArguments()["relation"].(string)
+
+		if judgmentID == "" {
+			return mcp.NewToolResultError("judgment_id is required"), nil
+		}
+		if relation == "" {
+			return mcp.NewToolResultError("relation is required"), nil
+		}
+
+		var reason *string
+		if v, ok := req.GetArguments()["reason"].(string); ok && v != "" {
+			reason = &v
+		}
+		var evidence *string
+		if v, ok := req.GetArguments()["evidence"].(string); ok && v != "" {
+			evidence = &v
+		}
+		var confidence *float64
+		if v, ok := req.GetArguments()["confidence"].(float64); ok {
+			if v < 0 || v > 1 {
+				return mcp.NewToolResultError("confidence must be between 0.0 and 1.0"), nil
+			}
+			confidence = &v
+		}
+
+		sessionID, _ := req.GetArguments()["session_id"].(string)
+		markedByActor := "agent"
+		markedByKind := "agent"
+
+		result, err := s.JudgeRelation(store.JudgeRelationParams{
+			JudgmentID:    judgmentID,
+			Relation:      relation,
+			Reason:        reason,
+			Evidence:      evidence,
+			Confidence:    confidence,
+			MarkedByActor: markedByActor,
+			MarkedByKind:  markedByKind,
+			MarkedByModel: "",
+			SessionID:     sessionID,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		envelope := map[string]any{
+			"relation": result,
+		}
+		out, _ := jsonMarshal(envelope)
+		return mcp.NewToolResultText(string(out)), nil
+	}
+}
+
+// handleCompare implements mem_compare. Persists a semantic verdict produced
+// externally by the agent (REQ-011). Honours ENGRAM_JUDGE_DISABLED=1.
+func handleCompare(s store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if os.Getenv("ENGRAM_JUDGE_DISABLED") == "1" {
+			out, _ := jsonMarshal(map[string]any{
+				"disabled": true,
+				"message":  "mem_compare is disabled in this deployment (ENGRAM_JUDGE_DISABLED=1)",
+			})
+			return mcp.NewToolResultText(string(out)), nil
+		}
+
+		rawA, okA := req.GetArguments()["memory_id_a"].(float64)
+		rawB, okB := req.GetArguments()["memory_id_b"].(float64)
+		if !okA {
+			return mcp.NewToolResultError("memory_id_a is required (integer observation id)"), nil
+		}
+		if !okB {
+			return mcp.NewToolResultError("memory_id_b is required (integer observation id)"), nil
+		}
+		idA := int64(rawA)
+		idB := int64(rawB)
+
+		relation, _ := req.GetArguments()["relation"].(string)
+		if relation == "" {
+			return mcp.NewToolResultError("relation is required"), nil
+		}
+		reasoning, _ := req.GetArguments()["reasoning"].(string)
+		if reasoning == "" {
+			return mcp.NewToolResultError("reasoning is required"), nil
+		}
+
+		rawConf, okConf := req.GetArguments()["confidence"].(float64)
+		if !okConf {
+			return mcp.NewToolResultError("confidence is required (float 0.0..1.0)"), nil
+		}
+		if rawConf < 0 || rawConf > 1 {
+			return mcp.NewToolResultError("confidence must be between 0.0 and 1.0"), nil
+		}
+
+		model, _ := req.GetArguments()["model"].(string)
+
+		obsA, err := s.GetObservation(idA)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("observation id=%d not found: %s", idA, err)), nil
+		}
+		obsB, err := s.GetObservation(idB)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("observation id=%d not found: %s", idB, err)), nil
+		}
+
+		syncID, err := s.JudgeBySemantic(store.JudgeBySemanticParams{
+			SourceID:   obsA.SyncID,
+			TargetID:   obsB.SyncID,
+			Relation:   relation,
+			Confidence: rawConf,
+			Reasoning:  reasoning,
+			Model:      model,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		envelope := map[string]any{
+			"sync_id": syncID,
+		}
+		out, _ := jsonMarshal(envelope)
+		return mcp.NewToolResultText(string(out)), nil
 	}
 }
 
@@ -2106,31 +2321,10 @@ func resolveReadProjectWithProcessOverride(s store.Store, override, defaultProje
 }
 
 // projectExists checks whether a project name is "known" to the store —
-// either because it is enrolled, has observations, or has an associated session.
-// This matches the upstream's ProjectExists semantics which checks enrollment,
-// observations, sessions, and prompts.
+// either because it is enrolled, has observations, sessions, or prompts.
+// Delegates to store.ProjectExists (UNION ALL LIMIT 1 query).
 func projectExists(s store.Store, name string) (bool, error) {
-	// Check enrollment first (fast path, no full table scan).
-	enrolled, err := s.IsProjectEnrolled(name)
-	if err == nil && enrolled {
-		return true, nil
-	}
-	// Check observations.
-	names, err := s.ListProjectNames()
-	if err != nil {
-		return false, err
-	}
-	for _, n := range names {
-		if n == name {
-			return true, nil
-		}
-	}
-	// Check sessions: a project is "known" if any session belongs to it.
-	sessions, err := s.RecentSessions(name, 1)
-	if err == nil && len(sessions) > 0 {
-		return true, nil
-	}
-	return false, nil
+	return s.ProjectExists(name)
 }
 
 func resolveReadProject(s store.Store, override string) (projectpkg.DetectionResult, error) {
