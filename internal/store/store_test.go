@@ -4678,31 +4678,128 @@ func TestDeletePrompt_NotFound(t *testing.T) {
 }
 
 
-// ─── ProjectExists tests — skipped: upstream feature not yet ported ───────────
-// TODO(merge-upstream-v2 PR #2/#3): port ProjectExists from gentle/main to enable these tests
+// ─── ProjectExists tests ──────────────────────────────────────────────────────
 
 func TestProjectExists_EmptyStore(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	exists, err := s.ProjectExists("any-project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exists {
+		t.Error("expected false on empty store")
+	}
 }
 
 func TestProjectExists_Known(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-1", "my-project", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-1",
+		Type:      "manual",
+		Title:     "test",
+		Content:   "test content",
+		Project:   "my-project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	exists, err := s.ProjectExists("my-project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Error("expected true for known project with observation")
+	}
 }
 
 func TestProjectExists_KnownViaSession(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-only", "session-only-project", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	exists, err := s.ProjectExists("session-only-project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Error("expected true for project with a session only")
+	}
 }
 
 func TestProjectExists_KnownViaPrompt(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-prompt", "prompt-only-project", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err := s.AddPrompt(AddPromptParams{
+		SessionID: "sess-prompt",
+		Content:   "what is this?",
+		Project:   "prompt-only-project",
+	})
+	if err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	exists, err := s.ProjectExists("prompt-only-project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Error("expected true for project with a prompt only")
+	}
 }
 
 func TestProjectExists_Unknown(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-other", "other-project", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-other",
+		Type:      "manual",
+		Title:     "other",
+		Content:   "other content",
+		Project:   "other-project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	exists, err := s.ProjectExists("does-not-exist")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exists {
+		t.Error("expected false for unknown project in populated store")
+	}
 }
 
+// TestProjectExists_KnownViaEnrollmentOnly: a project enrolled via EnrollProject()
+// with no observations/sessions/prompts must still be found by ProjectExists.
 func TestProjectExists_KnownViaEnrollmentOnly(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ProjectExists — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	if err := s.EnrollProject("enrolled-only-project"); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
+
+	exists, err := s.ProjectExists("enrolled-only-project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Error("enrolled-only-project must be found via sync_enrolled_projects UNION ALL branch")
+	}
 }
 
 // ─── Doctor diagnostic helpers — skipped: upstream feature not yet ported ────

@@ -69,6 +69,7 @@ type Store interface {
 	IsProjectEnrolled(project string) (bool, error)
 
 	// Project lifecycle / introspection
+	ProjectExists(name string) (bool, error)
 	MigrateProject(oldName, newName string) (*MigrateResult, error)
 	ListProjectNames() ([]string, error)
 	ListProjects(includeDeprecated bool) ([]ProjectStats, error)
@@ -84,4 +85,16 @@ type Store interface {
 	PromoteObservation(id int64, identity string) error
 	ListContributors(project string) ([]ContributorStats, error)
 	PassiveCapture(p PassiveCaptureParams) (*PassiveCaptureResult, error)
+
+	// Memory relations — conflict surfacing (mem_judge / mem_compare subsystem)
+	FindCandidates(savedID int64, opts CandidateOptions) ([]Candidate, error)
+	SaveRelation(p SaveRelationParams) (*Relation, error)
+	GetRelation(syncID string) (*Relation, error)
+	JudgeRelation(p JudgeRelationParams) (*Relation, error)
+	JudgeBySemantic(p JudgeBySemanticParams) (string, error)
+	GetRelationsForObservations(syncIDs []string) (map[string]ObservationRelations, error)
+	ListRelations(opts ListRelationsOptions) ([]RelationListItem, error)
+	CountRelations(opts ListRelationsOptions) (int, error)
+	GetRelationStats(project string) (RelationStats, error)
+	CountDeferredAndDead() (deferred, dead int, err error)
 }
