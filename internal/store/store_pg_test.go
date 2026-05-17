@@ -1582,3 +1582,363 @@ func TestPGRLSMigrationIdempotent(t *testing.T) {
 		t.Fatalf("second migratePG run failed: %v", err)
 	}
 }
+
+// ─── Relations — PostgresStore ────────────────────────────────────────────────
+
+func TestPGSaveAndGetRelation(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	syncID := newSyncID("rel")
+	rel, err := s.SaveRelation(SaveRelationParams{
+		SyncID:   syncID,
+		SourceID: "obs-src-001",
+		TargetID: "obs-tgt-001",
+	})
+	if err != nil {
+		t.Fatalf("SaveRelation: %v", err)
+	}
+	if rel.SyncID != syncID {
+		t.Errorf("expected sync_id %q, got %q", syncID, rel.SyncID)
+	}
+	if rel.Relation != "pending" {
+		t.Errorf("expected initial relation 'pending', got %q", rel.Relation)
+	}
+	if rel.JudgmentStatus != "pending" {
+		t.Errorf("expected initial judgment_status 'pending', got %q", rel.JudgmentStatus)
+	}
+
+	// Verify GetRelation round-trip.
+	got, err := s.GetRelation(syncID)
+	if err != nil {
+		t.Fatalf("GetRelation: %v", err)
+	}
+	if got.SyncID != syncID {
+		t.Errorf("GetRelation SyncID mismatch: %q vs %q", got.SyncID, syncID)
+	}
+	if got.CreatedAt == "" {
+		t.Error("GetRelation: CreatedAt is empty (PG timestamp scan failed)")
+	}
+}
+
+func TestPGGetRelation_NotFound(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	_, err := s.GetRelation("rel-nonexistent-000")
+	if err == nil {
+		t.Fatal("expected error for missing relation, got nil")
+	}
+}
+
+func TestPGJudgeRelation(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	syncID := newSyncID("rel")
+	if _, err := s.SaveRelation(SaveRelationParams{
+		SyncID:   syncID,
+		SourceID: "obs-src-002",
+		TargetID: "obs-tgt-002",
+	}); err != nil {
+		t.Fatalf("SaveRelation: %v", err)
+	}
+
+	reason := "they share the same topic"
+	rel, err := s.JudgeRelation(JudgeRelationParams{
+		JudgmentID:    syncID,
+		Relation:      RelationRelated,
+		Reason:        &reason,
+		MarkedByActor: "test-agent",
+		MarkedByKind:  "agent",
+	})
+	if err != nil {
+		t.Fatalf("JudgeRelation: %v", err)
+	}
+	if rel.Relation != RelationRelated {
+		t.Errorf("expected relation %q, got %q", RelationRelated, rel.Relation)
+	}
+	if rel.JudgmentStatus != "judged" {
+		t.Errorf("expected status 'judged', got %q", rel.JudgmentStatus)
+	}
+	if rel.Reason == nil || *rel.Reason != reason {
+		t.Errorf("expected reason %q, got %v", reason, rel.Reason)
+	}
+}
+
+func TestPGJudgeRelation_InvalidVerb(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	syncID := newSyncID("rel")
+	if _, err := s.SaveRelation(SaveRelationParams{
+		SyncID:   syncID,
+		SourceID: "obs-src-003",
+		TargetID: "obs-tgt-003",
+	}); err != nil {
+		t.Fatalf("SaveRelation: %v", err)
+	}
+
+	_, err := s.JudgeRelation(JudgeRelationParams{
+		JudgmentID:    syncID,
+		Relation:      "invalid_verb",
+		MarkedByActor: "test",
+		MarkedByKind:  "agent",
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid verb, got nil")
+	}
+}
+
+func TestPGJudgeBySemantic_InsertAndUpdate(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	// Insert path.
+	sid, err := s.JudgeBySemantic(JudgeBySemanticParams{
+		SourceID:   "obs-src-004",
+		TargetID:   "obs-tgt-004",
+		Relation:   RelationCompatible,
+		Confidence: 0.85,
+		Reasoning:  "compatible topics",
+		Model:      "claude-sonnet-4-6",
+	})
+	if err != nil {
+		t.Fatalf("JudgeBySemantic insert: %v", err)
+	}
+	if sid == "" {
+		t.Fatal("expected non-empty sync_id")
+	}
+
+	// Idempotent update path (same pair, different verb).
+	sid2, err := s.JudgeBySemantic(JudgeBySemanticParams{
+		SourceID:   "obs-src-004",
+		TargetID:   "obs-tgt-004",
+		Relation:   RelationRelated,
+		Confidence: 0.90,
+		Reasoning:  "updated judgment",
+		Model:      "claude-sonnet-4-6",
+	})
+	if err != nil {
+		t.Fatalf("JudgeBySemantic update: %v", err)
+	}
+	if sid2 != sid {
+		t.Errorf("expected same sync_id on upsert: %q vs %q", sid2, sid)
+	}
+
+	// Verify via GetRelation.
+	rel, err := s.GetRelation(sid)
+	if err != nil {
+		t.Fatalf("GetRelation after JudgeBySemantic: %v", err)
+	}
+	if rel.Relation != RelationRelated {
+		t.Errorf("expected updated relation %q, got %q", RelationRelated, rel.Relation)
+	}
+}
+
+func TestPGJudgeBySemantic_NotConflictIsNoop(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	sid, err := s.JudgeBySemantic(JudgeBySemanticParams{
+		SourceID:   "obs-src-005",
+		TargetID:   "obs-tgt-005",
+		Relation:   RelationNotConflict,
+		Confidence: 0.99,
+	})
+	if err != nil {
+		t.Fatalf("JudgeBySemantic not_conflict: %v", err)
+	}
+	if sid != "" {
+		t.Errorf("expected empty sync_id for not_conflict noop, got %q", sid)
+	}
+}
+
+func TestPGListAndCountRelations(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	// Insert a few relations.
+	for i := 0; i < 3; i++ {
+		if _, err := s.SaveRelation(SaveRelationParams{
+			SyncID:   newSyncID("rel"),
+			SourceID: fmt.Sprintf("obs-list-src-%d", i),
+			TargetID: fmt.Sprintf("obs-list-tgt-%d", i),
+		}); err != nil {
+			t.Fatalf("SaveRelation %d: %v", i, err)
+		}
+	}
+
+	items, err := s.ListRelations(ListRelationsOptions{})
+	if err != nil {
+		t.Fatalf("ListRelations: %v", err)
+	}
+	if len(items) < 3 {
+		t.Errorf("expected at least 3 items, got %d", len(items))
+	}
+	for _, item := range items {
+		if item.CreatedAt == "" {
+			t.Error("ListRelations: item.CreatedAt is empty (PG timestamp scan failed)")
+		}
+	}
+
+	total, err := s.CountRelations(ListRelationsOptions{})
+	if err != nil {
+		t.Fatalf("CountRelations: %v", err)
+	}
+	if total < 3 {
+		t.Errorf("expected total >= 3, got %d", total)
+	}
+
+	// Filter by status.
+	pending, err := s.CountRelations(ListRelationsOptions{Status: "pending"})
+	if err != nil {
+		t.Fatalf("CountRelations pending: %v", err)
+	}
+	if pending < 3 {
+		t.Errorf("expected at least 3 pending, got %d", pending)
+	}
+}
+
+func TestPGGetRelationStats(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	// Insert a relation and judge it so we have both pending and judged rows.
+	sid := newSyncID("rel")
+	if _, err := s.SaveRelation(SaveRelationParams{
+		SyncID:   sid,
+		SourceID: "obs-stats-src-1",
+		TargetID: "obs-stats-tgt-1",
+	}); err != nil {
+		t.Fatalf("SaveRelation: %v", err)
+	}
+
+	stats, err := s.GetRelationStats("")
+	if err != nil {
+		t.Fatalf("GetRelationStats: %v", err)
+	}
+	if stats.ByJudgmentStatus["pending"] < 1 {
+		t.Errorf("expected at least 1 pending in stats, got %v", stats.ByJudgmentStatus)
+	}
+}
+
+func TestPGCountDeferredAndDead(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	// Empty table — should return 0,0 without error.
+	deferred, dead, err := s.CountDeferredAndDead()
+	if err != nil {
+		t.Fatalf("CountDeferredAndDead: %v", err)
+	}
+	if deferred != 0 || dead != 0 {
+		t.Errorf("expected 0,0 on empty table, got %d,%d", deferred, dead)
+	}
+}
+
+func TestPGGetRelationsForObservations(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	srcID := "obs-rel-src-007"
+	tgtID := "obs-rel-tgt-007"
+	sid := newSyncID("rel")
+	if _, err := s.SaveRelation(SaveRelationParams{
+		SyncID:   sid,
+		SourceID: srcID,
+		TargetID: tgtID,
+	}); err != nil {
+		t.Fatalf("SaveRelation: %v", err)
+	}
+
+	result, err := s.GetRelationsForObservations([]string{srcID, tgtID})
+	if err != nil {
+		t.Fatalf("GetRelationsForObservations: %v", err)
+	}
+
+	srcRels, ok := result[srcID]
+	if !ok {
+		t.Fatalf("expected entry for srcID in result map")
+	}
+	if len(srcRels.AsSource) == 0 {
+		t.Errorf("expected at least one AsSource relation for srcID")
+	}
+	if srcRels.AsSource[0].SyncID != sid {
+		t.Errorf("expected SyncID %q, got %q", sid, srcRels.AsSource[0].SyncID)
+	}
+	if srcRels.AsSource[0].CreatedAt == "" {
+		t.Error("GetRelationsForObservations: CreatedAt is empty (PG timestamp scan failed)")
+	}
+
+	tgtRels := result[tgtID]
+	if len(tgtRels.AsTarget) == 0 {
+		t.Errorf("expected at least one AsTarget relation for tgtID")
+	}
+
+	// Empty input — should return empty map without error.
+	empty, err := s.GetRelationsForObservations([]string{})
+	if err != nil {
+		t.Fatalf("GetRelationsForObservations empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("expected empty map, got %d entries", len(empty))
+	}
+}
+
+func TestPGFindCandidates_SkipInsert(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	// PG enforces a FK on session_id — create sessions first.
+	if err := s.CreateSession("sess-fc-001", "test-project", "/tmp"); err != nil {
+		t.Fatalf("CreateSession 1: %v", err)
+	}
+	if err := s.CreateSession("sess-fc-002", "test-project", "/tmp"); err != nil {
+		t.Fatalf("CreateSession 2: %v", err)
+	}
+
+	// Add a source observation.
+	srcID, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-fc-001",
+		Type:      "manual",
+		Title:     "JWT authentication token refresh flow",
+		Content:   "How JWT tokens are refreshed using the refresh token endpoint",
+		Project:   "test-project",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation source: %v", err)
+	}
+
+	// Add a candidate observation with similar content.
+	_, err = s.AddObservation(AddObservationParams{
+		SessionID: "sess-fc-002",
+		Type:      "manual",
+		Title:     "JWT token expiration handling",
+		Content:   "Handling expired JWT tokens and refreshing them",
+		Project:   "test-project",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation candidate: %v", err)
+	}
+
+	// FindCandidates with SkipInsert=true: no relation rows created.
+	candidates, err := s.FindCandidates(srcID, CandidateOptions{
+		Project:    "test-project",
+		Scope:      "project",
+		Limit:      5,
+		SkipInsert: true,
+	})
+	if err != nil {
+		t.Fatalf("FindCandidates SkipInsert: %v", err)
+	}
+	// Result may be empty if FTS index hasn't updated yet, but must not error.
+	for _, c := range candidates {
+		if c.JudgmentID != "" {
+			t.Error("SkipInsert=true should not produce JudgmentID")
+		}
+	}
+	t.Logf("FindCandidates SkipInsert returned %d candidates", len(candidates))
+}

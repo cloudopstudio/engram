@@ -2921,65 +2921,12 @@ func ResolveInteractiveAuthExported(dataDir, profile string) (tenantID, clientID
 	return resolveInteractiveAuth(dataDir, profile)
 }
 
-// ─── Memory Relations — PostgresStore stubs ───────────────────────────────────
+// ─── Memory Relations — see relations_pg.go ───────────────────────────────────
 //
-// Full PostgreSQL relation implementations are deferred to a future PR
-// (merge-upstream-v2 PR #3+). These stubs satisfy the Store interface so the
-// unified binary compiles. The MCP gate (ENGRAM_JUDGE_DISABLED=1) prevents
-// these from being exercised in PG deployments until they are ported.
-
-// FindCandidates is not yet implemented for PostgresStore.
-func (s *PostgresStore) FindCandidates(_ int64, _ CandidateOptions) ([]Candidate, error) {
-	return nil, fmt.Errorf("FindCandidates: not yet implemented for PostgresStore (deferred to PR #3)")
-}
-
-// SaveRelation is not yet implemented for PostgresStore.
-func (s *PostgresStore) SaveRelation(_ SaveRelationParams) (*Relation, error) {
-	return nil, fmt.Errorf("SaveRelation: not yet implemented for PostgresStore (deferred to PR #3)")
-}
-
-// GetRelation is not yet implemented for PostgresStore.
-func (s *PostgresStore) GetRelation(_ string) (*Relation, error) {
-	return nil, fmt.Errorf("GetRelation: not yet implemented for PostgresStore (deferred to PR #3)")
-}
-
-// JudgeRelation is not yet implemented for PostgresStore.
-func (s *PostgresStore) JudgeRelation(_ JudgeRelationParams) (*Relation, error) {
-	return nil, fmt.Errorf("JudgeRelation: not yet implemented for PostgresStore (deferred to PR #3)")
-}
-
-// JudgeBySemantic is not yet implemented for PostgresStore.
-func (s *PostgresStore) JudgeBySemantic(_ JudgeBySemanticParams) (string, error) {
-	return "", fmt.Errorf("JudgeBySemantic: not yet implemented for PostgresStore (deferred to PR #3)")
-}
-
-// GetRelationsForObservations is not yet implemented for PostgresStore.
-func (s *PostgresStore) GetRelationsForObservations(_ []string) (map[string]ObservationRelations, error) {
-	return map[string]ObservationRelations{}, nil
-}
-
-// ListRelations is not yet implemented for PostgresStore.
-func (s *PostgresStore) ListRelations(_ ListRelationsOptions) ([]RelationListItem, error) {
-	return []RelationListItem{}, nil
-}
-
-// CountRelations is not yet implemented for PostgresStore.
-func (s *PostgresStore) CountRelations(_ ListRelationsOptions) (int, error) {
-	return 0, nil
-}
-
-// GetRelationStats is not yet implemented for PostgresStore.
-func (s *PostgresStore) GetRelationStats(_ string) (RelationStats, error) {
-	return RelationStats{
-		ByRelation:       map[string]int{},
-		ByJudgmentStatus: map[string]int{},
-	}, nil
-}
-
-// CountDeferredAndDead is not yet implemented for PostgresStore.
-func (s *PostgresStore) CountDeferredAndDead() (deferred, dead int, err error) {
-	return 0, 0, nil
-}
+// All PostgresStore relation method implementations (FindCandidates,
+// SaveRelation, GetRelation, JudgeRelation, JudgeBySemantic,
+// GetRelationsForObservations, ListRelations, CountRelations,
+// GetRelationStats, CountDeferredAndDead) live in relations_pg.go.
 
 // Compile-time assertion that *PostgresStore satisfies the Store interface.
 var _ Store = (*PostgresStore)(nil)
