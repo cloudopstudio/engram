@@ -228,6 +228,8 @@ func main() {
 		cmdLogin(cfg)
 	case "aws-login":
 		cmdAWSLogin(cfg)
+	case "doctor":
+		cmdDoctor(cfg)
 	case "migrate":
 		cmdMigrate(cfg)
 	case "promote":
@@ -1768,6 +1770,7 @@ Commands:
                      Merge similar project names into one canonical name
                        --all      Scan ALL projects for similar name groups
                        --dry-run  Preview what would be merged (no changes)
+  doctor             Run read-only operational diagnostics [--json] [--project P] [--check CODE]
   login              Authenticate with Azure Entra ID (device code / browser flow)
   aws-login          Verify the AWS SSO session for RDS IAM authentication
                        --profile <name>  Use a specific engram profile

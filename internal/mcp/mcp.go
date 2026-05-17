@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/diagnostic"
 	projectpkg "github.com/Gentleman-Programming/engram/internal/project"
 	"github.com/Gentleman-Programming/engram/internal/store"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -1318,6 +1319,7 @@ func DoctorToolHandler(s store.Store) server.ToolHandlerFunc {
 func handleDoctor(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		projectOverride, _ := req.GetArguments()["project"].(string)
+		check, _ := req.GetArguments()["check"].(string)
 		detRes, err := resolveReadProjectWithProcessOverride(s, projectOverride, cfg.DefaultProject)
 		if err != nil {
 			var upe *unknownProjectError
@@ -1326,8 +1328,28 @@ func handleDoctor(s store.Store, cfg MCPConfig) server.ToolHandlerFunc {
 			}
 			return mcp.NewToolResultError(fmt.Sprintf("Project resolution failed: %s", err)), nil
 		}
-		_ = detRes // diagnostic subsystem not yet ported to this fork
-		return mcp.NewToolResultText(`{"status":"ok","message":"mem_doctor not yet available in this build"}`), nil
+		project := detRes.Project
+		project, _ = store.NormalizeProject(project)
+		runner := diagnostic.NewRunner()
+		scope := diagnostic.Scope{Store: s, Project: project, Now: time.Now()}
+		var report diagnostic.Report
+		if strings.TrimSpace(check) != "" {
+			report, err = runner.RunOne(ctx, scope, check)
+		} else {
+			report, err = runner.RunAll(ctx, scope)
+		}
+		if err != nil {
+			report = diagnostic.ErrorReport(project, err)
+		}
+		out, marshalErr := json.Marshal(report)
+		if marshalErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Doctor JSON error: %s", marshalErr)), nil
+		}
+		result := mcp.NewToolResultText(string(out))
+		if report.Status == diagnostic.StatusError {
+			result.IsError = true
+		}
+		return result, nil
 	}
 }
 
