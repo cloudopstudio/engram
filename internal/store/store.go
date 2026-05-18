@@ -26,6 +26,24 @@ var openDB = sql.Open
 // See https://www.sqlite.org/rescode.html#constraint_foreignkey
 const sqliteConstraintForeignKey = 787
 
+// ─── Decay constants ─────────────────────────────────────────────────────────
+//
+// Decay defaults — months added to now() to compute review_after on new inserts.
+// expires_at is NULL for all types in Phase 1.
+const (
+	decayDecisionMonths   = 6
+	decayPolicyMonths     = 12
+	decayPreferenceMonths = 3
+)
+
+// decayReviewAfterMonths maps observation type → month offset for review_after.
+// Types absent from this map get review_after = NULL (Phase 1 behavior).
+var decayReviewAfterMonths = map[string]int{
+	"decision":   decayDecisionMonths,
+	"policy":     decayPolicyMonths,
+	"preference": decayPreferenceMonths,
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 //
 // Public types (Session, Observation, SearchResult, etc.) and the Config
@@ -561,6 +579,18 @@ func (s *SQLiteStore) migrate() error {
 		return err
 	}
 
+	// Phase decay-v1: additive nullable columns for decay scheduling.
+	// review_after holds the ISO-8601 timestamp after which this observation
+	// should be reviewed/refreshed. expires_at is reserved for Phase 2 (NULL now).
+	for _, c := range []struct{ name, def string }{
+		{"review_after", "TEXT"},
+		{"expires_at", "TEXT"},
+	} {
+		if err := s.addColumnIfNotExists("observations", c.name, c.def); err != nil {
+			return err
+		}
+	}
+
 	// Prompts FTS triggers (separate idempotent check)
 	var promptTrigger string
 	err = s.db.QueryRow(
@@ -955,6 +985,20 @@ func (s *SQLiteStore) AddObservation(p AddObservationParams) (int64, error) {
 		if err != nil {
 			return err
 		}
+
+		// Populate review_after for types that have a configured decay offset.
+		// expires_at is intentionally NULL for all types in Phase 1.
+		// This UPDATE runs only for NEW inserts (not topic_key revisions or deduplication).
+		if months, ok := decayReviewAfterMonths[p.Type]; ok {
+			reviewAfter := time.Now().UTC().AddDate(0, months, 0).Format("2006-01-02 15:04:05")
+			if _, err := s.execHook(tx,
+				`UPDATE observations SET review_after = ? WHERE id = ?`,
+				reviewAfter, observationID,
+			); err != nil {
+				return fmt.Errorf("set review_after: %w", err)
+			}
+		}
+
 		obs, err = s.getObservationTx(tx, observationID)
 		if err != nil {
 			return err
