@@ -5506,3 +5506,290 @@ func TestGetDeferred_NotFound(t *testing.T) {
 		t.Errorf("expected error to contain 'not found'; got %q", err.Error())
 	}
 }
+
+// ─── ScanProject tests ────────────────────────────────────────────────────────
+
+// fakeSemanticRunner is a SemanticRunner that returns a fixed verdict for all pairs.
+type fakeSemanticRunner struct {
+	verdict SemanticVerdict
+	err     error
+	calls   int
+}
+
+var _ SemanticRunner = (*fakeSemanticRunner)(nil)
+
+func (f *fakeSemanticRunner) Compare(_ context.Context, _ string) (SemanticVerdict, error) {
+	f.calls++
+	return f.verdict, f.err
+}
+
+// TestScanProject_DryRunNoInsert verifies that a dry-run scan (Apply=false) does
+// not insert any relation rows even when candidates are found.
+func TestScanProject_DryRunNoInsert(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("scan-sess-1", "testproj", "/tmp/testproj"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Seed two similar observations in the same project.
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "scan-sess-1",
+		Title:     "JWT auth token storage decision",
+		Content:   "We decided to use JWT tokens stored in httpOnly cookies.",
+		Type:      "decision",
+		Project:   "testproj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation A: %v", err)
+	}
+	_, err = s.AddObservation(AddObservationParams{
+		SessionID: "scan-sess-1",
+		Title:     "JWT authentication approach",
+		Content:   "Using JWT for stateless session management.",
+		Type:      "decision",
+		Project:   "testproj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation B: %v", err)
+	}
+
+	result, err := s.ScanProject(ScanOptions{
+		Project: "testproj",
+		Apply:   false, // dry-run
+	})
+	if err != nil {
+		t.Fatalf("ScanProject dry-run: %v", err)
+	}
+	if result.Project != "testproj" {
+		t.Errorf("ScanProject result.Project = %q; want %q", result.Project, "testproj")
+	}
+	if result.Inspected != 2 {
+		t.Errorf("ScanProject inspected = %d; want 2", result.Inspected)
+	}
+	if result.RelationsInserted != 0 {
+		t.Errorf("ScanProject dry-run must insert 0 relations; got %d", result.RelationsInserted)
+	}
+	if !result.DryRun {
+		t.Errorf("ScanProject result.DryRun must be true for dry-run scan")
+	}
+}
+
+// TestScanProject_ApplyInsertsRelations verifies that Apply=true inspects
+// observations and runs without error (insertion depends on FTS5 candidate matches).
+func TestScanProject_ApplyInsertsRelations(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("scan-sess-2", "testproj2", "/tmp/testproj2"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Seed similar observations so FindCandidates returns results.
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "scan-sess-2",
+		Title:     "JWT auth session cookies",
+		Content:   "Session tokens are stored as httpOnly cookies using JWT standard.",
+		Type:      "decision",
+		Project:   "testproj2",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation A: %v", err)
+	}
+	_, err = s.AddObservation(AddObservationParams{
+		SessionID: "scan-sess-2",
+		Title:     "JWT session management",
+		Content:   "JWT tokens used for stateless auth session management httpOnly.",
+		Type:      "decision",
+		Project:   "testproj2",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation B: %v", err)
+	}
+
+	result, err := s.ScanProject(ScanOptions{
+		Project: "testproj2",
+		Apply:   true,
+	})
+	if err != nil {
+		t.Fatalf("ScanProject apply: %v", err)
+	}
+	if result.Inspected != 2 {
+		t.Errorf("ScanProject inspected = %d; want 2", result.Inspected)
+	}
+	if result.DryRun {
+		t.Errorf("ScanProject result.DryRun must be false for apply scan")
+	}
+}
+
+// TestScanProject_SemanticMode_MockRunner verifies that when Semantic=true,
+// the runner is called for each pair and non-not_conflict verdicts are persisted.
+func TestScanProject_SemanticMode_MockRunner(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("scan-sess-3", "semproj", "/tmp/semproj"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Seed two semantically similar observations.
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "scan-sess-3",
+		Title:     "JWT auth token cookies",
+		Content:   "Use JWT tokens stored in httpOnly cookies for session management.",
+		Type:      "decision",
+		Project:   "semproj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation A: %v", err)
+	}
+	_, err = s.AddObservation(AddObservationParams{
+		SessionID: "scan-sess-3",
+		Title:     "JWT authentication httpOnly",
+		Content:   "JWT tokens in httpOnly cookies for stateless auth session.",
+		Type:      "decision",
+		Project:   "semproj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation B: %v", err)
+	}
+
+	runner := &fakeSemanticRunner{
+		verdict: SemanticVerdict{
+			Relation:   "related",
+			Confidence: 0.85,
+			Reasoning:  "Both talk about JWT httpOnly cookies",
+			Model:      "mock",
+		},
+	}
+
+	buildPrompt := func(a, b ObservationSnippet) string {
+		return "mock prompt: " + a.SyncID + " vs " + b.SyncID
+	}
+
+	result, err := s.ScanProject(ScanOptions{
+		Project:     "semproj",
+		Semantic:    true,
+		Apply:       true,
+		MaxSemantic: 10,
+		Concurrency: 1,
+		Runner:      runner,
+		BuildPrompt: buildPrompt,
+	})
+	if err != nil {
+		t.Fatalf("ScanProject semantic: %v", err)
+	}
+	if result.Inspected < 1 {
+		t.Errorf("ScanProject semantic: expected at least 1 inspected obs; got %d", result.Inspected)
+	}
+	// runner.calls confirms the mock was called (not the real CLI).
+	if runner.calls == 0 {
+		t.Errorf("ScanProject semantic: expected runner to be called at least once; calls = %d", runner.calls)
+	}
+}
+
+// TestScanProject_SemanticMode_RequiresRunner verifies ErrSemanticRunnerRequired
+// is returned when Semantic=true but Runner is nil.
+func TestScanProject_SemanticMode_RequiresRunner(t *testing.T) {
+	s := newTestStore(t)
+
+	_, err := s.ScanProject(ScanOptions{
+		Project:  "testproj",
+		Semantic: true,
+		Runner:   nil, // missing
+		BuildPrompt: func(a, b ObservationSnippet) string {
+			return "prompt"
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error when Runner is nil; got nil")
+	}
+	if !errors.Is(err, ErrSemanticRunnerRequired) {
+		t.Errorf("expected ErrSemanticRunnerRequired; got %v", err)
+	}
+}
+
+// TestScanProject_SemanticMode_RequiresBuildPrompt verifies ErrSemanticPromptBuilderRequired
+// is returned when Semantic=true but BuildPrompt is nil.
+func TestScanProject_SemanticMode_RequiresBuildPrompt(t *testing.T) {
+	s := newTestStore(t)
+
+	runner := &fakeSemanticRunner{
+		verdict: SemanticVerdict{Relation: "related", Confidence: 0.9},
+	}
+
+	_, err := s.ScanProject(ScanOptions{
+		Project:     "testproj",
+		Semantic:    true,
+		Runner:      runner,
+		BuildPrompt: nil, // missing
+	})
+	if err == nil {
+		t.Fatal("expected error when BuildPrompt is nil; got nil")
+	}
+	if !errors.Is(err, ErrSemanticPromptBuilderRequired) {
+		t.Errorf("expected ErrSemanticPromptBuilderRequired; got %v", err)
+	}
+}
+
+// TestScanProject_SemanticMode_NotConflictSkipped verifies that "not_conflict"
+// verdicts are counted in SemanticSkipped and NOT persisted as relations.
+func TestScanProject_SemanticMode_NotConflictSkipped(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("scan-sess-4", "skipproj", "/tmp/skipproj"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "scan-sess-4",
+		Title:     "Alpha decision JWT token",
+		Content:   "Use JWT tokens for authentication httpOnly session cookie.",
+		Type:      "decision",
+		Project:   "skipproj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation A: %v", err)
+	}
+	_, err = s.AddObservation(AddObservationParams{
+		SessionID: "scan-sess-4",
+		Title:     "Beta JWT session cookie",
+		Content:   "JWT httpOnly cookie for authentication session tokens.",
+		Type:      "decision",
+		Project:   "skipproj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation B: %v", err)
+	}
+
+	runner := &fakeSemanticRunner{
+		verdict: SemanticVerdict{
+			Relation:   "not_conflict",
+			Confidence: 0.95,
+			Reasoning:  "Unrelated observations",
+			Model:      "mock",
+		},
+	}
+
+	result, err := s.ScanProject(ScanOptions{
+		Project:     "skipproj",
+		Semantic:    true,
+		Apply:       true,
+		MaxSemantic: 10,
+		Concurrency: 1,
+		Runner:      runner,
+		BuildPrompt: func(a, b ObservationSnippet) string { return "prompt" },
+	})
+	if err != nil {
+		t.Fatalf("ScanProject not_conflict: %v", err)
+	}
+	if result.SemanticJudged != 0 {
+		t.Errorf("SemanticJudged = %d; want 0 (not_conflict must not be persisted)", result.SemanticJudged)
+	}
+}

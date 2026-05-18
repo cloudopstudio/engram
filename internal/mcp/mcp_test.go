@@ -2104,3 +2104,88 @@ func TestSessionStartUsesDefaultSessionID(t *testing.T) {
 		t.Fatalf("expected no activity under real session ID, got: %q", realScore)
 	}
 }
+
+// ─── mem_judge ENGRAM_JUDGE_DISABLED regression tests ─────────────────────────
+
+// TestHandleJudge_DisabledPath verifies that when ENGRAM_JUDGE_DISABLED=1 is set,
+// mem_judge returns a JSON envelope with "disabled":true and does NOT attempt any
+// store operation (regression: guardrail must survive future refactors).
+func TestHandleJudge_DisabledPath(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "1")
+
+	s := newMCPTestStore(t)
+	h := handleJudge(s, NewSessionActivity(10*time.Minute))
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"judgment_id": "rel-abc123",
+		"relation":    "related",
+	}}}
+
+	res, err := h(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleJudge disabled: unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("handleJudge disabled: tool result must NOT be an error (disabled returns JSON, not error)")
+	}
+
+	text := callResultText(t, res)
+	if !strings.Contains(text, `"disabled":true`) {
+		t.Errorf("handleJudge disabled: expected disabled:true in response; got %q", text)
+	}
+	if !strings.Contains(text, "ENGRAM_JUDGE_DISABLED") {
+		t.Errorf("handleJudge disabled: expected ENGRAM_JUDGE_DISABLED mention in response; got %q", text)
+	}
+}
+
+// TestHandleJudge_EnabledPath_MissingJudgmentID verifies that when
+// ENGRAM_JUDGE_DISABLED is NOT set, the handler validates required fields
+// and returns an error for a missing judgment_id.
+func TestHandleJudge_EnabledPath_MissingJudgmentID(t *testing.T) {
+	// Ensure the env var is NOT set.
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "")
+
+	s := newMCPTestStore(t)
+	h := handleJudge(s, NewSessionActivity(10*time.Minute))
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		// judgment_id intentionally omitted
+		"relation": "related",
+	}}}
+
+	res, err := h(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleJudge enabled: unexpected Go error: %v", err)
+	}
+	// Expect a tool-level error (judgment_id is required).
+	if !res.IsError {
+		t.Errorf("handleJudge enabled: expected tool error when judgment_id is missing")
+	}
+}
+
+// TestHandleCompare_DisabledPath verifies that when ENGRAM_JUDGE_DISABLED=1 is set,
+// mem_compare returns a JSON envelope with "disabled":true (same guardrail as mem_judge).
+func TestHandleCompare_DisabledPath(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "1")
+
+	s := newMCPTestStore(t)
+	h := handleCompare(s)
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"memory_id_a": float64(1),
+		"memory_id_b": float64(2),
+		"relation":    "related",
+		"reasoning":   "test",
+		"confidence":  float64(0.8),
+	}}}
+
+	res, err := h(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleCompare disabled: unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("handleCompare disabled: tool result must NOT be an error (disabled returns JSON, not error)")
+	}
+
+	text := callResultText(t, res)
+	if !strings.Contains(text, `"disabled":true`) {
+		t.Errorf("handleCompare disabled: expected disabled:true in response; got %q", text)
+	}
+}
