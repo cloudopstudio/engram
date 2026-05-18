@@ -843,12 +843,16 @@ func (s *PostgresStore) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, e
 	for rows.Next() {
 		var r DeferredRow
 		var rawPayload string
+		var lastAttemptedAt *time.Time
+		var firstSeenAt time.Time
 		if err := rows.Scan(
 			&r.SyncID, &r.Entity, &rawPayload, &r.ApplyStatus, &r.RetryCount,
-			&r.LastError, &r.LastAttemptedAt, &r.FirstSeenAt,
+			&r.LastError, &lastAttemptedAt, &firstSeenAt,
 		); err != nil {
 			return nil, fmt.Errorf("ListDeferred: scan: %w", err)
 		}
+		r.LastAttemptedAt = formatNullableTS(lastAttemptedAt)
+		r.FirstSeenAt = formatTS(firstSeenAt)
 		decodeDeferredPayloadPG(&r, rawPayload)
 		result = append(result, r)
 	}
@@ -867,6 +871,8 @@ func (s *PostgresStore) GetDeferred(syncID string) (DeferredRow, error) {
 	ctx := context.Background()
 	var r DeferredRow
 	var rawPayload string
+	var lastAttemptedAt *time.Time
+	var firstSeenAt time.Time
 	err := s.pool.QueryRow(ctx, `
 		SELECT sync_id, entity, payload, apply_status, retry_count,
 		       last_error, last_attempted_at, first_seen_at
@@ -874,7 +880,7 @@ func (s *PostgresStore) GetDeferred(syncID string) (DeferredRow, error) {
 		WHERE sync_id = $1
 	`, syncID).Scan(
 		&r.SyncID, &r.Entity, &rawPayload, &r.ApplyStatus, &r.RetryCount,
-		&r.LastError, &r.LastAttemptedAt, &r.FirstSeenAt,
+		&r.LastError, &lastAttemptedAt, &firstSeenAt,
 	)
 	if err == pgx.ErrNoRows {
 		return DeferredRow{}, fmt.Errorf("GetDeferred: deferred row %q not found", syncID)
@@ -882,6 +888,8 @@ func (s *PostgresStore) GetDeferred(syncID string) (DeferredRow, error) {
 	if err != nil {
 		return DeferredRow{}, fmt.Errorf("GetDeferred: %w", err)
 	}
+	r.LastAttemptedAt = formatNullableTS(lastAttemptedAt)
+	r.FirstSeenAt = formatTS(firstSeenAt)
 	decodeDeferredPayloadPG(&r, rawPayload)
 	return r, nil
 }
