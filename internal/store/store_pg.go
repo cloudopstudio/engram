@@ -3002,9 +3002,13 @@ func (s *PostgresStore) ListPendingProjectMutations(project string) ([]SyncMutat
 	mutations := make([]SyncMutation, 0)
 	for rows.Next() {
 		var m SyncMutation
-		if err := rows.Scan(&m.Seq, &m.TargetKey, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.Source, &m.Project, &m.OccurredAt, &m.AckedAt); err != nil {
+		var occurredAt time.Time
+		var ackedAt *time.Time
+		if err := rows.Scan(&m.Seq, &m.TargetKey, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.Source, &m.Project, &occurredAt, &ackedAt); err != nil {
 			return nil, err
 		}
+		m.OccurredAt = formatTS(occurredAt)
+		m.AckedAt = formatNullableTS(ackedAt)
 		mutations = append(mutations, m)
 	}
 	return mutations, rows.Err()
