@@ -5373,7 +5373,7 @@ func TestAddObservation_DecayNotAppliedToExistingRows(t *testing.T) {
 	}
 }
 
-// ─── ListDeferred / GetDeferred tests — skipped: pending PR #8 ───────────────
+// ─── ListDeferred / GetDeferred tests ────────────────────────────────────────
 
 func seedDeferredRow(t *testing.T, s *SQLiteStore, syncID, entity, payload string, retryCount int, applyStatus string) {
 	t.Helper()
@@ -5387,21 +5387,122 @@ func seedDeferredRow(t *testing.T, s *SQLiteStore, syncID, entity, payload strin
 }
 
 func TestListDeferred_HappyPath(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ListDeferred — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	validPayload := `{"relation_type":"conflicts_with","source_id":"obs-aaa","target_id":"obs-bbb"}`
+	seedDeferredRow(t, s, "def-001", "relation", validPayload, 0, "deferred")
+	seedDeferredRow(t, s, "def-002", "relation", validPayload, 1, "deferred")
+	seedDeferredRow(t, s, "def-003", "relation", validPayload, 5, "dead")
+
+	// List all.
+	all, err := s.ListDeferred(ListDeferredOptions{Limit: 50})
+	if err != nil {
+		t.Fatalf("ListDeferred all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Errorf("expected 3 rows; got %d", len(all))
+	}
+
+	// List only deferred status.
+	deferred, err := s.ListDeferred(ListDeferredOptions{Status: "deferred", Limit: 50})
+	if err != nil {
+		t.Fatalf("ListDeferred deferred: %v", err)
+	}
+	if len(deferred) != 2 {
+		t.Errorf("expected 2 deferred rows; got %d", len(deferred))
+	}
+
+	// Pagination: limit=1.
+	page, err := s.ListDeferred(ListDeferredOptions{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListDeferred limit=1: %v", err)
+	}
+	if len(page) != 1 {
+		t.Errorf("expected 1 row with limit=1; got %d", len(page))
+	}
 }
 
 func TestListDeferred_DecodedPayload(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ListDeferred — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	validPayload := `{"relation_type":"conflicts_with","source_id":"obs-src","target_id":"obs-tgt","extra":42}`
+	seedDeferredRow(t, s, "def-valid", "relation", validPayload, 0, "deferred")
+
+	rows, err := s.ListDeferred(ListDeferredOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeferred: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row; got %d", len(rows))
+	}
+	row := rows[0]
+	if !row.PayloadValid {
+		t.Errorf("expected PayloadValid=true for well-formed JSON; got false. PayloadRaw=%q", row.PayloadRaw)
+	}
+	if row.Payload == nil {
+		t.Fatal("expected decoded Payload map; got nil")
+	}
+	if row.Payload["relation_type"] != "conflicts_with" {
+		t.Errorf("decoded Payload[relation_type]: want conflicts_with; got %v", row.Payload["relation_type"])
+	}
 }
 
 func TestListDeferred_MalformedPayload(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: ListDeferred — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	seedDeferredRow(t, s, "def-bad", "relation", "not valid json", 5, "dead")
+
+	rows, err := s.ListDeferred(ListDeferredOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeferred malformed: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row; got %d", len(rows))
+	}
+	row := rows[0]
+	if row.PayloadValid {
+		t.Errorf("expected PayloadValid=false for malformed JSON; got true")
+	}
+	if row.PayloadRaw != "not valid json" {
+		t.Errorf("expected PayloadRaw preserved; got %q", row.PayloadRaw)
+	}
 }
 
 func TestGetDeferred_HappyPath(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: GetDeferred — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	validPayload := `{"relation_type":"related","source_id":"obs-xyz","target_id":"obs-abc"}`
+	seedDeferredRow(t, s, "def-xyz", "relation", validPayload, 2, "deferred")
+
+	row, err := s.GetDeferred("def-xyz")
+	if err != nil {
+		t.Fatalf("GetDeferred: %v", err)
+	}
+	if row.SyncID != "def-xyz" {
+		t.Errorf("expected SyncID=def-xyz; got %q", row.SyncID)
+	}
+	if row.ApplyStatus != "deferred" {
+		t.Errorf("expected ApplyStatus=deferred; got %q", row.ApplyStatus)
+	}
+	if row.RetryCount != 2 {
+		t.Errorf("expected RetryCount=2; got %d", row.RetryCount)
+	}
+	if !row.PayloadValid {
+		t.Errorf("expected PayloadValid=true for valid JSON; got false")
+	}
+	if row.Payload["relation_type"] != "related" {
+		t.Errorf("decoded Payload[relation_type]: want related; got %v", row.Payload["relation_type"])
+	}
 }
 
 func TestGetDeferred_NotFound(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: GetDeferred — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+
+	_, err := s.GetDeferred("def-missing")
+	if err == nil {
+		t.Fatal("expected error for missing sync_id; got nil")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected error to contain 'not found'; got %q", err.Error())
+	}
 }

@@ -1942,3 +1942,140 @@ func TestPGFindCandidates_SkipInsert(t *testing.T) {
 	}
 	t.Logf("FindCandidates SkipInsert returned %d candidates", len(candidates))
 }
+
+// ─── ListDeferred / GetDeferred (PostgreSQL) ─────────────────────────────────
+
+func seedDeferredRowPG(t *testing.T, s *PostgresStore, syncID, entity, payload string, retryCount int, applyStatus string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO sync_apply_deferred
+			(sync_id, entity, payload, apply_status, retry_count, first_seen_at)
+		VALUES ($1, $2, $3, $4, $5, NOW())
+	`, syncID, entity, payload, applyStatus, retryCount); err != nil {
+		t.Fatalf("seedDeferredRowPG %q: %v", syncID, err)
+	}
+}
+
+func TestPGListDeferred_HappyPath(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	validPayload := `{"relation_type":"conflicts_with","source_id":"obs-pg1","target_id":"obs-pg2"}`
+	seedDeferredRowPG(t, s, "pg-def-001", "relation", validPayload, 0, "deferred")
+	seedDeferredRowPG(t, s, "pg-def-002", "relation", validPayload, 1, "deferred")
+	seedDeferredRowPG(t, s, "pg-def-003", "relation", validPayload, 5, "dead")
+
+	// List all.
+	all, err := s.ListDeferred(ListDeferredOptions{Limit: 50})
+	if err != nil {
+		t.Fatalf("ListDeferred all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Errorf("expected 3 rows; got %d", len(all))
+	}
+
+	// List only deferred status.
+	deferred, err := s.ListDeferred(ListDeferredOptions{Status: "deferred", Limit: 50})
+	if err != nil {
+		t.Fatalf("ListDeferred deferred: %v", err)
+	}
+	if len(deferred) != 2 {
+		t.Errorf("expected 2 deferred rows; got %d", len(deferred))
+	}
+
+	// Pagination: limit=1.
+	page, err := s.ListDeferred(ListDeferredOptions{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListDeferred limit=1: %v", err)
+	}
+	if len(page) != 1 {
+		t.Errorf("expected 1 row with limit=1; got %d", len(page))
+	}
+}
+
+func TestPGListDeferred_DecodedPayload(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	validPayload := `{"relation_type":"related","source_id":"obs-src","target_id":"obs-tgt","extra":99}`
+	seedDeferredRowPG(t, s, "pg-def-valid", "relation", validPayload, 0, "deferred")
+
+	rows, err := s.ListDeferred(ListDeferredOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeferred: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row; got %d", len(rows))
+	}
+	row := rows[0]
+	if !row.PayloadValid {
+		t.Errorf("expected PayloadValid=true; got false. PayloadRaw=%q", row.PayloadRaw)
+	}
+	if row.Payload["relation_type"] != "related" {
+		t.Errorf("Payload[relation_type]: want related; got %v", row.Payload["relation_type"])
+	}
+}
+
+func TestPGListDeferred_MalformedPayload(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	seedDeferredRowPG(t, s, "pg-def-bad", "relation", "not valid json", 3, "dead")
+
+	rows, err := s.ListDeferred(ListDeferredOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListDeferred malformed: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row; got %d", len(rows))
+	}
+	row := rows[0]
+	if row.PayloadValid {
+		t.Errorf("expected PayloadValid=false for malformed JSON; got true")
+	}
+	if row.PayloadRaw != "not valid json" {
+		t.Errorf("expected PayloadRaw preserved; got %q", row.PayloadRaw)
+	}
+}
+
+func TestPGGetDeferred_HappyPath(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	validPayload := `{"relation_type":"compatible","source_id":"obs-abc","target_id":"obs-def"}`
+	seedDeferredRowPG(t, s, "pg-def-xyz", "relation", validPayload, 2, "deferred")
+
+	row, err := s.GetDeferred("pg-def-xyz")
+	if err != nil {
+		t.Fatalf("GetDeferred: %v", err)
+	}
+	if row.SyncID != "pg-def-xyz" {
+		t.Errorf("expected SyncID=pg-def-xyz; got %q", row.SyncID)
+	}
+	if row.ApplyStatus != "deferred" {
+		t.Errorf("expected ApplyStatus=deferred; got %q", row.ApplyStatus)
+	}
+	if row.RetryCount != 2 {
+		t.Errorf("expected RetryCount=2; got %d", row.RetryCount)
+	}
+	if !row.PayloadValid {
+		t.Errorf("expected PayloadValid=true; got false")
+	}
+	if row.Payload["relation_type"] != "compatible" {
+		t.Errorf("Payload[relation_type]: want compatible; got %v", row.Payload["relation_type"])
+	}
+}
+
+func TestPGGetDeferred_NotFound(t *testing.T) {
+	s := newTestStorePG(t)
+	defer s.Close()
+
+	_, err := s.GetDeferred("pg-def-missing")
+	if err == nil {
+		t.Fatal("expected error for missing sync_id; got nil")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected error to contain 'not found'; got %q", err.Error())
+	}
+}
