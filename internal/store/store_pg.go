@@ -3092,6 +3092,24 @@ func (s *PostgresStore) BackupSQLite() (string, error) {
 	return "", nil
 }
 
+// CountPendingNonEnrolledSyncMutations is not yet implemented on PostgreSQL.
+// PostgreSQL-backed deployments are server-side only; client-side autosync uses SQLite.
+func (s *PostgresStore) CountPendingNonEnrolledSyncMutations(_ string) ([]PendingSyncMutationProjectCount, error) {
+	return nil, fmt.Errorf("CountPendingNonEnrolledSyncMutations: not implemented for PostgreSQL")
+}
+
+// MarkSyncBlocked is not yet implemented on PostgreSQL.
+// PostgreSQL-backed deployments are server-side only; client-side autosync uses SQLite.
+func (s *PostgresStore) MarkSyncBlocked(_, _, _ string) error {
+	return fmt.Errorf("MarkSyncBlocked: not implemented for PostgreSQL")
+}
+
+// ReplayDeferred is not yet implemented on PostgreSQL.
+// PostgreSQL-backed deployments are server-side only; client-side autosync uses SQLite.
+func (s *PostgresStore) ReplayDeferred() (ReplayDeferredResult, error) {
+	return ReplayDeferredResult{}, fmt.Errorf("ReplayDeferred: not implemented for PostgreSQL")
+}
+
 // Compile-time assertion that *PostgresStore satisfies the Store interface.
 var _ Store = (*PostgresStore)(nil)
 

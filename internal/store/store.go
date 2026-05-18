@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -2108,49 +2109,85 @@ func (s *SQLiteStore) ApplyPulledMutation(targetKey string, mutation SyncMutatio
 			return nil
 		}
 
-		switch mutation.Entity {
-		case SyncEntitySession:
-			var payload syncSessionPayload
-			if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
-				return err
-			}
-			if err := s.applySessionPayloadTx(tx, payload); err != nil {
-				return err
-			}
-		case SyncEntityObservation:
-			var payload syncObservationPayload
-			if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
-				return err
-			}
-			if mutation.Op == SyncOpDelete {
-				if err := s.applyObservationDeleteTx(tx, payload); err != nil {
-					return err
+		applyErr := s.applyPulledMutationTx(tx, mutation)
+		if applyErr != nil {
+			// Phase E: per-entity skip+log policy.
+			// For relation FK misses, write to sync_apply_deferred and ACK the seq
+			// so the cursor can advance. All other errors propagate and halt the pull.
+			if mutation.Entity == SyncEntityRelation && errors.Is(applyErr, ErrRelationFKMissing) {
+				log.Printf("[store] ApplyPulledMutation: relation FK miss seq=%d entity_key=%s — deferring",
+					mutation.Seq, mutation.EntityKey)
+				if _, deferErr := s.execHook(tx, `
+					INSERT INTO sync_apply_deferred
+						(sync_id, entity, payload, apply_status, retry_count, first_seen_at)
+					VALUES (?, ?, ?, 'deferred', 0, datetime('now'))
+					ON CONFLICT(sync_id) DO UPDATE SET
+						payload            = excluded.payload,
+						last_attempted_at  = datetime('now')
+				`, mutation.EntityKey, mutation.Entity, mutation.Payload); deferErr != nil {
+					return fmt.Errorf("ApplyPulledMutation: write deferred row: %w", deferErr)
 				}
+				// Fall through to advance the cursor (ACK the seq).
+			} else if mutation.Entity == SyncEntityRelation && errors.Is(applyErr, ErrApplyDead) {
+				// Payload is permanently undecodable — write directly as dead and ACK.
+				log.Printf("[store] ApplyPulledMutation: relation payload dead seq=%d entity_key=%s err=%v — marking dead",
+					mutation.Seq, mutation.EntityKey, applyErr)
+				if _, deferErr := s.execHook(tx, `
+					INSERT INTO sync_apply_deferred
+						(sync_id, entity, payload, apply_status, retry_count, first_seen_at)
+					VALUES (?, ?, ?, 'dead', 0, datetime('now'))
+					ON CONFLICT(sync_id) DO UPDATE SET
+						payload           = excluded.payload,
+						apply_status      = 'dead',
+						last_attempted_at = datetime('now')
+				`, mutation.EntityKey, mutation.Entity, mutation.Payload); deferErr != nil {
+					return fmt.Errorf("ApplyPulledMutation: write dead row: %w", deferErr)
+				}
+				// Fall through to advance the cursor (ACK the seq).
 			} else {
-				if err := s.applyObservationUpsertTx(tx, payload); err != nil {
-					return err
-				}
+				return applyErr
 			}
-		case SyncEntityPrompt:
-			var payload syncPromptPayload
-			if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
-				return err
-			}
-			if err := s.applyPromptUpsertTx(tx, payload); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unknown sync entity %q", mutation.Entity)
 		}
 
 		_, err = s.execHook(tx,
 			`UPDATE sync_state
-			 SET last_pulled_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, last_error = NULL, updated_at = datetime('now')
+			 SET last_pulled_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
 			 WHERE target_key = ?`,
 			mutation.Seq, SyncLifecycleHealthy, targetKey,
 		)
 		return err
 	})
+}
+
+// applyPulledMutationTx dispatches a pulled mutation to the appropriate apply handler.
+func (s *SQLiteStore) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
+	switch mutation.Entity {
+	case SyncEntityRelation:
+		return s.applyRelationUpsertTx(tx, mutation)
+	case SyncEntitySession:
+		var payload syncSessionPayload
+		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
+			return err
+		}
+		return s.applySessionPayloadTx(tx, payload)
+	case SyncEntityObservation:
+		var payload syncObservationPayload
+		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
+			return err
+		}
+		if mutation.Op == SyncOpDelete {
+			return s.applyObservationDeleteTx(tx, payload)
+		}
+		return s.applyObservationUpsertTx(tx, payload)
+	case SyncEntityPrompt:
+		var payload syncPromptPayload
+		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
+			return err
+		}
+		return s.applyPromptUpsertTx(tx, payload)
+	default:
+		return fmt.Errorf("unknown sync entity %q", mutation.Entity)
+	}
 }
 
 func (s *SQLiteStore) GetObservationBySyncID(syncID string) (*Observation, error) {

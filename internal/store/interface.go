@@ -56,14 +56,17 @@ type Store interface {
 	// Sync — mutation journal
 	GetSyncState(targetKey string) (*SyncState, error)
 	ListPendingSyncMutations(targetKey string, limit int) ([]SyncMutation, error)
+	CountPendingNonEnrolledSyncMutations(targetKey string) ([]PendingSyncMutationProjectCount, error)
 	SkipAckNonEnrolledMutations(targetKey string) (int64, error)
 	AckSyncMutations(targetKey string, lastAckedSeq int64) error
 	AckSyncMutationSeqs(targetKey string, seqs []int64) error
 	AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error)
 	ReleaseSyncLease(targetKey, owner string) error
 	MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error
+	MarkSyncBlocked(targetKey, reasonCode, message string) error
 	MarkSyncHealthy(targetKey string) error
 	ApplyPulledMutation(targetKey string, mutation SyncMutation) error
+	ReplayDeferred() (ReplayDeferredResult, error)
 
 	// Project enrollment
 	EnrollProject(project string) error
