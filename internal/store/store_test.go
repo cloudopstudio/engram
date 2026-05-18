@@ -5211,19 +5211,169 @@ func TestRepairHandlesMixedState(t *testing.T) {
 	}
 }
 
-// ─── Decay defaults tests — skipped: upstream feature not yet ported ─────────
-// TODO(merge-upstream-v2 PR #2/#3): port review_after/expires_at decay fields to enable
+// ─── Decay defaults tests ─────────────────────────────────────────────────────
+// Phase F — Decay defaults wiring (REQ-006)
 
+// queryDecayFields returns the raw review_after and expires_at values for a
+// given observation ID, reporting whether each column is NULL.
+func queryDecayFields(t *testing.T, s *SQLiteStore, obsID int64) (reviewAfter string, reviewAfterNull bool, expiresAt string, expiresAtNull bool) {
+	t.Helper()
+	var ra, ea sql.NullString
+	if err := s.db.QueryRow(
+		`SELECT review_after, expires_at FROM observations WHERE id = ?`, obsID,
+	).Scan(&ra, &ea); err != nil {
+		t.Fatalf("queryDecayFields: %v", err)
+	}
+	return ra.String, !ra.Valid, ea.String, !ea.Valid
+}
+
+// withinDays asserts that the parsed timestamp is within ±days of expected.
+func withinDays(t *testing.T, label, value string, expected time.Time, days int) {
+	t.Helper()
+	parsed, err := time.Parse("2006-01-02 15:04:05", value)
+	if err != nil {
+		// try RFC3339 as fallback
+		parsed, err = time.Parse(time.RFC3339, value)
+		if err != nil {
+			t.Fatalf("withinDays: %s: cannot parse %q: %v", label, value, err)
+		}
+	}
+	delta := parsed.Sub(expected)
+	if delta < 0 {
+		delta = -delta
+	}
+	maxDelta := time.Duration(days) * 24 * time.Hour
+	if delta > maxDelta {
+		t.Fatalf("withinDays: %s: got %s, want ~%s (±%dd), delta=%s",
+			label, parsed.Format(time.RFC3339), expected.Format(time.RFC3339), days, delta)
+	}
+}
+
+// TestAddObservation_DecayDefaults verifies that AddObservation populates
+// review_after for known types (decision, policy, preference) and leaves it
+// NULL for unknown/unlisted types. expires_at is NULL for all types in Phase 1.
 func TestAddObservation_DecayDefaults(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: decay fields (review_after/expires_at) — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+	if err := s.CreateSession("decay-sess", "decay-proj", "/tmp/decay"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	now := time.Now().UTC()
+
+	cases := []struct {
+		obsType          string
+		wantReviewNull   bool
+		wantMonthsOffset int
+	}{
+		{"decision", false, 6},
+		{"policy", false, 12},
+		{"preference", false, 3},
+		{"observation", true, 0},
+		{"manual", true, 0},
+		{"bugfix", true, 0},
+		{"architecture", true, 0},
+		{"", true, 0},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run("type="+tc.obsType, func(t *testing.T) {
+			obsType := tc.obsType
+			if obsType == "" {
+				obsType = "manual" // AddObservation requires non-empty type; test blank separately
+			}
+			title := "Decay test — " + tc.obsType + " — " + time.Now().Format(time.RFC3339Nano)
+			id, err := s.AddObservation(AddObservationParams{
+				SessionID: "decay-sess",
+				Type:      obsType,
+				Title:     title,
+				Content:   "decay defaults test content",
+				Project:   "decay-proj",
+				Scope:     "project",
+			})
+			if err != nil {
+				t.Fatalf("AddObservation: %v", err)
+			}
+
+			ra, raNull, _, eaNull := queryDecayFields(t, s, id)
+
+			// expires_at MUST always be NULL (Phase 1)
+			if !eaNull {
+				t.Errorf("type=%s: expected expires_at=NULL, got non-NULL", tc.obsType)
+			}
+
+			if tc.wantReviewNull {
+				if !raNull {
+					t.Errorf("type=%s: expected review_after=NULL, got %q", tc.obsType, ra)
+				}
+				return
+			}
+
+			// For types with a decay offset, review_after must be ~N months from now.
+			if raNull {
+				t.Fatalf("type=%s: expected review_after to be set, got NULL", tc.obsType)
+			}
+			expected := now.AddDate(0, tc.wantMonthsOffset, 0)
+			withinDays(t, "review_after type="+tc.obsType, ra, expected, 2)
+		})
+	}
 }
 
+// TestAddObservation_DecayNotAppliedToExistingRows verifies that topic_key
+// revisions and deduplication do NOT overwrite review_after on existing rows.
 func TestAddObservation_DecayNotAppliedToExistingRows(t *testing.T) {
-	t.Skipf("upstream feature not yet ported: decay fields (review_after/expires_at) — needs merge-upstream-v2 PR #2+")
+	s := newTestStore(t)
+	if err := s.CreateSession("decay-rev-sess", "decay-rev-proj", "/tmp/decay-rev"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Insert a decision observation via topic_key so revision path is exercised.
+	firstID, err := s.AddObservation(AddObservationParams{
+		SessionID: "decay-rev-sess",
+		Type:      "decision",
+		Title:     "Architecture: use SQLite",
+		Content:   "We chose SQLite as the primary store.",
+		Project:   "decay-rev-proj",
+		Scope:     "project",
+		TopicKey:  "arch/db-choice",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation first: %v", err)
+	}
+
+	ra1, ra1Null, _, _ := queryDecayFields(t, s, firstID)
+	if ra1Null {
+		t.Fatalf("first insert: expected review_after to be populated for 'decision', got NULL")
+	}
+
+	// Revise via same topic_key — this hits the UPDATE path, NOT a new insert.
+	secondID, err := s.AddObservation(AddObservationParams{
+		SessionID: "decay-rev-sess",
+		Type:      "decision",
+		Title:     "Architecture: use SQLite (revised)",
+		Content:   "Confirmed: SQLite is the right choice.",
+		Project:   "decay-rev-proj",
+		Scope:     "project",
+		TopicKey:  "arch/db-choice",
+	})
+	if err != nil {
+		t.Fatalf("AddObservation revision: %v", err)
+	}
+
+	// Topic_key revision should return same row ID.
+	if firstID != secondID {
+		t.Fatalf("expected topic_key revision to return same ID, got %d vs %d", firstID, secondID)
+	}
+
+	ra2, _, _, _ := queryDecayFields(t, s, firstID)
+
+	// review_after MUST NOT have been updated by the revision (original value preserved).
+	if ra1 != ra2 {
+		t.Errorf("revision must not overwrite review_after: was %q, now %q", ra1, ra2)
+	}
 }
 
-// ─── ListDeferred / GetDeferred tests — skipped: upstream feature not yet ported ─
-// TODO(merge-upstream-v2 PR #2/#3): port ListDeferred/GetDeferred to enable these tests
+// ─── ListDeferred / GetDeferred tests — skipped: pending PR #8 ───────────────
 
 func seedDeferredRow(t *testing.T, s *SQLiteStore, syncID, entity, payload string, retryCount int, applyStatus string) {
 	t.Helper()
