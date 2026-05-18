@@ -12,8 +12,6 @@ builds:
     binary: engram
     env:
       - CGO_ENABLED=0
-    tags:
-      - pgstore
     goos:
       - linux
       - darwin
@@ -47,3 +45,16 @@ changelog:
       - "^test:"
       - "^ci:"
 
+brews:
+  - repository:
+      owner: cloudopstudio
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    name: engram
+    homepage: "https://github.com/cloudopstudio/engram"
+    description: "Persistent memory for AI coding agents. Fork of Gentleman-Programming/engram with PostgreSQL, AWS RDS IAM, Azure Entra auth, and unaccent FTS."
+    license: "MIT"
+    commit_msg_template: "chore: update engram formula to {{ .Tag }}"
+    test: |
+      system "#{bin}/engram", "--version"
