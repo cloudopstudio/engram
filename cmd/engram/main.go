@@ -281,6 +281,10 @@ func cmdServe(cfg store.Config) {
 	}
 	defer s.Close()
 
+	// Start autosync if ENGRAM_CLOUD_AUTOSYNC=1 (opt-in, never fatal).
+	ctx, cancel := context.WithCancel(context.Background())
+	_, mgrStop := tryStartAutosync(ctx, s, cfg)
+
 	srv := newHTTPServer(s, port)
 
 	// Graceful shutdown on SIGINT/SIGTERM.
@@ -289,10 +293,18 @@ func cmdServe(cfg store.Config) {
 	go func() {
 		<-sigCh
 		log.Println("[engram] shutting down...")
+		cancel()
+		if mgrStop != nil {
+			mgrStop()
+		}
 		exitFunc(0)
 	}()
 
 	if err := startHTTP(srv); err != nil {
+		cancel()
+		if mgrStop != nil {
+			mgrStop()
+		}
 		fatal(err)
 	}
 }
@@ -328,6 +340,17 @@ func cmdMCP(cfg store.Config) {
 		fatal(err)
 	}
 	defer s.Close()
+
+	// Start autosync if ENGRAM_CLOUD_AUTOSYNC=1 (opt-in, never fatal).
+	// Autosync must not interfere with MCP stdio transport.
+	ctx, cancel := context.WithCancel(context.Background())
+	_, mgrStop := tryStartAutosync(ctx, s, cfg)
+	defer func() {
+		cancel()
+		if mgrStop != nil {
+			mgrStop()
+		}
+	}()
 
 	mcpCfg := mcp.MCPConfig{DefaultProject: projectOverride}
 
