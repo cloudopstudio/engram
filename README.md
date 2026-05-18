@@ -4,7 +4,7 @@
 
 <p align="center">
   <strong>Persistent memory for AI coding agents</strong><br>
-  <em>Agent-agnostic. Single binary. Zero dependencies.</em>
+  <em>One brain. Local or cloud. Agent-agnostic, single binary, zero dependencies.</em>
 </p>
 
 <p align="center">
@@ -81,7 +81,7 @@ It gives Pi persistent project memory, compaction recovery, and shared memory wi
 
 Full details on session lifecycle, topic keys, and memory hygiene → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
-## MCP Tools (15)
+## MCP Tools (19)
 
 | Category               | Tools                                                                                                            |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------- |
@@ -91,7 +91,7 @@ Full details on session lifecycle, topic keys, and memory hygiene → [docs/ARCH
 | **Conflict Surfacing** | `mem_judge`, `mem_compare`                                                                                       |
 | **Utilities**          | `mem_save_prompt`, `mem_stats`, `mem_capture_passive`, `mem_merge_projects`, `mem_current_project`, `mem_doctor` |
 
-Full tool reference with parameters → [DOCS.md#mcp-tools-15-tools](DOCS.md#mcp-tools-15-tools)
+Full tool reference with parameters → [DOCS.md#mcp-tools-19-tools](DOCS.md#mcp-tools-19-tools)
 
 ## Terminal UI
 
@@ -111,6 +111,8 @@ engram tui
 ## Git Sync
 
 Share memories across machines. Uses compressed chunks — no merge conflicts, no huge files.
+
+Local SQLite remains the source of truth. Cloud integration is opt-in replication.
 
 ```bash
 engram sync                    # Export new memories as compressed chunk
