@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -987,7 +988,103 @@ var _ interface {
 	CountRelations(ListRelationsOptions) (int, error)
 	GetRelationStats(string) (RelationStats, error)
 	CountDeferredAndDead() (int, int, error)
+	ListDeferred(ListDeferredOptions) ([]DeferredRow, error)
+	GetDeferred(string) (DeferredRow, error)
 } = (*SQLiteStore)(nil)
 
 // Suppress unused import warning for log (used in FindCandidates and JudgeRelation).
 var _ = errors.New
+
+// ─── ListDeferred / GetDeferred (SQLite) ──────────────────────────────────────
+
+// sqliteScannable is a common scan interface for *sql.Row and *sql.Rows.
+type sqliteScannable interface {
+	Scan(dest ...any) error
+}
+
+// scanDeferredRowSQLite scans a single sync_apply_deferred row into a DeferredRow.
+// The payload is decoded to map[string]any; malformed JSON sets PayloadValid=false.
+func scanDeferredRowSQLite(row sqliteScannable) (DeferredRow, error) {
+	var r DeferredRow
+	var rawPayload string
+	if err := row.Scan(
+		&r.SyncID, &r.Entity, &rawPayload, &r.ApplyStatus, &r.RetryCount,
+		&r.LastError, &r.LastAttemptedAt, &r.FirstSeenAt,
+	); err != nil {
+		return r, err
+	}
+	r.PayloadRaw = rawPayload
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(rawPayload), &decoded); err == nil {
+		r.Payload = decoded
+		r.PayloadValid = true
+	}
+	return r, nil
+}
+
+// ListDeferred returns rows from sync_apply_deferred with optional status filter
+// and pagination. The payload field is decoded to map[string]any; on malformed
+// JSON, PayloadValid is false and PayloadRaw is preserved.
+func (s *SQLiteStore) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error) {
+	query := `
+		SELECT sync_id, entity, payload, apply_status, retry_count,
+		       last_error, last_attempted_at, first_seen_at
+		FROM sync_apply_deferred
+		WHERE 1=1`
+	var args []any
+
+	if opts.Status != "" {
+		query += ` AND apply_status = ?`
+		args = append(args, opts.Status)
+	}
+	query += ` ORDER BY first_seen_at`
+	if opts.Limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, opts.Limit)
+	}
+	if opts.Offset > 0 {
+		query += ` OFFSET ?`
+		args = append(args, opts.Offset)
+	}
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("ListDeferred: query: %w", err)
+	}
+	defer rows.Close()
+
+	var result []DeferredRow
+	for rows.Next() {
+		row, err := scanDeferredRowSQLite(rows)
+		if err != nil {
+			return nil, fmt.Errorf("ListDeferred: scan: %w", err)
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListDeferred: rows error: %w", err)
+	}
+	if result == nil {
+		result = []DeferredRow{}
+	}
+	return result, nil
+}
+
+// GetDeferred returns a single row from sync_apply_deferred by sync_id.
+// Returns an error wrapping "not found" when no row exists.
+func (s *SQLiteStore) GetDeferred(syncID string) (DeferredRow, error) {
+	row := s.db.QueryRow(`
+		SELECT sync_id, entity, payload, apply_status, retry_count,
+		       last_error, last_attempted_at, first_seen_at
+		FROM sync_apply_deferred
+		WHERE sync_id = ?
+	`, syncID)
+	result, err := scanDeferredRowSQLite(row)
+	if err == sql.ErrNoRows {
+		return DeferredRow{}, fmt.Errorf("GetDeferred: deferred row %q not found", syncID)
+	}
+	if err != nil {
+		return DeferredRow{}, fmt.Errorf("GetDeferred: %w", err)
+	}
+	return result, nil
+}
