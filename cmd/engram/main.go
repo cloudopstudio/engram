@@ -242,6 +242,8 @@ func main() {
 		cmdPromote(cfg)
 	case "who":
 		cmdWho(cfg)
+	case "conflicts":
+		cmdConflicts(cfg)
 	case "version", "--version", "-v":
 		fmt.Printf("engram %s\n", version)
 	case "help", "--help", "-h":
@@ -1811,6 +1813,8 @@ Commands:
   login              Authenticate with Azure Entra ID (device code / browser flow)
   aws-login          Verify the AWS SSO session for RDS IAM authentication
                        --profile <name>  Use a specific engram profile
+  conflicts <sub>    Manage memory conflict relations (list, show, stats, scan, deferred)
+                       scan --semantic  LLM-judge candidate pairs (requires ENGRAM_AGENT_CLI=claude|opencode)
   config <sub>       Manage persistent configuration (set, get, list, profiles, path)
   setup [agent]      Install/setup agent integration (opencode, pi, claude-code, gemini-cli, codex)
   sync               Export new memories as compressed chunk to .engram/
