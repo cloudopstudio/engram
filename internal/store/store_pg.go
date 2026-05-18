@@ -492,6 +492,20 @@ func (s *PostgresStore) AddObservation(p AddObservationParams) (int64, error) {
 		).Scan(&observationID); err != nil {
 			return err
 		}
+
+		// Populate review_after for types that have a configured decay offset.
+		// expires_at is intentionally NULL for all types in Phase 1.
+		// This UPDATE runs only for NEW inserts (not topic_key revisions or deduplication).
+		if months, ok := decayReviewAfterMonths[p.Type]; ok {
+			reviewAfter := time.Now().UTC().AddDate(0, months, 0)
+			if _, err := tx.Exec(ctx,
+				`UPDATE observations SET review_after = $1 WHERE id = $2`,
+				reviewAfter, observationID,
+			); err != nil {
+				return fmt.Errorf("set review_after: %w", err)
+			}
+		}
+
 		obs, err = s.getObservationTx(ctx, tx, observationID)
 		if err != nil {
 			return err

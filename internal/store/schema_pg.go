@@ -499,6 +499,17 @@ func migratePG(pool *pgxpool.Pool) error {
 				CREATE INDEX IF NOT EXISTS idx_sad_status_seen ON sync_apply_deferred(apply_status, first_seen_at);
 			`,
 		},
+		{
+			version:     11,
+			description: "decay scheduling columns on observations (review_after, expires_at)",
+			sql: `
+				-- Phase decay-v1: review_after holds the ISO-8601 timestamp after which
+				-- this observation should be reviewed/refreshed.
+				-- expires_at is reserved for Phase 2 and remains NULL.
+				ALTER TABLE observations ADD COLUMN IF NOT EXISTS review_after TIMESTAMPTZ;
+				ALTER TABLE observations ADD COLUMN IF NOT EXISTS expires_at   TIMESTAMPTZ;
+			`,
+		},
 	}
 
 	for _, m := range migrations {
