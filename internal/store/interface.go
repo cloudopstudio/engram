@@ -101,6 +101,10 @@ type Store interface {
 	GetRelationStats(project string) (RelationStats, error)
 	CountDeferredAndDead() (deferred, dead int, err error)
 
+	// Deferred queue — read-only access to sync_apply_deferred rows.
+	ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error)
+	GetDeferred(syncID string) (DeferredRow, error)
+
 	// Operational diagnostics (doctor subsystem)
 	ListDiagnosticSessions(project string) ([]DiagnosticSessionEvidence, error)
 	ListPendingProjectMutations(project string) ([]SyncMutation, error)

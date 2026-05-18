@@ -240,3 +240,30 @@ type PassiveCaptureResult struct {
 	Saved      int `json:"saved"`      // New observations created
 	Duplicates int `json:"duplicates"` // Skipped because already existed
 }
+
+// DeferredRow is a single row from the sync_apply_deferred queue.
+// The payload column is decoded to a map[string]any for convenience;
+// if the JSON is malformed, PayloadValid is false and PayloadRaw is preserved.
+type DeferredRow struct {
+	SyncID          string         `json:"sync_id"`
+	Entity          string         `json:"entity"`
+	PayloadRaw      string         `json:"payload_raw"`
+	Payload         map[string]any `json:"payload,omitempty"`
+	PayloadValid    bool           `json:"payload_valid"`
+	ApplyStatus     string         `json:"apply_status"`
+	RetryCount      int            `json:"retry_count"`
+	LastError       *string        `json:"last_error,omitempty"`
+	LastAttemptedAt *string        `json:"last_attempted_at,omitempty"`
+	FirstSeenAt     string         `json:"first_seen_at"`
+}
+
+// ListDeferredOptions controls filtering and pagination for ListDeferred.
+type ListDeferredOptions struct {
+	// Status filters rows by apply_status ("deferred", "dead", "applied").
+	// An empty string returns all rows.
+	Status string `json:"status,omitempty"`
+	// Limit caps the number of rows returned. Zero means no limit.
+	Limit int `json:"limit,omitempty"`
+	// Offset skips the first N rows (for pagination).
+	Offset int `json:"offset,omitempty"`
+}
