@@ -622,6 +622,18 @@ func (s *SQLiteStore) migrate() error {
 		}
 	}
 
+	// Autosync Phase: add reason_code and reason_message columns to sync_state.
+	// These are used by MarkSyncBlocked and ApplyPulledMutation to surface
+	// deterministic block reasons (auth_required, non_enrolled_pending_mutations, etc.).
+	for _, c := range []struct{ col, def string }{
+		{"reason_code", "TEXT"},
+		{"reason_message", "TEXT"},
+	} {
+		if err := s.addColumnIfNotExists("sync_state", c.col, c.def); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
