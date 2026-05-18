@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -786,4 +787,101 @@ var _ interface {
 	CountRelations(ListRelationsOptions) (int, error)
 	GetRelationStats(string) (RelationStats, error)
 	CountDeferredAndDead() (int, int, error)
+	ListDeferred(ListDeferredOptions) ([]DeferredRow, error)
+	GetDeferred(string) (DeferredRow, error)
 } = (*PostgresStore)(nil)
+
+// ─── ListDeferred / GetDeferred (PostgreSQL) ──────────────────────────────────
+
+// decodeDeferredPayloadPG decodes a raw JSON string into the Payload/PayloadValid
+// fields of a DeferredRow.
+func decodeDeferredPayloadPG(r *DeferredRow, raw string) {
+	r.PayloadRaw = raw
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(raw), &decoded); err == nil {
+		r.Payload = decoded
+		r.PayloadValid = true
+	}
+}
+
+// ListDeferred returns rows from sync_apply_deferred with optional status filter
+// and pagination. The payload field is decoded to map[string]any; on malformed
+// JSON, PayloadValid is false and PayloadRaw is preserved.
+func (s *PostgresStore) ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error) {
+	ctx := context.Background()
+	query := `
+		SELECT sync_id, entity, payload, apply_status, retry_count,
+		       last_error, last_attempted_at, first_seen_at
+		FROM sync_apply_deferred
+		WHERE 1=1`
+	var args []any
+	argIdx := 1
+
+	if opts.Status != "" {
+		query += fmt.Sprintf(` AND apply_status = $%d`, argIdx)
+		args = append(args, opts.Status)
+		argIdx++
+	}
+	query += ` ORDER BY first_seen_at`
+	if opts.Limit > 0 {
+		query += fmt.Sprintf(` LIMIT $%d`, argIdx)
+		args = append(args, opts.Limit)
+		argIdx++
+	}
+	if opts.Offset > 0 {
+		query += fmt.Sprintf(` OFFSET $%d`, argIdx)
+		args = append(args, opts.Offset)
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("ListDeferred: query: %w", err)
+	}
+	defer rows.Close()
+
+	var result []DeferredRow
+	for rows.Next() {
+		var r DeferredRow
+		var rawPayload string
+		if err := rows.Scan(
+			&r.SyncID, &r.Entity, &rawPayload, &r.ApplyStatus, &r.RetryCount,
+			&r.LastError, &r.LastAttemptedAt, &r.FirstSeenAt,
+		); err != nil {
+			return nil, fmt.Errorf("ListDeferred: scan: %w", err)
+		}
+		decodeDeferredPayloadPG(&r, rawPayload)
+		result = append(result, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListDeferred: rows error: %w", err)
+	}
+	if result == nil {
+		result = []DeferredRow{}
+	}
+	return result, nil
+}
+
+// GetDeferred returns a single row from sync_apply_deferred by sync_id.
+// Returns an error wrapping "not found" when no row exists.
+func (s *PostgresStore) GetDeferred(syncID string) (DeferredRow, error) {
+	ctx := context.Background()
+	var r DeferredRow
+	var rawPayload string
+	err := s.pool.QueryRow(ctx, `
+		SELECT sync_id, entity, payload, apply_status, retry_count,
+		       last_error, last_attempted_at, first_seen_at
+		FROM sync_apply_deferred
+		WHERE sync_id = $1
+	`, syncID).Scan(
+		&r.SyncID, &r.Entity, &rawPayload, &r.ApplyStatus, &r.RetryCount,
+		&r.LastError, &r.LastAttemptedAt, &r.FirstSeenAt,
+	)
+	if err == pgx.ErrNoRows {
+		return DeferredRow{}, fmt.Errorf("GetDeferred: deferred row %q not found", syncID)
+	}
+	if err != nil {
+		return DeferredRow{}, fmt.Errorf("GetDeferred: %w", err)
+	}
+	decodeDeferredPayloadPG(&r, rawPayload)
+	return r, nil
+}
