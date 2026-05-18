@@ -105,6 +105,9 @@ type Store interface {
 	ListDeferred(opts ListDeferredOptions) ([]DeferredRow, error)
 	GetDeferred(syncID string) (DeferredRow, error)
 
+	// Semantic scan — walks a project's observations and optionally LLM-judges pairs.
+	ScanProject(opts ScanOptions) (ScanResult, error)
+
 	// Operational diagnostics (doctor subsystem)
 	ListDiagnosticSessions(project string) ([]DiagnosticSessionEvidence, error)
 	ListPendingProjectMutations(project string) ([]SyncMutation, error)

@@ -885,3 +885,10 @@ func (s *PostgresStore) GetDeferred(syncID string) (DeferredRow, error) {
 	decodeDeferredPayloadPG(&r, rawPayload)
 	return r, nil
 }
+
+// ScanProject is not implemented on PostgresStore — semantic scan is SQLite-only.
+// The CLI's conflicts scan command requires SQLite via store.New(cfg) which returns
+// a *SQLiteStore when no PostgreSQL connection string is configured.
+func (s *PostgresStore) ScanProject(_ ScanOptions) (ScanResult, error) {
+	return ScanResult{}, fmt.Errorf("ScanProject: not implemented for PostgresStore; use SQLite store")
+}
