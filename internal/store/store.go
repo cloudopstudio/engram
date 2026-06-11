@@ -297,6 +297,7 @@ func (s *SQLiteStore) migrate() error {
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,
+			created_by TEXT,
 			FOREIGN KEY (session_id) REFERENCES sessions(id)
 		);
 
@@ -386,6 +387,7 @@ func (s *SQLiteStore) migrate() error {
 		{name: "last_seen_at", definition: "TEXT"},
 		{name: "updated_at", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "deleted_at", definition: "TEXT"},
+		{name: "created_by", definition: "TEXT"},
 	}
 	for _, c := range observationColumns {
 		if err := s.addColumnIfNotExists("observations", c.name, c.definition); err != nil {
@@ -3078,6 +3080,11 @@ func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 		return nil
 	}
 
+	// Legacy tables predate created_by; ensure it exists before the copy below reads it.
+	if err := s.addColumnIfNotExists("observations", "created_by", "TEXT"); err != nil {
+		return err
+	}
+
 	tx, err := s.beginTxHook()
 	if err != nil {
 		return fmt.Errorf("migrate legacy observations: begin tx: %w", err)
@@ -3103,6 +3110,7 @@ func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,
+			created_by TEXT,
 			FOREIGN KEY (session_id) REFERENCES sessions(id)
 		);
 	`); err != nil {
@@ -3113,7 +3121,7 @@ func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 		INSERT INTO observations_migrated (
 			id, sync_id, session_id, type, title, content, tool_name, project,
 			scope, topic_key, normalized_hash, revision_count, duplicate_count,
-			last_seen_at, created_at, updated_at, deleted_at
+			last_seen_at, created_at, updated_at, deleted_at, created_by
 		)
 		SELECT
 			CASE
@@ -3136,7 +3144,8 @@ func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 			last_seen_at,
 			COALESCE(NULLIF(created_at, ''), datetime('now')),
 			COALESCE(NULLIF(updated_at, ''), NULLIF(created_at, ''), datetime('now')),
-			deleted_at
+			deleted_at,
+			created_by
 		FROM observations
 		ORDER BY rowid;
 	`); err != nil {
@@ -3401,7 +3410,8 @@ func (s *SQLiteStore) PromoteObservation(id int64, identity string) error {
 }
 
 // ListContributors returns contributor activity stats from observations and prompts.
-// SQLite stub — does not have per-row created_by in all builds, returns empty.
+// SQLite — created_by is only populated on rows synced from a multi-user backend;
+// local-only writes leave it NULL, so this typically returns empty.
 func (s *SQLiteStore) ListContributors(project string) ([]ContributorStats, error) {
 	obsQuery := `
 		SELECT COALESCE(created_by, '') as identity,
