@@ -510,6 +510,44 @@ func migratePG(pool *pgxpool.Pool) error {
 				ALTER TABLE observations ADD COLUMN IF NOT EXISTS expires_at   TIMESTAMPTZ;
 			`,
 		},
+		{
+			version:     12,
+			description: "RLS: include global scope in observation policies",
+			sql: `
+				-- normalizeScope now honors 'global' (upstream #428). Global
+				-- observations are shared like project ones — visible and
+				-- modifiable by everyone — but cross-project. Without this,
+				-- RLS would hide scope='global' rows from every user.
+
+				DROP POLICY IF EXISTS obs_visibility ON observations;
+				CREATE POLICY obs_visibility ON observations
+					FOR SELECT
+					USING (
+						scope = 'project'
+						OR scope = 'global'
+						OR scope IS NULL
+						OR (scope = 'personal' AND created_by = engram_current_identity())
+					);
+
+				DROP POLICY IF EXISTS obs_modify ON observations;
+				CREATE POLICY obs_modify ON observations
+					FOR UPDATE
+					USING (
+						scope = 'project'
+						OR scope = 'global'
+						OR (scope = 'personal' AND created_by = engram_current_identity())
+					);
+
+				DROP POLICY IF EXISTS obs_delete ON observations;
+				CREATE POLICY obs_delete ON observations
+					FOR DELETE
+					USING (
+						scope = 'project'
+						OR scope = 'global'
+						OR (scope = 'personal' AND created_by = engram_current_identity())
+					);
+			`,
+		},
 	}
 
 	for _, m := range migrations {
