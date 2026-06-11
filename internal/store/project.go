@@ -34,10 +34,12 @@ func NormalizeProject(project string) (normalized string, warning string) {
 
 func normalizeScope(scope string) string {
 	v := strings.TrimSpace(strings.ToLower(scope))
-	if v == "personal" {
-		return "personal"
+	switch v {
+	case "personal", "global":
+		return v
+	default:
+		return "project"
 	}
-	return "project"
 }
 
 // ClassifyTool returns the observation type for a given tool name.
