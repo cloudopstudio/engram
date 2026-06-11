@@ -4291,6 +4291,46 @@ func TestListProjectsWithStats(t *testing.T) {
 	}
 }
 
+// Regression: ListProjects and ListContributors reference created_by, which the
+// SQLite schema did not create — both failed with "no such column: o.created_by".
+func TestListProjectsAndContributorsCreatedBy(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "proj-a", "/work/a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "obs a",
+		Content:   "content",
+		Project:   "proj-a",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("AddObservation: %v", err)
+	}
+
+	projects, err := s.ListProjects(false)
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	if len(projects) != 1 || projects[0].Project != "proj-a" {
+		t.Fatalf("expected [proj-a], got %+v", projects)
+	}
+	if projects[0].Observations != 1 {
+		t.Errorf("proj-a: expected 1 observation, got %d", projects[0].Observations)
+	}
+
+	// Local writes leave created_by NULL — contributors must be empty, not error.
+	contributors, err := s.ListContributors("")
+	if err != nil {
+		t.Fatalf("ListContributors: %v", err)
+	}
+	if len(contributors) != 0 {
+		t.Errorf("expected no contributors for local-only rows, got %+v", contributors)
+	}
+}
+
 func TestMergeProjects(t *testing.T) {
 	s := newTestStore(t)
 
