@@ -67,6 +67,7 @@ func seedJudgeFixture(t *testing.T, s store.Store) (judgmentID string, sourceSyn
 // TestHandleJudge_HappyPath — judging a valid pending relation creates a judged row.
 // REQ-003 happy path | Design §6
 func TestHandleJudge_HappyPath(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	judgmentID, _, _ := seedJudgeFixture(t, s)
 
@@ -110,6 +111,7 @@ func TestHandleJudge_HappyPath(t *testing.T) {
 // TestHandleJudge_OptionalFieldsStayNull — omitting optional fields leaves them NULL.
 // REQ-003 edge case | Design §6.2
 func TestHandleJudge_OptionalFieldsStayNull(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	judgmentID, _, _ := seedJudgeFixture(t, s)
 
@@ -150,6 +152,7 @@ func TestHandleJudge_OptionalFieldsStayNull(t *testing.T) {
 // TestHandleJudge_UnknownID_IsError — unknown judgment_id returns IsError=true.
 // REQ-003 negative | Design §6.3
 func TestHandleJudge_UnknownID_IsError(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 
 	h := handleJudge(s, NewSessionActivity(10*time.Minute))
@@ -173,6 +176,7 @@ func TestHandleJudge_UnknownID_IsError(t *testing.T) {
 // TestHandleJudge_InvalidVerb_IsError — invalid relation verb returns IsError=true, row unchanged.
 // REQ-003 negative | Design §6.3
 func TestHandleJudge_InvalidVerb_IsError(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	judgmentID, _, _ := seedJudgeFixture(t, s)
 
@@ -203,6 +207,7 @@ func TestHandleJudge_InvalidVerb_IsError(t *testing.T) {
 // TestHandleJudge_Idempotent_Overwrite — re-judging overwrites the existing verdict.
 // REQ-003 | Design §6.4
 func TestHandleJudge_Idempotent_Overwrite(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	judgmentID, _, _ := seedJudgeFixture(t, s)
 
@@ -246,6 +251,7 @@ func TestHandleJudge_Idempotent_Overwrite(t *testing.T) {
 
 // TestHandleJudge_RequiresJudgmentID — missing judgment_id returns IsError=true.
 func TestHandleJudge_RequiresJudgmentID(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	h := handleJudge(s, NewSessionActivity(10*time.Minute))
 
@@ -265,6 +271,7 @@ func TestHandleJudge_RequiresJudgmentID(t *testing.T) {
 
 // TestHandleJudge_RequiresRelation — missing relation returns IsError=true.
 func TestHandleJudge_RequiresRelation(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	judgmentID, _, _ := seedJudgeFixture(t, s)
 

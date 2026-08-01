@@ -32,6 +32,7 @@ import (
 //
 // REQ-001 (candidate detection), REQ-002 (search annotations), REQ-003 (mem_judge)
 func TestConflictLoop_SaveJudgeSearch(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	saveH := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
 	searchH := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
@@ -182,6 +183,7 @@ func TestConflictLoop_SaveJudgeSearch(t *testing.T) {
 // Verifies both relations persist as separate rows and both appear in
 // GetRelationsForObservations (REQ-004).
 func TestConflictLoop_MultiActor(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 
 	if err := s.CreateSession("s-multi-actor", "engram", "/tmp"); err != nil {
@@ -310,6 +312,7 @@ func TestConflictLoop_MultiActor(t *testing.T) {
 //   - relation rows become judgment_status='orphaned' (REQ-010)
 //   - mem_search results no longer surface orphaned relations (REQ-010)
 func TestConflictLoop_Orphaning(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	searchH := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
 
@@ -437,6 +440,7 @@ func TestConflictLoop_Orphaning(t *testing.T) {
 // entity = 'relation' after conflict operations on an unenrolled project.
 // Sessions and observations still produce their own sync mutations as expected.
 func TestConflictLoop_SyncRegression(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	saveH := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
 	judgeH := handleJudge(s, NewSessionActivity(10*time.Minute))
@@ -507,6 +511,7 @@ func TestConflictLoop_SyncRegression(t *testing.T) {
 // valid, readable responses even with the new envelope fields present.
 // REQ-007 | Design §4 (regression guard).
 func TestConflictLoop_BackwardsCompat(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	saveH := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
 	searchH := handleSearch(s, MCPConfig{}, NewSessionActivity(10*time.Minute))

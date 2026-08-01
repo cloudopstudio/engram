@@ -52,6 +52,7 @@ func seedCompareFixture(t *testing.T, s store.Store) (idA, idB int64) {
 // TestHandleCompare_HappyPath — valid params persists a relation row and returns sync_id.
 // REQ-011 happy path | Design §9
 func TestHandleCompare_HappyPath(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	idA, idB := seedCompareFixture(t, s)
 
@@ -88,6 +89,7 @@ func TestHandleCompare_HappyPath(t *testing.T) {
 // TestHandleCompare_NotConflict_NoRow — not_conflict returns success without inserting a row.
 // REQ-011 | Design §9 (not_conflict is still persisted but JudgeBySemantic handles it as no-op)
 func TestHandleCompare_NotConflict_NoRow(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	idA, idB := seedCompareFixture(t, s)
 
@@ -124,6 +126,7 @@ func TestHandleCompare_NotConflict_NoRow(t *testing.T) {
 // TestHandleCompare_MissingMemoryIDB — missing memory_id_b returns IsError=true.
 // REQ-011 validation | Design §9
 func TestHandleCompare_MissingMemoryIDB(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	idA, _ := seedCompareFixture(t, s)
 
@@ -148,6 +151,7 @@ func TestHandleCompare_MissingMemoryIDB(t *testing.T) {
 // TestHandleCompare_InvalidRelation — invalid relation enum returns IsError=true.
 // REQ-011 validation | Design §9
 func TestHandleCompare_InvalidRelation(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	idA, idB := seedCompareFixture(t, s)
 
@@ -172,6 +176,7 @@ func TestHandleCompare_InvalidRelation(t *testing.T) {
 // TestHandleCompare_NonExistentObservation — non-existent memory_id_a returns descriptive error.
 // REQ-011 negative | Design §9
 func TestHandleCompare_NonExistentObservation(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	_, idB := seedCompareFixture(t, s)
 
@@ -199,6 +204,7 @@ func TestHandleCompare_NonExistentObservation(t *testing.T) {
 // TestHandleCompare_Idempotency — re-calling same pair updates existing row.
 // REQ-011 | Design §9 (JudgeBySemantic uses UPSERT)
 func TestHandleCompare_Idempotency(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	idA, idB := seedCompareFixture(t, s)
 
@@ -245,6 +251,7 @@ func TestHandleCompare_Idempotency(t *testing.T) {
 // TestHandleCompare_ProfileAgent — mem_compare is in ProfileAgent.
 // Tool count: ProfileAgent should contain mem_compare after Phase G.
 func TestHandleCompare_ProfileAgent(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	if !ProfileAgent["mem_compare"] {
 		t.Errorf("expected mem_compare in ProfileAgent, but it is absent")
 	}
@@ -253,6 +260,7 @@ func TestHandleCompare_ProfileAgent(t *testing.T) {
 // TestHandleCompare_ModelOptional — omitting 'model' field succeeds (model is optional).
 // REQ-011 | Design §9 schema
 func TestHandleCompare_ModelOptional(t *testing.T) {
+	t.Setenv("ENGRAM_JUDGE_DISABLED", "") // this fork's CI sets it globally; these tests need the feature on
 	s := newMCPTestStore(t)
 	idA, idB := seedCompareFixture(t, s)
 
