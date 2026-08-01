@@ -2207,6 +2207,7 @@ Commands:
                                 [--semantic]  [--concurrency N]  [--timeout-per-call SECONDS]
                                 [--max-semantic N]  [--yes]
                        deferred [--status S]  [--limit N]  [--inspect SYNC_ID]  [--replay]
+                     scan --semantic judges candidate pairs with an LLM (requires ENGRAM_AGENT_CLI)
   doctor             Run read-only operational diagnostics [--json] [--project P] [--check CODE]
   context [project]  Show recent context from previous sessions
   stats              Show memory system statistics
@@ -2220,13 +2221,10 @@ Commands:
                      Merge similar project names into one canonical name
                        --all      Scan ALL projects for similar name groups
                        --dry-run  Preview what would be merged (no changes)
-  doctor             Run read-only operational diagnostics [--json] [--project P] [--check CODE]
   login              Authenticate with Azure Entra ID (device code / browser flow)
   aws-login          Verify the AWS SSO session for RDS IAM authentication
   migrate            Run database migrations (PostgreSQL backend)
                        --profile <name>  Use a specific engram profile
-  conflicts <sub>    Manage memory conflict relations (list, show, stats, scan, deferred)
-                       scan --semantic  LLM-judge candidate pairs (requires ENGRAM_AGENT_CLI=claude|opencode)
   config <sub>       Manage persistent configuration (set, get, list, profiles, path)
   setup [agent]      Install/setup agent integration (opencode, pi, claude-code, gemini-cli, codex)
   sync               Export new memories as compressed chunk to .engram/
