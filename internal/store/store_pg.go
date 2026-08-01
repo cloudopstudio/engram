@@ -1356,30 +1356,14 @@ func (s *PostgresStore) Import(data *ExportData) (*ImportResult, error) {
 
 // ─── Sync Chunk Tracking ─────────────────────────────────────────────────────
 
+// GetSyncedChunks returns local-target chunk IDs for backwards compatibility.
 func (s *PostgresStore) GetSyncedChunks() (map[string]bool, error) {
-	ctx := context.Background()
-	rows, err := s.pool.Query(ctx, "SELECT chunk_id FROM sync_chunks")
-	if err != nil {
-		return nil, fmt.Errorf("get synced chunks: %w", err)
-	}
-	defer rows.Close()
-
-	chunks := make(map[string]bool)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		chunks[id] = true
-	}
-	return chunks, rows.Err()
+	return s.GetSyncedChunksForTarget(LocalChunkTargetKey)
 }
 
+// RecordSyncedChunk marks a local-target chunk as imported/exported.
 func (s *PostgresStore) RecordSyncedChunk(chunkID string) error {
-	ctx := context.Background()
-	_, err := s.pool.Exec(ctx,
-		"INSERT INTO sync_chunks (chunk_id) VALUES ($1) ON CONFLICT(chunk_id) DO NOTHING", chunkID)
-	return err
+	return s.RecordSyncedChunkForTarget(LocalChunkTargetKey, chunkID)
 }
 
 // ─── Sync State ──────────────────────────────────────────────────────────────
