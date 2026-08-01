@@ -2223,6 +2223,7 @@ Commands:
   doctor             Run read-only operational diagnostics [--json] [--project P] [--check CODE]
   login              Authenticate with Azure Entra ID (device code / browser flow)
   aws-login          Verify the AWS SSO session for RDS IAM authentication
+  migrate            Run database migrations (PostgreSQL backend)
                        --profile <name>  Use a specific engram profile
   conflicts <sub>    Manage memory conflict relations (list, show, stats, scan, deferred)
                        scan --semantic  LLM-judge candidate pairs (requires ENGRAM_AGENT_CLI=claude|opencode)
