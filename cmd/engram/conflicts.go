@@ -47,7 +47,7 @@ func printConflictsUsage() {
 	fmt.Fprintln(os.Stderr, "  scan       [--project P]  [--since RFC3339]  [--dry-run]  [--apply]  [--max-insert N]")
 	fmt.Fprintln(os.Stderr, "             [--semantic]  [--concurrency N]  [--timeout-per-call SECONDS]")
 	fmt.Fprintln(os.Stderr, "             [--max-semantic N]  [--yes]")
-	fmt.Fprintln(os.Stderr, "  deferred   [--status S]  [--limit N]  [--inspect SYNC_ID]")
+	fmt.Fprintln(os.Stderr, "  deferred   [--status S]  [--limit N]  [--inspect SYNC_ID]  [--replay]")
 }
 
 // resolveConflictsProject returns the explicit project if non-empty, otherwise falls
@@ -120,6 +120,12 @@ func cmdConflictsList(cfg store.Config) {
 		sinceTime = t
 	}
 
+	if limit > 500 {
+		fmt.Fprintln(os.Stderr, "error: --limit cannot exceed 500")
+		exitFunc(1)
+		return
+	}
+
 	s, err := storeNew(cfg)
 	if err != nil {
 		fatal(err)
@@ -190,7 +196,8 @@ func cmdConflictsShow(cfg store.Config) {
 	}
 	defer s.Close()
 
-	// Fetch all and find by integer ID.
+	// Scan via ListRelations (no filter, no limit) and find by integer ID.
+	// Phase 4 hook: add GetRelationByID to store for O(log N) lookup.
 	items, err := s.ListRelations(store.ListRelationsOptions{Limit: 0})
 	if err != nil {
 		fatal(err)
@@ -257,17 +264,34 @@ func cmdConflictsStats(cfg store.Config) {
 		return
 	}
 
-	fmt.Printf("Relation Stats (project: %s)\n", proj)
+	fmt.Printf("Conflicts Stats (project: %s)\n", proj)
 	fmt.Println()
-	fmt.Println("  By Relation:")
-	for rel, count := range stats.ByRelation {
-		fmt.Printf("    %-20s %d\n", rel, count)
+
+	if len(stats.ByJudgmentStatus) == 0 {
+		fmt.Println("  No relations found.")
+	} else {
+		fmt.Println("  By judgment_status:")
+		// Print in a stable order: pending, accepted, rejected, then others.
+		for _, status := range []string{"pending", "accepted", "rejected"} {
+			if n, ok := stats.ByJudgmentStatus[status]; ok {
+				fmt.Printf("    %-12s %d\n", status+":", n)
+			}
+		}
+		for status, n := range stats.ByJudgmentStatus {
+			if status != "pending" && status != "accepted" && status != "rejected" {
+				fmt.Printf("    %-12s %d\n", status+":", n)
+			}
+		}
 	}
-	fmt.Println()
-	fmt.Println("  By Judgment Status:")
-	for status, count := range stats.ByJudgmentStatus {
-		fmt.Printf("    %-20s %d\n", status, count)
+
+	if len(stats.ByRelation) > 0 {
+		fmt.Println()
+		fmt.Println("  By relation type:")
+		for rel, n := range stats.ByRelation {
+			fmt.Printf("    %-20s %d\n", rel+":", n)
+		}
 	}
+
 	fmt.Println()
 	fmt.Printf("  Deferred:    %d\n", stats.DeferredCount)
 	fmt.Printf("  Dead:        %d\n", stats.DeadCount)
@@ -283,7 +307,7 @@ func cmdConflictsScan(cfg store.Config) {
 	apply := false
 	maxInsert := 100
 
-	// Phase 4 semantic flags.
+	// Phase 4 semantic flags (parsed here; wired into ScanOptions below).
 	semantic := false
 	concurrency := 5
 	timeoutPerCall := 60
@@ -343,7 +367,7 @@ func cmdConflictsScan(cfg store.Config) {
 		}
 	}
 
-	// Explicit mutex enforcement.
+	// Explicit mutex enforcement
 	if dryRun && apply {
 		fmt.Fprintln(os.Stderr, "error: --dry-run and --apply are mutually exclusive")
 		exitFunc(1)
@@ -457,6 +481,7 @@ func cmdConflictsDeferred(cfg store.Config) {
 	args := os.Args[3:]
 
 	var statusFlag, inspectFlag string
+	replay := false
 	limit := 50
 
 	for i := 0; i < len(args); i++ {
@@ -478,7 +503,16 @@ func cmdConflictsDeferred(cfg store.Config) {
 				inspectFlag = args[i+1]
 				i++
 			}
+		case "--replay":
+			replay = true
 		}
+	}
+
+	// Mutex: --inspect and --replay cannot be combined.
+	if inspectFlag != "" && replay {
+		fmt.Fprintln(os.Stderr, "error: --inspect and --replay are mutually exclusive")
+		exitFunc(1)
+		return
 	}
 
 	s, err := storeNew(cfg)
@@ -488,9 +522,24 @@ func cmdConflictsDeferred(cfg store.Config) {
 	}
 	defer s.Close()
 
+	if replay {
+		result, err := s.ReplayDeferred()
+		if err != nil {
+			fatal(err)
+			return
+		}
+		fmt.Printf("Deferred Replay\n")
+		fmt.Printf("  retried:   %d\n", result.Retried)
+		fmt.Printf("  succeeded: %d\n", result.Succeeded)
+		fmt.Printf("  failed:    %d\n", result.Failed)
+		fmt.Printf("  dead:      %d\n", result.Dead)
+		return
+	}
+
 	if inspectFlag != "" {
 		row, err := s.GetDeferred(inspectFlag)
 		if err != nil {
+			// GetDeferred wraps sql.ErrNoRows with a "not found" message.
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			exitFunc(1)
 			return

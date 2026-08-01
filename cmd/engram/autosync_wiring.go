@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -59,7 +60,7 @@ func loadCloudConfig(cfg store.Config) (*cloudConfig, error) {
 func resolveCloudRuntimeConfig(cfg store.Config) (*cloudConfig, error) {
 	cc, err := loadCloudConfig(cfg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read cloud config: %w", err)
 	}
 	if cc == nil {
 		cc = &cloudConfig{}
@@ -80,9 +81,6 @@ func resolveCloudRuntimeConfig(cfg store.Config) (*cloudConfig, error) {
 
 // autosyncStatusProvider is the minimal interface for consumers that only
 // need to read the autosync status (not run or stop the manager).
-type autosyncStatusProvider interface {
-	Status() autosync.Status
-}
 
 // ─── Mutation transport adapter ───────────────────────────────────────────────
 
@@ -175,7 +173,7 @@ func tryStartAutosync(ctx context.Context, s store.Store, cfg store.Config) (aut
 
 	transport := &mutationTransportAdapter{remote: remoteMT}
 	mgrCfg := autosync.DefaultConfig()
-	mgr := autosync.New(s, transport, mgrCfg)
+	mgr := newAutosyncManager(s, transport, mgrCfg)
 
 	go mgr.Run(ctx)
 	log.Printf("[autosync] started (server=%s)", serverURL)

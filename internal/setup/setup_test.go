@@ -25,9 +25,7 @@ func resetSetupSeams(t *testing.T) {
 	oldJSONMarshalFn := jsonMarshalFn
 	oldJSONMarshalIndentFn := jsonMarshalIndentFn
 	oldInjectOpenCodeMCPFn := injectOpenCodeMCPFn
-	oldInjectOpenCodeServerPluginFn := injectOpenCodeServerPluginFn
-	oldInjectOpenCodeTUIPluginFn := injectOpenCodeTUIPluginFn
-	oldInstallNPMDependenciesFn := installNPMDependenciesFn
+	oldInjectOpenCodeTUIPluginFn := injectOpenCodeSubagentPluginFn
 	oldInjectGeminiMCPFn := injectGeminiMCPFn
 	oldWriteGeminiSystemPromptFn := writeGeminiSystemPromptFn
 	oldWriteCodexMemoryInstructionFilesFn := writeCodexMemoryInstructionFilesFn
@@ -36,6 +34,7 @@ func resetSetupSeams(t *testing.T) {
 	oldAddClaudeCodeAllowlistFn := addClaudeCodeAllowlistFn
 	oldOsExecutable := osExecutable
 	oldWriteClaudeCodeUserMCPFn := writeClaudeCodeUserMCPFn
+	oldResolveMiseNodeVersionFn := resolveMiseNodeVersionFn
 
 	t.Cleanup(func() {
 		runtimeGOOS = oldRuntimeGOOS
@@ -50,9 +49,7 @@ func resetSetupSeams(t *testing.T) {
 		jsonMarshalFn = oldJSONMarshalFn
 		jsonMarshalIndentFn = oldJSONMarshalIndentFn
 		injectOpenCodeMCPFn = oldInjectOpenCodeMCPFn
-		injectOpenCodeServerPluginFn = oldInjectOpenCodeServerPluginFn
-		injectOpenCodeTUIPluginFn = oldInjectOpenCodeTUIPluginFn
-		installNPMDependenciesFn = oldInstallNPMDependenciesFn
+		injectOpenCodeSubagentPluginFn = oldInjectOpenCodeTUIPluginFn
 		injectGeminiMCPFn = oldInjectGeminiMCPFn
 		writeGeminiSystemPromptFn = oldWriteGeminiSystemPromptFn
 		writeCodexMemoryInstructionFilesFn = oldWriteCodexMemoryInstructionFilesFn
@@ -61,6 +58,7 @@ func resetSetupSeams(t *testing.T) {
 		addClaudeCodeAllowlistFn = oldAddClaudeCodeAllowlistFn
 		osExecutable = oldOsExecutable
 		writeClaudeCodeUserMCPFn = oldWriteClaudeCodeUserMCPFn
+		resolveMiseNodeVersionFn = oldResolveMiseNodeVersionFn
 	})
 }
 
@@ -300,6 +298,142 @@ func TestInstallCodexInjectsTOMLAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestInstallCodexPluginCLIPresent verifies that when the codex CLI is in PATH,
+// installCodex() runs marketplace add + plugin add with the correct arguments.
+func TestInstallCodexPluginCLIPresent(t *testing.T) {
+	resetSetupSeams(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	var commands [][]string
+	lookPathFn = func(file string) (string, error) {
+		if file == "codex" {
+			return "/usr/local/bin/codex", nil
+		}
+		return "", errors.New("not found")
+	}
+	runCommand = func(name string, args ...string) ([]byte, error) {
+		commands = append(commands, append([]string{name}, args...))
+		return []byte("ok"), nil
+	}
+
+	result, err := Install("codex")
+	if err != nil {
+		t.Fatalf("Install(codex) failed: %v", err)
+	}
+	if result.Agent != "codex" {
+		t.Fatalf("unexpected agent: %q", result.Agent)
+	}
+	if result.Files != 3 {
+		t.Fatalf("expected 3 files written, got %d", result.Files)
+	}
+
+	// Verify marketplace add was called with the right args.
+	var foundMarketplace bool
+	for _, cmd := range commands {
+		if len(cmd) >= 7 &&
+			cmd[0] == "/usr/local/bin/codex" &&
+			cmd[1] == "plugin" && cmd[2] == "marketplace" && cmd[3] == "add" &&
+			cmd[4] == codexMarketplace &&
+			cmd[5] == "--ref" && cmd[6] == "main" {
+			foundMarketplace = true
+		}
+	}
+	if !foundMarketplace {
+		t.Fatalf("expected 'codex plugin marketplace add %s --ref main' to be invoked, got: %v", codexMarketplace, commands)
+	}
+
+	// Verify plugin add was called with the right args.
+	var foundPluginAdd bool
+	for _, cmd := range commands {
+		if len(cmd) >= 4 &&
+			cmd[0] == "/usr/local/bin/codex" &&
+			cmd[1] == "plugin" && cmd[2] == "add" && cmd[3] == "engram@engram" {
+			foundPluginAdd = true
+		}
+	}
+	if !foundPluginAdd {
+		t.Fatalf("expected 'codex plugin add engram@engram' to be invoked, got: %v", commands)
+	}
+}
+
+// TestInstallCodexPluginCLIAbsent verifies that when the codex CLI is not in
+// PATH, installCodex() does not fail — MCP config is still written and Files==3.
+func TestInstallCodexPluginCLIAbsent(t *testing.T) {
+	resetSetupSeams(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	lookPathFn = func(file string) (string, error) {
+		return "", errors.New("not found")
+	}
+	runCommand = func(name string, args ...string) ([]byte, error) {
+		t.Fatalf("runCommand should not be called when codex CLI is absent, got: %s %v", name, args)
+		return nil, nil
+	}
+
+	result, err := Install("codex")
+	if err != nil {
+		t.Fatalf("Install(codex) should succeed even without codex CLI, got: %v", err)
+	}
+	if result.Agent != "codex" {
+		t.Fatalf("unexpected agent: %q", result.Agent)
+	}
+	if result.Files != 3 {
+		t.Fatalf("expected 3 files written, got %d", result.Files)
+	}
+
+	// Verify the TOML config was still written.
+	configPath := filepath.Join(home, ".codex", "config.toml")
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("expected config.toml to be written: %v", err)
+	}
+	if !strings.Contains(string(raw), "[mcp_servers.engram]") {
+		t.Fatalf("expected [mcp_servers.engram] in config, got:\n%s", raw)
+	}
+}
+
+// TestInstallCodexPluginIdempotentAlreadyInOutput verifies that when
+// marketplace add or plugin add returns an error whose output contains "already",
+// the install is still treated as successful (idempotent).
+func TestInstallCodexPluginIdempotentAlreadyInOutput(t *testing.T) {
+	resetSetupSeams(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	lookPathFn = func(file string) (string, error) {
+		if file == "codex" {
+			return "/usr/local/bin/codex", nil
+		}
+		return "", errors.New("not found")
+	}
+	calls := 0
+	runCommand = func(name string, args ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			// marketplace add returns "already exists" with a non-zero exit
+			return []byte("marketplace already added"), errors.New("exit 1")
+		}
+		if calls == 2 {
+			// plugin add returns "already installed" with a non-zero exit
+			return []byte("plugin already installed"), errors.New("exit 1")
+		}
+		return []byte("ok"), nil
+	}
+
+	result, err := Install("codex")
+	if err != nil {
+		t.Fatalf("Install(codex) should succeed on already-installed outputs, got: %v", err)
+	}
+	if result.Files != 3 {
+		t.Fatalf("expected 3 files written, got %d", result.Files)
+	}
+	if calls < 2 {
+		t.Fatalf("expected at least 2 codex CLI calls, got %d", calls)
+	}
+}
+
 func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	resetSetupSeams(t)
 	agentDir := t.TempDir()
@@ -319,7 +453,7 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if result.Agent != "pi" || result.Destination != agentDir || result.Files != 2 {
 		t.Fatalf("unexpected install result: %#v", result)
 	}
-	wantCommands := []string{"pi install npm:gentle-engram@0.1.5", "pi install npm:pi-mcp-adapter"}
+	wantCommands := []string{"pi install npm:gentle-engram@0.1.8", "pi install npm:pi-mcp-adapter"}
 	if !reflect.DeepEqual(commands, wantCommands) {
 		t.Fatalf("unexpected pi install commands: got %#v want %#v", commands, wantCommands)
 	}
@@ -334,7 +468,7 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if err := json.Unmarshal(settingsRaw, &settings); err != nil {
 		t.Fatalf("parse settings: %v", err)
 	}
-	for _, pkg := range []string{"npm:gentle-engram@0.1.5", "npm:pi-mcp-adapter"} {
+	for _, pkg := range []string{"npm:gentle-engram@0.1.8", "npm:pi-mcp-adapter"} {
 		if !slices.Contains(settings.Packages, pkg) {
 			t.Fatalf("expected settings packages to include %q, got %#v", pkg, settings.Packages)
 		}
@@ -402,7 +536,7 @@ func TestInstallPiPreservesExistingEngramMCPServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read settings after install: %v", err)
 	}
-	if !strings.Contains(string(settingsRaw), "npm:existing") || !strings.Contains(string(settingsRaw), "npm:gentle-engram@0.1.5") || !strings.Contains(string(settingsRaw), "npm:pi-mcp-adapter") {
+	if !strings.Contains(string(settingsRaw), "npm:existing") || !strings.Contains(string(settingsRaw), "npm:gentle-engram@0.1.8") || !strings.Contains(string(settingsRaw), "npm:pi-mcp-adapter") {
 		t.Fatalf("expected settings packages to be preserved and extended, got %s", settingsRaw)
 	}
 }
@@ -413,8 +547,237 @@ func TestInstallPiCommandFailure(t *testing.T) {
 		return []byte("boom"), errors.New("exit 1")
 	}
 	_, err := Install("pi")
-	if err == nil || !strings.Contains(err.Error(), "install npm:gentle-engram@0.1.5") {
+	if err == nil || !strings.Contains(err.Error(), "install npm:gentle-engram@0.1.8") {
 		t.Fatalf("expected pi install error, got %v", err)
+	}
+}
+
+// TestEnsurePiNpmCommandWritesMiseCommand verifies that when mise is detected
+// and no npmCommand exists in settings.json, a stable mise-pinned command is written.
+func TestEnsurePiNpmCommandWritesMiseCommand(t *testing.T) {
+	resetSetupSeams(t)
+	agentDir := t.TempDir()
+	settingsPath := filepath.Join(agentDir, "settings.json")
+
+	// mise is found in PATH
+	lookPathFn = func(file string) (string, error) {
+		if file == "mise" {
+			return "/usr/local/bin/mise", nil
+		}
+		return "", errors.New("not found")
+	}
+	// mise current node returns a version
+	resolveMiseNodeVersionFn = func() string { return "node@22.12.0" }
+
+	changed, err := ensurePiNpmCommand(settingsPath)
+	if err != nil {
+		t.Fatalf("ensurePiNpmCommand failed: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected changed=true when mise detected and no npmCommand set")
+	}
+
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatalf("parse settings: %v", err)
+	}
+	npmCmdRaw, ok := settings["npmCommand"]
+	if !ok {
+		t.Fatalf("expected npmCommand in settings, got %s", raw)
+	}
+	var npmCmd []string
+	if err := json.Unmarshal(npmCmdRaw, &npmCmd); err != nil {
+		t.Fatalf("parse npmCommand: %v", err)
+	}
+	want := []string{"mise", "exec", "node@22.12.0", "--", "npm"}
+	if !reflect.DeepEqual(npmCmd, want) {
+		t.Fatalf("expected npmCommand %v, got %v", want, npmCmd)
+	}
+}
+
+// TestEnsurePiNpmCommandPreservesExisting verifies that an existing npmCommand
+// in settings.json is never overwritten (idempotent / user-override safe).
+func TestEnsurePiNpmCommandPreservesExisting(t *testing.T) {
+	resetSetupSeams(t)
+	agentDir := t.TempDir()
+	settingsPath := filepath.Join(agentDir, "settings.json")
+
+	existing := `{"npmCommand":["mise","exec","node@20.0.0","--","npm"]}`
+	if err := os.WriteFile(settingsPath, []byte(existing), 0644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	// mise is found — but should NOT overwrite the user's existing command
+	lookPathFn = func(file string) (string, error) {
+		if file == "mise" {
+			return "/usr/local/bin/mise", nil
+		}
+		return "", errors.New("not found")
+	}
+	resolveMiseNodeVersionFn = func() string { return "node@25.9.0" }
+
+	changed, err := ensurePiNpmCommand(settingsPath)
+	if err != nil {
+		t.Fatalf("ensurePiNpmCommand failed: %v", err)
+	}
+	if changed {
+		t.Fatalf("expected changed=false when npmCommand already set")
+	}
+
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	if string(raw) != existing {
+		t.Fatalf("expected settings to be unchanged, got %s", raw)
+	}
+}
+
+// TestEnsurePiNpmCommandNoMise verifies that when mise is not found,
+// no npmCommand is written.
+func TestEnsurePiNpmCommandNoMise(t *testing.T) {
+	resetSetupSeams(t)
+	agentDir := t.TempDir()
+	settingsPath := filepath.Join(agentDir, "settings.json")
+
+	// mise not found
+	lookPathFn = func(file string) (string, error) {
+		return "", errors.New("not found")
+	}
+
+	changed, err := ensurePiNpmCommand(settingsPath)
+	if err != nil {
+		t.Fatalf("ensurePiNpmCommand failed: %v", err)
+	}
+	if changed {
+		t.Fatalf("expected changed=false when mise is not detected")
+	}
+
+	// settings.json should not have been created
+	if _, err := os.Stat(settingsPath); err == nil {
+		t.Fatalf("expected settings.json not to be created when mise is absent")
+	}
+}
+
+// TestEnsurePiNpmCommandMiseVersionFallback verifies that when mise is found
+// but the version cannot be resolved, "node" is used as the spec fallback.
+func TestEnsurePiNpmCommandMiseVersionFallback(t *testing.T) {
+	resetSetupSeams(t)
+	agentDir := t.TempDir()
+	settingsPath := filepath.Join(agentDir, "settings.json")
+
+	lookPathFn = func(file string) (string, error) {
+		if file == "mise" {
+			return "/usr/local/bin/mise", nil
+		}
+		return "", errors.New("not found")
+	}
+	// version resolution fails — returns empty string
+	resolveMiseNodeVersionFn = func() string { return "" }
+
+	changed, err := ensurePiNpmCommand(settingsPath)
+	if err != nil {
+		t.Fatalf("ensurePiNpmCommand failed: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected changed=true even when version resolution fails")
+	}
+
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatalf("parse settings: %v", err)
+	}
+	var npmCmd []string
+	if err := json.Unmarshal(settings["npmCommand"], &npmCmd); err != nil {
+		t.Fatalf("parse npmCommand: %v", err)
+	}
+	// Fallback: mise exec node -- npm (no version specifier)
+	want := []string{"mise", "exec", "node", "--", "npm"}
+	if !reflect.DeepEqual(npmCmd, want) {
+		t.Fatalf("expected fallback npmCommand %v, got %v", want, npmCmd)
+	}
+}
+
+// TestInstallPiWritesNpmCommandWhenMiseDetected verifies that the full
+// installPi() flow writes npmCommand to settings.json when mise is available.
+func TestInstallPiWritesNpmCommandWhenMiseDetected(t *testing.T) {
+	resetSetupSeams(t)
+	agentDir := t.TempDir()
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+	osExecutable = func() (string, error) { return "/opt/engram/bin/engram", nil }
+	runCommand = func(string, ...string) ([]byte, error) { return []byte("ok"), nil }
+
+	lookPathFn = func(file string) (string, error) {
+		if file == "mise" {
+			return "/usr/local/bin/mise", nil
+		}
+		return "", errors.New("not found")
+	}
+	resolveMiseNodeVersionFn = func() string { return "node@25.9.0" }
+
+	result, err := Install("pi")
+	if err != nil {
+		t.Fatalf("Install(pi) failed: %v", err)
+	}
+	// settings.json changed (packages + npmCommand) + mcp.json
+	if result.Files != 2 {
+		t.Fatalf("expected 2 files written, got %d", result.Files)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(agentDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatalf("parse settings: %v", err)
+	}
+	var npmCmd []string
+	if err := json.Unmarshal(settings["npmCommand"], &npmCmd); err != nil {
+		t.Fatalf("parse npmCommand: %v", err)
+	}
+	want := []string{"mise", "exec", "node@25.9.0", "--", "npm"}
+	if !reflect.DeepEqual(npmCmd, want) {
+		t.Fatalf("expected npmCommand %v, got %v", want, npmCmd)
+	}
+}
+
+// TestInstallPiNoNpmCommandWhenNoMise verifies that installPi() does not write
+// npmCommand when mise is absent.
+func TestInstallPiNoNpmCommandWhenNoMise(t *testing.T) {
+	resetSetupSeams(t)
+	agentDir := t.TempDir()
+	t.Setenv("PI_CODING_AGENT_DIR", agentDir)
+	osExecutable = func() (string, error) { return "/opt/engram/bin/engram", nil }
+	runCommand = func(string, ...string) ([]byte, error) { return []byte("ok"), nil }
+
+	lookPathFn = func(file string) (string, error) {
+		return "", errors.New("not found")
+	}
+
+	_, err := Install("pi")
+	if err != nil {
+		t.Fatalf("Install(pi) failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(agentDir, "settings.json"))
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatalf("parse settings: %v", err)
+	}
+	if _, ok := settings["npmCommand"]; ok {
+		t.Fatalf("expected no npmCommand when mise is absent, got %s", raw)
 	}
 }
 
@@ -432,16 +795,15 @@ func TestInstallOpenCodeSuccessAndMCPRegistered(t *testing.T) {
 	runtimeGOOS = "linux"
 	xdg := filepath.Join(home, "xdg")
 	t.Setenv("XDG_CONFIG_HOME", xdg)
-	// Stub npm install so it doesn't actually run in the test environment.
-	installNPMDependenciesFn = func(string) error { return nil }
 
 	result, err := installOpenCode()
 	if err != nil {
 		t.Fatalf("installOpenCode failed: %v", err)
 	}
-	// 1 (engram.ts) + 1 (opencode.json MCP) + 4 (TUI plugin files) + 1 (tui.json) = 7
-	if result.Files != 7 {
-		t.Fatalf("expected 7 files after full install, got %d", result.Files)
+	// engram.ts + opencode.json MCP + tui.json + the 5 azure-entra plugin files
+	// this fork also installs.
+	if result.Files != 8 {
+		t.Fatalf("expected 8 files after MCP + TUI registration, got %d", result.Files)
 	}
 
 	pluginPath := filepath.Join(xdg, "opencode", "plugins", "engram.ts")
@@ -449,7 +811,6 @@ func TestInstallOpenCodeSuccessAndMCPRegistered(t *testing.T) {
 		t.Fatalf("expected plugin file to exist: %v", err)
 	}
 
-	// Verify MCP registration in opencode.json
 	raw, err := os.ReadFile(filepath.Join(xdg, "opencode", "opencode.json"))
 	if err != nil {
 		t.Fatalf("read opencode config: %v", err)
@@ -466,31 +827,27 @@ func TestInstallOpenCodeSuccessAndMCPRegistered(t *testing.T) {
 		t.Fatalf("expected mcp.engram registration")
 	}
 
-	// Verify TUI plugin files were installed
-	tuiPluginDir := filepath.Join(xdg, "opencode", "plugins", "opencode-azure-entra-auth")
-	for _, f := range []string{"index.ts", "tui.tsx", "package.json", "README.md"} {
-		if _, err := os.Stat(filepath.Join(tuiPluginDir, f)); err != nil {
-			t.Fatalf("expected TUI plugin file %s to exist: %v", f, err)
-		}
-	}
-
-	// Verify tui.json was created with plugin registration
-	tuiConfigPath := filepath.Join(xdg, "opencode", "tui.json")
-	tuiRaw, err := os.ReadFile(tuiConfigPath)
+	tuiRaw, err := os.ReadFile(filepath.Join(xdg, "opencode", "tui.json"))
 	if err != nil {
-		t.Fatalf("expected tui.json to exist: %v", err)
+		t.Fatalf("read opencode tui config: %v", err)
 	}
 	var tuiCfg map[string]any
 	if err := json.Unmarshal(tuiRaw, &tuiCfg); err != nil {
-		t.Fatalf("parse tui.json: %v", err)
+		t.Fatalf("parse opencode tui config: %v", err)
 	}
 	plugins, ok := tuiCfg["plugin"].([]any)
-	if !ok || len(plugins) == 0 {
+	if !ok {
 		t.Fatalf("expected plugin array in tui.json")
 	}
-	pluginURI := plugins[0].(string)
-	if !strings.Contains(pluginURI, "opencode-azure-entra-auth") {
-		t.Fatalf("expected TUI plugin URI in tui.json, got %q", pluginURI)
+	var found bool
+	for _, plugin := range plugins {
+		if plugin == openCodeSubagentStatuslinePlugin {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected %q plugin registration", openCodeSubagentStatuslinePlugin)
 	}
 }
 
@@ -532,18 +889,31 @@ func TestInstallOpenCodeMCPInjectionFailureIsNonFatal(t *testing.T) {
 	injectOpenCodeMCPFn = func() error {
 		return errors.New("cannot write config")
 	}
-	// Stub TUI functions so only the core engram.ts counts when MCP injection fails.
-	injectOpenCodeTUIPluginFn = func(string) error { return nil }
-	injectOpenCodeServerPluginFn = func(string) error { return nil }
-	installNPMDependenciesFn = func(string) error { return nil }
 
 	result, err := installOpenCode()
 	if err != nil {
 		t.Fatalf("expected non-fatal MCP injection failure, got %v", err)
 	}
-	// 1 (engram.ts) + MCP injection failed (0) + 4 (TUI plugin files) + 1 (tui.json) = 6
-	if result.Files != 6 {
-		t.Fatalf("expected 6 files (TUI still installed) when MCP injection fails, got %d", result.Files)
+	if result.Files != 7 {
+		t.Fatalf("expected plugin file + TUI config + azure-entra plugin files when MCP injection fails, got %d", result.Files)
+	}
+}
+
+func TestInstallOpenCodeTUIInjectionFailureIsNonFatal(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
+	runtimeGOOS = "linux"
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	injectOpenCodeSubagentPluginFn = func() error {
+		return errors.New("cannot write tui config")
+	}
+
+	result, err := installOpenCode()
+	if err != nil {
+		t.Fatalf("expected non-fatal TUI injection failure, got %v", err)
+	}
+	if result.Files != 7 {
+		t.Fatalf("expected plugin file + MCP config + azure-entra plugin files when TUI injection fails, got %d", result.Files)
 	}
 }
 
@@ -592,6 +962,96 @@ func TestInjectOpenCodeMCPPreservesExistingAndIsIdempotent(t *testing.T) {
 	if engram["enabled"] != true {
 		t.Fatalf("expected engram.enabled=true")
 	}
+}
+
+func TestInjectOpenCodeTUIPluginPreservesExistingAndIsIdempotent(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
+	runtimeGOOS = "linux"
+	xdg := filepath.Join(home, "xdg")
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+
+	configPath := filepath.Join(xdg, "opencode", "tui.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	initial := `{"$schema":"https://opencode.ai/tui.json","plugin":["existing-plugin"]}`
+	if err := os.WriteFile(configPath, []byte(initial), 0644); err != nil {
+		t.Fatalf("write initial config: %v", err)
+	}
+
+	if err := injectOpenCodeSubagentPlugin(); err != nil {
+		t.Fatalf("injectOpenCodeTUIPlugin failed: %v", err)
+	}
+	if err := injectOpenCodeSubagentPlugin(); err != nil {
+		t.Fatalf("injectOpenCodeTUIPlugin should be idempotent: %v", err)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read updated config: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parse updated config: %v", err)
+	}
+	plugins, ok := cfg["plugin"].([]any)
+	if !ok {
+		t.Fatalf("expected plugin array")
+	}
+	if len(plugins) != 2 {
+		t.Fatalf("expected 2 plugins, got %v", plugins)
+	}
+	if plugins[0] != "existing-plugin" {
+		t.Fatalf("expected existing plugin to be preserved, got %v", plugins)
+	}
+	if plugins[1] != openCodeSubagentStatuslinePlugin {
+		t.Fatalf("expected %q to be appended, got %v", openCodeSubagentStatuslinePlugin, plugins)
+	}
+}
+
+func TestInjectOpenCodeTUIPluginConfigErrors(t *testing.T) {
+	t.Run("invalid root json", func(t *testing.T) {
+		resetSetupSeams(t)
+		home := useTestHome(t)
+		runtimeGOOS = "linux"
+		xdg := filepath.Join(home, "xdg")
+		t.Setenv("XDG_CONFIG_HOME", xdg)
+
+		configPath := filepath.Join(xdg, "opencode", "tui.json")
+		if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+			t.Fatalf("mkdir config dir: %v", err)
+		}
+		if err := os.WriteFile(configPath, []byte("{"), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		err := injectOpenCodeSubagentPlugin()
+		if err == nil || !strings.Contains(err.Error(), "parse config") {
+			t.Fatalf("expected parse config error, got %v", err)
+		}
+	})
+
+	t.Run("invalid plugin block", func(t *testing.T) {
+		resetSetupSeams(t)
+		home := useTestHome(t)
+		runtimeGOOS = "linux"
+		xdg := filepath.Join(home, "xdg")
+		t.Setenv("XDG_CONFIG_HOME", xdg)
+
+		configPath := filepath.Join(xdg, "opencode", "tui.json")
+		if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+			t.Fatalf("mkdir config dir: %v", err)
+		}
+		if err := os.WriteFile(configPath, []byte(`{"plugin":{"bad":true}}`), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		err := injectOpenCodeSubagentPlugin()
+		if err == nil || !strings.Contains(err.Error(), "parse plugin block") {
+			t.Fatalf("expected parse plugin block error, got %v", err)
+		}
+	})
 }
 
 func TestInjectOpenCodeMCPConfigErrors(t *testing.T) {
@@ -1028,6 +1488,72 @@ func TestResolveEngramCommand(t *testing.T) {
 	})
 }
 
+// TestResolveEngramCommandHomebrewCellar guards against baking a versioned
+// Homebrew/Linuxbrew Cellar path into MCP client configs. Such paths (e.g.
+// .../Cellar/engram/1.16.1/bin/engram) are removed on `brew upgrade`, leaving
+// OpenCode/Codex with a stale command that fails to spawn (ENOENT). The command
+// must resolve to the stable <brew-prefix>/bin/engram symlink, or bare "engram"
+// when that symlink is missing.
+func TestResolveEngramCommandHomebrewCellar(t *testing.T) {
+	cases := []struct {
+		name         string
+		exe          string
+		stableOnDisk string // stable symlink present on disk; "" means none
+		want         string
+	}{
+		{
+			name:         "linuxbrew cellar maps to stable bin symlink",
+			exe:          "/home/linuxbrew/.linuxbrew/Cellar/engram/1.16.1/bin/engram",
+			stableOnDisk: "/home/linuxbrew/.linuxbrew/bin/engram",
+			want:         "/home/linuxbrew/.linuxbrew/bin/engram",
+		},
+		{
+			name:         "macos arm cellar maps to stable bin symlink",
+			exe:          "/opt/homebrew/Cellar/engram/1.16.1/bin/engram",
+			stableOnDisk: "/opt/homebrew/bin/engram",
+			want:         "/opt/homebrew/bin/engram",
+		},
+		{
+			name:         "macos intel cellar maps to stable bin symlink",
+			exe:          "/usr/local/Cellar/engram/1.16.1/bin/engram",
+			stableOnDisk: "/usr/local/bin/engram",
+			want:         "/usr/local/bin/engram",
+		},
+		{
+			name:         "cellar path with missing stable symlink falls back to bare name",
+			exe:          "/opt/homebrew/Cellar/engram/1.16.1/bin/engram",
+			stableOnDisk: "",
+			want:         "engram",
+		},
+		{
+			name:         "non-cellar absolute path is preserved",
+			exe:          "/opt/engram/bin/engram",
+			stableOnDisk: "",
+			want:         "/opt/engram/bin/engram",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetSetupSeams(t)
+			osExecutable = func() (string, error) { return tc.exe, nil }
+			statFn = func(name string) (os.FileInfo, error) {
+				if tc.stableOnDisk != "" && filepath.ToSlash(name) == tc.stableOnDisk {
+					return nil, nil // exists
+				}
+				return nil, os.ErrNotExist
+			}
+
+			// Normalize separators so the comparison holds on Windows runners,
+			// where resolveEngramCommand returns OS-native separators via
+			// filepath.FromSlash while tc.want is written with forward slashes.
+			if got := filepath.ToSlash(resolveEngramCommand()); got != tc.want {
+				t.Fatalf("resolveEngramCommand() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestClaudeCodeMCPDirPaths(t *testing.T) {
 	resetSetupSeams(t)
 	userHomeDir = func() (string, error) { return "/home/tester", nil }
@@ -1163,6 +1689,9 @@ func TestPathHelpersAcrossOSVariants(t *testing.T) {
 	if got := openCodeConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "opencode.json") {
 		t.Fatalf("unexpected linux openCodeConfigPath: %s", got)
 	}
+	if got := openCodeTUIConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "tui.json") {
+		t.Fatalf("unexpected linux openCodeTUIConfigPath: %s", got)
+	}
 	if got := openCodePluginDir(); got != filepath.Join("/home/tester", ".config", "opencode", "plugins") {
 		t.Fatalf("unexpected linux openCodePluginDir: %s", got)
 	}
@@ -1177,6 +1706,9 @@ func TestPathHelpersAcrossOSVariants(t *testing.T) {
 	if got := openCodeConfigPath(); got != filepath.Join("/xdg", "opencode", "opencode.json") {
 		t.Fatalf("unexpected linux xdg openCodeConfigPath: %s", got)
 	}
+	if got := openCodeTUIConfigPath(); got != filepath.Join("/xdg", "opencode", "tui.json") {
+		t.Fatalf("unexpected linux xdg openCodeTUIConfigPath: %s", got)
+	}
 	if got := openCodePluginDir(); got != filepath.Join("/xdg", "opencode", "plugins") {
 		t.Fatalf("unexpected linux xdg openCodePluginDir: %s", got)
 	}
@@ -1187,6 +1719,9 @@ func TestPathHelpersAcrossOSVariants(t *testing.T) {
 	// OpenCode uses ~/.config/opencode/ on ALL platforms, ignoring %APPDATA%
 	if got := openCodeConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "opencode.json") {
 		t.Fatalf("unexpected windows openCodeConfigPath: %s", got)
+	}
+	if got := openCodeTUIConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "tui.json") {
+		t.Fatalf("unexpected windows openCodeTUIConfigPath: %s", got)
 	}
 	if got := openCodePluginDir(); got != filepath.Join("/home/tester", ".config", "opencode", "plugins") {
 		t.Fatalf("unexpected windows openCodePluginDir: %s", got)
@@ -1203,6 +1738,9 @@ func TestPathHelpersAcrossOSVariants(t *testing.T) {
 	if got := openCodeConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "opencode.json") {
 		t.Fatalf("unexpected windows fallback openCodeConfigPath: %s", got)
 	}
+	if got := openCodeTUIConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "tui.json") {
+		t.Fatalf("unexpected windows fallback openCodeTUIConfigPath: %s", got)
+	}
 	if got := openCodePluginDir(); got != filepath.Join("/home/tester", ".config", "opencode", "plugins") {
 		t.Fatalf("unexpected windows fallback openCodePluginDir: %s", got)
 	}
@@ -1216,6 +1754,9 @@ func TestPathHelpersAcrossOSVariants(t *testing.T) {
 	runtimeGOOS = "plan9"
 	if got := openCodeConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "opencode.json") {
 		t.Fatalf("unexpected default openCodeConfigPath: %s", got)
+	}
+	if got := openCodeTUIConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "tui.json") {
+		t.Fatalf("unexpected default openCodeTUIConfigPath: %s", got)
 	}
 	if got := openCodePluginDir(); got != filepath.Join("/home/tester", ".config", "opencode", "plugins") {
 		t.Fatalf("unexpected default openCodePluginDir: %s", got)
@@ -1749,6 +2290,205 @@ func TestAdditionalHelperBranches(t *testing.T) {
 	})
 }
 
+func TestClaudeCodePermissionTools(t *testing.T) {
+	tools := claudeCodePermissionTools(map[string]bool{
+		"mem_search":          true,
+		"mem_current_project": true,
+		"mem_stats":           false,
+	})
+
+	want := []string{
+		"mcp__engram__mem_current_project",
+		"mcp__engram__mem_search",
+		"mcp__plugin_engram_engram__mem_current_project",
+		"mcp__plugin_engram_engram__mem_search",
+	}
+	if !reflect.DeepEqual(tools, want) {
+		t.Fatalf("unexpected permissions:\nwant %#v\n got %#v", want, tools)
+	}
+
+	for _, tool := range []string{
+		"mcp__engram__mem_current_project",
+		"mcp__engram__mem_judge",
+		"mcp__plugin_engram_engram__mem_current_project",
+		"mcp__plugin_engram_engram__mem_judge",
+	} {
+		if !slices.Contains(claudeCodeMCPTools, tool) {
+			t.Fatalf("claudeCodeMCPTools missing current agent permission %q", tool)
+		}
+	}
+}
+
+func TestClaudeCodeMemorySkillDoesNotHardcodePluginScopedToolSearch(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "skills", "memory", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read memory skill: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "select:mcp__plugin_engram_engram__") {
+		t.Fatalf("memory skill must not hardcode plugin-scoped ToolSearch names")
+	}
+	if !strings.Contains(text, "engram setup claude-code") {
+		t.Fatalf("memory skill fallback should direct users to repair Claude Code setup")
+	}
+}
+
+func TestClaudeCodeUserPromptHookUsesCurrentMCPServerID(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "scripts", "user-prompt-submit.sh"))
+	if err != nil {
+		t.Fatalf("read user prompt hook: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "select:mcp__plugin_engram_engram__") {
+		t.Fatalf("user prompt hook must not hardcode plugin-scoped ToolSearch names")
+	}
+	for _, tool := range []string{
+		"mcp__engram__mem_save",
+		"mcp__engram__mem_search",
+		"mcp__engram__mem_context",
+		"mcp__engram__mem_current_project",
+		"mcp__engram__mem_judge",
+	} {
+		if !strings.Contains(text, tool) {
+			t.Fatalf("user prompt hook missing current ToolSearch name %q", tool)
+		}
+	}
+}
+
+func TestClaudeCodeUserPromptHookDefersProjectDetectionUntilNeeded(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "scripts", "user-prompt-submit.sh"))
+	if err != nil {
+		t.Fatalf("read user prompt hook: %v", err)
+	}
+	text := string(data)
+
+	sessionParse := strings.Index(text, "SESSION_ID=$(echo \"$INPUT\" | jq -r '.session_id // empty')")
+	if sessionParse < 0 {
+		t.Fatalf("user prompt hook missing expected session parsing structure")
+	}
+	sessionKeyBranchRel := strings.Index(text[sessionParse:], "if [ -n \"$SESSION_ID\" ]; then")
+	sessionKeyBranch := -1
+	if sessionKeyBranchRel >= 0 {
+		sessionKeyBranch = sessionParse + sessionKeyBranchRel
+	}
+	if sessionParse < 0 || sessionKeyBranch < 0 {
+		t.Fatalf("user prompt hook missing expected session parsing/keying structure")
+	}
+	if preKey := text[sessionParse:sessionKeyBranch]; strings.Contains(preKey, "detect_project") {
+		t.Fatalf("user prompt hook must not detect project before session_id-first keying")
+	}
+
+	fallbackDetect := "PROJECT=$(detect_project \"$CWD\")\n  SAFE_PROJECT="
+	if !strings.Contains(text, fallbackDetect) {
+		t.Fatalf("user prompt hook should detect project only for the no-session_id fallback key")
+	}
+
+	subsequentMarker := strings.Index(text, "# SUBSEQUENT MESSAGES")
+	if subsequentMarker < 0 {
+		t.Fatalf("user prompt hook missing subsequent-message section")
+	}
+	if !strings.Contains(text[subsequentMarker:], "PROJECT=$(detect_project \"$CWD\")") {
+		t.Fatalf("user prompt hook should detect project for subsequent nudge logic after first-message handling")
+	}
+}
+
+func TestClaudeCodeUserPromptHookHasWindowsGitBashSafePath(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "scripts", "user-prompt-submit.sh"))
+	if err != nil {
+		t.Fatalf("read user prompt hook: %v", err)
+	}
+	text := string(data)
+
+	safePath := strings.Index(text, "if is_windows_bash &&")
+	scriptDir := strings.Index(text, "SCRIPT_DIR=\"$(cd")
+	if safePath < 0 {
+		t.Fatalf("user prompt hook missing Windows Git Bash safe path")
+	}
+	if scriptDir < 0 || scriptDir < safePath {
+		t.Fatalf("Windows Git Bash safe path must run before dirname/pwd helper setup")
+	}
+
+	blockEnd := strings.Index(text[safePath:], "# Load shared helpers after the Windows-safe fast path")
+	if blockEnd < 0 {
+		t.Fatalf("Windows Git Bash safe path missing explicit end marker")
+	}
+	block := text[safePath : safePath+blockEnd]
+	for _, forkHeavy := range []string{"jq", "curl", "git ", "date ", "dirname", "touch", "$("} {
+		if strings.Contains(block, forkHeavy) {
+			t.Fatalf("Windows Git Bash safe path should avoid fork-heavy %q", forkHeavy)
+		}
+	}
+	if !strings.Contains(block, "printf '%s\\n' '{}'") {
+		t.Fatalf("Windows Git Bash subsequent prompts should degrade to a fast empty response")
+	}
+}
+
+func TestClaudeCodeUserPromptHookSanitizesWindowsSafeSessionKey(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "scripts", "user-prompt-submit.sh"))
+	if err != nil {
+		t.Fatalf("read user prompt hook: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"sanitize_session_key_part()",
+		"[[ \"$char\" =~ [a-zA-Z0-9_-] ]]",
+		"SESSION_KEY=\"engram-claude-${JSON_VALUE}-tools-loaded\"",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("user prompt hook missing Windows session key sanitization fragment %q", want)
+		}
+	}
+}
+
+func TestClaudeCodeUserPromptHookIncludesPowerShellFallback(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "scripts", "user-prompt-submit.ps1"))
+	if err != nil {
+		t.Fatalf("read PowerShell user prompt hook: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"[Console]::In.ReadToEnd()",
+		"ConvertFrom-Json",
+		"mcp__engram__mem_context",
+		"Write-EmptyHookResponse",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("PowerShell user prompt hook missing %q", want)
+		}
+	}
+}
+
+func TestClaudeCodeUserPromptSubmitHookTimeout(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "hooks", "hooks.json"))
+	if err != nil {
+		t.Fatalf("read Claude Code hooks config: %v", err)
+	}
+
+	var cfg struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+				Timeout int    `json:"timeout"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("parse Claude Code hooks config: %v", err)
+	}
+
+	entries := cfg.Hooks["UserPromptSubmit"]
+	if len(entries) != 1 || len(entries[0].Hooks) != 1 {
+		t.Fatalf("expected one UserPromptSubmit command hook, got %#v", entries)
+	}
+	hook := entries[0].Hooks[0]
+	if hook.Command != "\"${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-submit.sh\"" {
+		t.Fatalf("unexpected UserPromptSubmit command %q", hook.Command)
+	}
+	if hook.Timeout != 2 {
+		t.Fatalf("UserPromptSubmit timeout = %d, want 2", hook.Timeout)
+	}
+}
+
 func TestAddClaudeCodeAllowlist(t *testing.T) {
 	t.Run("creates file from scratch", func(t *testing.T) {
 		resetSetupSeams(t)
@@ -1883,7 +2623,7 @@ func TestAddClaudeCodeAllowlist(t *testing.T) {
 			t.Fatalf("mkdir: %v", err)
 		}
 
-		// Include 3 of 11 tools
+		// Include 3 tools and verify only the missing permissions are appended.
 		partial := []string{
 			claudeCodeMCPTools[0],
 			claudeCodeMCPTools[3],
@@ -2138,6 +2878,43 @@ func TestOpenCodeConfigPathFallsBackToJSON(t *testing.T) {
 	}
 }
 
+func TestOpenCodeTUIConfigPathPrefersJSONC(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
+	runtimeGOOS = "linux"
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	statFn = func(name string) (os.FileInfo, error) {
+		if strings.HasSuffix(name, "tui.jsonc") {
+			return nil, nil
+		}
+		return nil, os.ErrNotExist
+	}
+
+	got := openCodeTUIConfigPath()
+	expected := filepath.Join(home, ".config", "opencode", "tui.jsonc")
+	if got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestOpenCodeTUIConfigPathFallsBackToJSON(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
+	runtimeGOOS = "linux"
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	statFn = func(name string) (os.FileInfo, error) {
+		return nil, os.ErrNotExist
+	}
+
+	got := openCodeTUIConfigPath()
+	expected := filepath.Join(home, ".config", "opencode", "tui.json")
+	if got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
 func TestOpenCodeConfigPathXDGWithJSONC(t *testing.T) {
 	resetSetupSeams(t)
 	_ = useTestHome(t)
@@ -2230,6 +3007,55 @@ func TestInjectOpenCodeMCPHandlesJSONC(t *testing.T) {
 	}
 	if _, ok := mcp["other"]; !ok {
 		t.Fatalf("expected existing 'other' entry to be preserved")
+	}
+}
+
+func TestInjectOpenCodeTUIPluginHandlesJSONC(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
+	runtimeGOOS = "linux"
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	configDir := filepath.Join(home, ".config", "opencode")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	jsoncPath := filepath.Join(configDir, "tui.jsonc")
+	content := `{
+  // Keep existing plugins
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    "existing-plugin"
+  ]
+}`
+	if err := os.WriteFile(jsoncPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write jsonc: %v", err)
+	}
+
+	statFn = os.Stat
+
+	if err := injectOpenCodeSubagentPlugin(); err != nil {
+		t.Fatalf("injectOpenCodeTUIPlugin with JSONC failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(jsoncPath)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("result should be valid JSON: %v", err)
+	}
+	plugins, ok := cfg["plugin"].([]any)
+	if !ok {
+		t.Fatalf("expected plugin array in result")
+	}
+	if len(plugins) != 2 {
+		t.Fatalf("expected 2 plugins in result, got %v", plugins)
+	}
+	if plugins[0] != "existing-plugin" || plugins[1] != openCodeSubagentStatuslinePlugin {
+		t.Fatalf("unexpected plugins after injection: %v", plugins)
 	}
 }
 

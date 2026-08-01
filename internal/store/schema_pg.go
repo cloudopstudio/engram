@@ -548,6 +548,20 @@ func migratePG(pool *pgxpool.Pool) error {
 					);
 			`,
 		},
+		{
+			version:     13,
+			description: "v1.20.0 parity: observation pinning and per-target sync chunks",
+			sql: `
+				-- Local pin flag used by mem_pin / mem_unpin for context priority.
+				ALTER TABLE observations ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE;
+
+				-- Chunks are tracked per sync target; the legacy table keyed only on
+				-- chunk_id, so backfill existing rows to the local target.
+				ALTER TABLE sync_chunks ADD COLUMN IF NOT EXISTS target_key TEXT NOT NULL DEFAULT 'local';
+				ALTER TABLE sync_chunks DROP CONSTRAINT IF EXISTS sync_chunks_pkey;
+				ALTER TABLE sync_chunks ADD PRIMARY KEY (target_key, chunk_id);
+			`,
+		},
 	}
 
 	for _, m := range migrations {

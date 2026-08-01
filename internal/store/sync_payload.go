@@ -16,33 +16,46 @@ import (
 )
 
 type syncSessionPayload struct {
-	ID        string  `json:"id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
-}
-
-type syncObservationPayload struct {
-	SyncID     string  `json:"sync_id"`
-	SessionID  string  `json:"session_id"`
-	Type       string  `json:"type"`
-	Title      string  `json:"title"`
-	Content    string  `json:"content"`
-	ToolName   *string `json:"tool_name,omitempty"`
-	Project    *string `json:"project,omitempty"`
-	Scope      string  `json:"scope"`
-	TopicKey   *string `json:"topic_key,omitempty"`
+	ID         string  `json:"id"`
+	Project    string  `json:"project"`
+	Directory  string  `json:"directory,omitempty"`
+	StartedAt  string  `json:"started_at,omitempty"`
+	EndedAt    *string `json:"ended_at,omitempty"`
+	Summary    *string `json:"summary,omitempty"`
 	Deleted    bool    `json:"deleted,omitempty"`
 	DeletedAt  *string `json:"deleted_at,omitempty"`
 	HardDelete bool    `json:"hard_delete,omitempty"`
 }
 
+type syncObservationPayload struct {
+	SyncID         string  `json:"sync_id"`
+	SessionID      string  `json:"session_id"`
+	Type           string  `json:"type"`
+	Title          string  `json:"title"`
+	Content        string  `json:"content"`
+	ToolName       *string `json:"tool_name,omitempty"`
+	Project        *string `json:"project,omitempty"`
+	Scope          string  `json:"scope"`
+	TopicKey       *string `json:"topic_key,omitempty"`
+	RevisionCount  int     `json:"revision_count"`
+	DuplicateCount int     `json:"duplicate_count"`
+	LastSeenAt     *string `json:"last_seen_at,omitempty"`
+	CreatedAt      string  `json:"created_at,omitempty"`
+	UpdatedAt      string  `json:"updated_at,omitempty"`
+	Deleted        bool    `json:"deleted,omitempty"`
+	DeletedAt      *string `json:"deleted_at,omitempty"`
+	HardDelete     bool    `json:"hard_delete,omitempty"`
+}
+
 type syncPromptPayload struct {
-	SyncID    string  `json:"sync_id"`
-	SessionID string  `json:"session_id"`
-	Content   string  `json:"content"`
-	Project   *string `json:"project,omitempty"`
+	SyncID     string  `json:"sync_id"`
+	SessionID  string  `json:"session_id"`
+	Content    string  `json:"content"`
+	Project    *string `json:"project,omitempty"`
+	CreatedAt  string  `json:"created_at,omitempty"`
+	Deleted    bool    `json:"deleted,omitempty"`
+	DeletedAt  *string `json:"deleted_at,omitempty"`
+	HardDelete bool    `json:"hard_delete,omitempty"`
 }
 
 // syncRelationPayload is the wire format for a memory_relations row sent over

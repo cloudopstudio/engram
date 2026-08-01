@@ -7,8 +7,8 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -20,6 +20,12 @@ const ENGRAM_PORT = Number.parseInt(process.env.ENGRAM_PORT ?? "7437", 10);
 const CONFIGURED_ENGRAM_URL = process.env.ENGRAM_URL?.trim() || undefined;
 const ENGRAM_URL = CONFIGURED_ENGRAM_URL || `http://127.0.0.1:${ENGRAM_PORT}`;
 const ENGRAM_BIN = process.env.ENGRAM_BIN ?? "engram";
+
+const ENGRAM_FETCH_TIMEOUT_MS = 3000;
+const ENGRAM_FETCH_MAX_ATTEMPTS = 3;
+const ENGRAM_FETCH_BACKOFF_BASE_MS = 250;
+const ENGRAM_SELF_HEAL_INTERVAL_MS = 5000;
+const ENGRAM_SELF_HEAL_MAX_ATTEMPTS = 6;
 
 const ENGRAM_TOOLS = [
   "mem_search",
@@ -38,6 +44,7 @@ const ENGRAM_TOOLS = [
   "mem_current_project",
   "mem_doctor",
   "mem_capture_passive",
+  "mem_review",
   "mem_judge",
   "mem_compare",
 ] as const;
@@ -47,6 +54,7 @@ const ENGRAM_TOOL_NAMES = new Set<string>(ENGRAM_TOOLS);
 const MEMORY_INSTRUCTIONS = `## Engram Persistent Memory — Protocol
 
 You have access to Engram, a persistent memory system that survives across sessions and compactions.
+These instructions are injected by gentle-engram, the Pi-native memory provider. Use the memory tools named in this section as the authoritative Pi memory contract. Do not infer alternative Engram tool names from other integrations unless the user explicitly asks you to use them.
 
 ### WHEN TO SAVE (mandatory — not optional)
 
@@ -78,6 +86,8 @@ call \`mem_search\`, then \`mem_get_observation\` for full content.
 
 Before ending a session or saying "done", call \`mem_session_summary\`
 with Goal, Instructions, Discoveries, Accomplished, Next Steps, and Relevant Files.
+If \`mem_session_summary\` fails because Engram cannot detect a project, ask the user
+which project should receive the summary, then retry with \`project: "<name>"\`.
 
 ### AFTER COMPACTION
 
@@ -116,6 +126,9 @@ interface MigrationBody {
 
 interface CurrentProjectResponse {
   project?: string;
+  project_source?: string;
+  project_path?: string;
+  cwd?: string;
   available_projects?: string[] | null;
   warning?: string;
   error_hint?: string;
@@ -132,6 +145,11 @@ interface SessionContext {
   };
 }
 
+type MemoryToolContext = SessionContext & {
+  hasUI?: boolean;
+  ui?: { setStatus?: (key: string, text: string | undefined) => void };
+};
+
 interface AgentStartEvent {
   systemPrompt: string;
   prompt?: string;
@@ -143,23 +161,71 @@ interface ToolEndEvent {
 }
 
 class EngramHttpError extends Error {
-  constructor(message: string, readonly status: number, readonly data: unknown) {
+  readonly status: number;
+  readonly data: unknown;
+
+  constructor(message: string, status: number, data: unknown) {
     super(message);
     this.name = "EngramHttpError";
+    this.status = status;
+    this.data = data;
   }
 }
 
+// Node rejects an AbortSignal.timeout() fetch with a DOMException named "TimeoutError",
+// which is an instanceof Error; a caller-supplied abort surfaces as "AbortError".
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
+}
+
+// engramFetch resolves to null on failure and ~20 call sites depend on that fallthrough —
+// ensureSession in particular must not abort a mem_save just because session creation blipped.
+// So the timeout detail travels out-of-band instead of changing what any caller receives,
+// letting executeMemoryTool tell the truth about an ambiguous write without blast radius.
+let lastFetchTimeoutMethod: string | undefined;
+
+function takeLastFetchTimeoutMethod(): string | undefined {
+  const method = lastFetchTimeoutMethod;
+  lastFetchTimeoutMethod = undefined;
+  return method;
+}
+
 async function engramFetch<TResponse = unknown>(path: string, opts: FetchOptions = {}): Promise<TResponse | null> {
-  let res: Response;
-  try {
-    res = await fetch(`${ENGRAM_URL}${redactUrlPath(path)}`, {
-      method: opts.method ?? "GET",
-      headers: opts.body ? { "Content-Type": "application/json" } : undefined,
-      body: opts.body ? JSON.stringify(redactValue(opts.body)) : undefined,
-    });
-  } catch {
-    return null;
+  const method = opts.method ?? "GET";
+  // This call's outcome supersedes any earlier one. A tool call can issue several fetches
+  // (mem_save creates the session, then writes the observation); without this reset a timeout
+  // on the first leg would mislabel an unrelated failure on the second as "may already have
+  // been applied", telling the agent not to retry a write that never left the machine.
+  lastFetchTimeoutMethod = undefined;
+  let res: Response | undefined;
+  let timedOut = false;
+  for (let attempt = 0; attempt < ENGRAM_FETCH_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      res = await fetch(`${ENGRAM_URL}${redactUrlPath(path)}`, {
+        method,
+        headers: opts.body ? { "Content-Type": "application/json" } : undefined,
+        body: opts.body ? JSON.stringify(redactValue(opts.body)) : undefined,
+        signal: AbortSignal.timeout(ENGRAM_FETCH_TIMEOUT_MS),
+      });
+      break;
+    } catch (error) {
+      // A timeout means the request may already have reached the server, so re-sending it
+      // could duplicate a non-idempotent write (mem_save and friends carry no idempotency
+      // key). Only pre-send connection failures — the macOS wake-settle case this retry
+      // exists for — are safe to repeat, and a hung server will not recover by retrying.
+      if (isTimeoutError(error)) {
+        timedOut = true;
+        break;
+      }
+      if (attempt < ENGRAM_FETCH_MAX_ATTEMPTS - 1) await wait(ENGRAM_FETCH_BACKOFF_BASE_MS * 2 ** attempt);
+    }
   }
+
+  // A timeout is NOT the same failure as an unreachable server, and reporting both as "could
+  // not reach" invites the caller to retry a write whose outcome is genuinely unknown. Record
+  // which it was so the tool layer can say what we do and do not know.
+  if (timedOut) lastFetchTimeoutMethod = method;
+  if (!res) return null;
 
   let data: unknown = null;
   try {
@@ -186,6 +252,46 @@ async function bestEffortEngramFetch<TResponse = unknown>(path: string, opts: Fe
   }
 }
 
+function detectLocalConfigProject(cwd: string): CurrentProjectResponse | undefined {
+  let current = resolve(cwd || ".");
+  while (true) {
+    const configPath = `${current}/.engram/config.json`;
+    if (existsSync(configPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(configPath, "utf8")) as { project_name?: unknown };
+        const projectName = typeof parsed.project_name === "string" ? parsed.project_name.trim() : "";
+        if (projectName) {
+          return {
+            project: projectName,
+            project_source: "config",
+            project_path: current,
+            cwd,
+            warning: `Engram server at ${ENGRAM_URL} does not support /project/current; using ${configPath}. Upgrade or restart Engram for canonical project detection.`,
+          };
+        }
+        return {
+          cwd,
+          error_hint: `${configPath} exists but project_name is missing or empty. Fix the config or pass project explicitly.`,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { cwd, error_hint: `Could not read ${configPath}: ${message}` };
+      }
+    }
+
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+function projectCurrentUnsupportedError(cwd: string): CurrentProjectResponse {
+  return {
+    cwd,
+    error_hint: `Engram server at ${ENGRAM_URL} does not support /project/current. Upgrade or restart the running Engram server, verify ENGRAM_URL/ENGRAM_BIN, or pass project explicitly to project-capable memory tools.`,
+  };
+}
+
 async function ensureSessionBestEffort(sessionId: string, sessionProject = project): Promise<void> {
   try {
     await ensureSession(sessionId, sessionProject);
@@ -203,6 +309,48 @@ async function isEngramRunning(): Promise<boolean> {
   }
 }
 
+function waitUnref(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
+let engramSelfHealInFlight = false;
+// Keyed by session so a session that fails repeatedly is tracked once, and so a session that
+// shuts down mid-outage can be dropped instead of having its torn-down UI touched later.
+const engramSelfHealContexts = new Map<string | MemoryToolContext, MemoryToolContext>();
+
+// Pruning is by session id. A context with no resolvable session id is keyed by the ctx
+// object itself and cannot be pruned here, but it self-expires: the probe clears the whole
+// map within one cycle, and setStatus is optional-chained, so a torn-down UI is never a crash.
+function forgetSelfHealContext(sessionId: string): void {
+  engramSelfHealContexts.delete(sessionId);
+}
+
+function scheduleEngramSelfHeal(ctx: MemoryToolContext): void {
+  // Track every session that observed the outage: this module is shared by all sessions in
+  // the Pi process, so a single probe must clear the stale label on all of them, not just
+  // whichever session happened to fail first.
+  engramSelfHealContexts.set(getSessionId(ctx) ?? ctx, ctx);
+  if (engramSelfHealInFlight) return;
+  engramSelfHealInFlight = true;
+  void (async () => {
+    try {
+      for (let attempt = 0; attempt < ENGRAM_SELF_HEAL_MAX_ATTEMPTS; attempt += 1) {
+        await waitUnref(ENGRAM_SELF_HEAL_INTERVAL_MS);
+        if (await isEngramRunning()) {
+          for (const pending of engramSelfHealContexts.values()) pending.ui?.setStatus?.("engram", undefined);
+          return;
+        }
+      }
+    } finally {
+      engramSelfHealContexts.clear();
+      engramSelfHealInFlight = false;
+    }
+  })();
+}
+
 function rawBasenameProjectName(directory: string): string {
   const resolved = resolve(directory || ".");
   return basename(resolved).trim() || "unknown";
@@ -214,6 +362,11 @@ function fallbackProjectName(directory: string): string {
 
 function truncate(str: string, max: number): string {
   return str.length > max ? `${str.slice(0, max)}...` : str;
+}
+
+function errorStatusLabel(message: string): string {
+  if (/ambiguous project/i.test(message)) return "ambiguous project";
+  return "error";
 }
 
 function stripPrivateTags(str: string): string {
@@ -273,8 +426,14 @@ async function ensureSession(sessionId: string, sessionProject = project): Promi
 
 async function detectServerProject(cwd: string): Promise<CurrentProjectResponse | undefined> {
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    const detected = await bestEffortEngramFetch<CurrentProjectResponse>(`/project/current${queryString({ cwd })}`);
-    if (detected) return detected;
+    try {
+      const detected = await engramFetch<CurrentProjectResponse>(`/project/current${queryString({ cwd })}`);
+      if (detected) return detected;
+    } catch (error) {
+      if (error instanceof EngramHttpError && error.status === 404) {
+        return detectLocalConfigProject(cwd) || projectCurrentUnsupportedError(cwd);
+      }
+    }
     if (attempt < 4) await wait(200);
   }
   return undefined;
@@ -358,6 +517,8 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
     project: optionalString("Filter by project name"),
     scope: optionalString("Filter by scope: project or personal"),
     limit: optionalNumber("Max results"),
+    all_projects: optionalBoolean("Search across every project; when true project is ignored"),
+    match_mode: optionalString("Match mode: all (default) or any for broader recall"),
   }),
   mem_save: Type.Object({
     title: Type.String({ description: "Short, searchable title" }),
@@ -394,6 +555,7 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
   mem_session_summary: Type.Object({
     content: Type.String({ description: "Full session summary" }),
     session_id: optionalString("Session ID"),
+    project: optionalString("Optional project to use when automatic detection is unavailable"),
   }),
   mem_context: Type.Object({
     project: optionalString("Filter by project"),
@@ -430,6 +592,13 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
     content: Type.String({ description: "Text output containing a ## Key Learnings section" }),
     session_id: optionalString("Session ID to associate with"),
     source: optionalString("Source identifier, e.g. subagent-stop or session-end"),
+  }),
+  mem_review: Type.Object({
+    action: Type.String({ description: "Action: list | mark_reviewed" }),
+    project: optionalString("Optional project filter for action=list"),
+    limit: optionalNumber("Max results for action=list"),
+    observation_id: optionalNumber("Observation id for action=mark_reviewed"),
+    id: optionalNumber("Alias for observation_id"),
   }),
   mem_judge: Type.Object({
     judgment_id: Type.String({ description: "The relation judgment_id returned by mem_save candidates" }),
@@ -486,7 +655,15 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
 
   switch (toolName) {
     case "mem_search":
-      return engramFetch(`/search${queryString({ q: params.query, type: params.type, project: params.project, scope: params.scope, limit: params.limit })}`);
+      return engramFetch(`/search${queryString({
+        q: params.query,
+        type: params.type,
+        project: params.all_projects ? undefined : params.project,
+        scope: params.scope,
+        limit: params.limit,
+        match_mode: params.match_mode,
+        all_projects: params.all_projects,
+      })}`);
     case "mem_context":
       if (!params.project) requireResolvedProject();
       return engramFetch(`/context${queryString({ project: params.project || project, scope: params.scope })}`);
@@ -534,8 +711,8 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
         body: { session_id: activeSessionId, content: params.content, project: activeProject },
       });
     case "mem_session_summary":
-      requireResolvedProject();
-      await ensureSession(activeSessionId);
+      if (!requestedProject) requireResolvedProject();
+      await ensureSession(activeSessionId, activeProject);
       return engramFetch("/observations", {
         method: "POST",
         body: {
@@ -543,7 +720,7 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
           type: "session_summary",
           title: "Session summary",
           content: params.content,
-          project,
+          project: activeProject,
           scope: "project",
         },
       });
@@ -558,8 +735,17 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
         method: "POST",
         body: { summary: params.summary || "" },
       });
-    case "mem_current_project":
-      return engramFetch(`/project/current${queryString({ cwd: params.cwd || ctx.cwd })}`);
+    case "mem_current_project": {
+      const cwd = String(params.cwd || ctx.cwd);
+      try {
+        return await engramFetch(`/project/current${queryString({ cwd })}`);
+      } catch (error) {
+        if (error instanceof EngramHttpError && error.status === 404) {
+          return detectLocalConfigProject(cwd) || projectCurrentUnsupportedError(cwd);
+        }
+        throw error;
+      }
+    }
     case "mem_doctor":
       return engramFetch(`/doctor${queryString({ project: params.project, check: params.check, cwd: params.project ? undefined : ctx.cwd })}`);
     case "mem_capture_passive":
@@ -574,6 +760,19 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
           source: params.source || "pi-tool",
         },
       });
+    case "mem_review": {
+      const action = String(params.action || "").trim();
+      if (action === "list") {
+        return engramFetch(`/review${queryString({ project: params.project, limit: params.limit })}`);
+      }
+      if (action === "mark_reviewed") {
+        return engramFetch("/review/mark_reviewed", {
+          method: "POST",
+          body: { observation_id: params.observation_id || params.id },
+        });
+      }
+      throw new Error("action must be one of: list, mark_reviewed");
+    }
     case "mem_judge":
       return engramFetch("/conflicts/judge", {
         method: "POST",
@@ -603,7 +802,17 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
   }
 }
 
-async function executeMemoryTool(toolName: string, params: Record<string, unknown>, ctx: SessionContext & { hasUI?: boolean; ui?: { setStatus?: (key: string, text: string | undefined) => void } }) {
+function unreachableMessage(timedOutMethod: string | undefined): string {
+  if (timedOutMethod && timedOutMethod !== "GET") {
+    return `gentle-engram timed out after ${ENGRAM_FETCH_TIMEOUT_MS}ms waiting for the Engram HTTP server at ${ENGRAM_URL}. The ${timedOutMethod} request may already have been applied — do NOT blindly retry it, or you may duplicate the write. Verify with mem_search or mem_doctor first.`;
+  }
+  if (timedOutMethod) {
+    return `gentle-engram timed out after ${ENGRAM_FETCH_TIMEOUT_MS}ms waiting for the Engram HTTP server at ${ENGRAM_URL}. The server accepted the connection but did not respond. Run mem_doctor or restart Engram.`;
+  }
+  return `gentle-engram could not reach the Engram HTTP server at ${ENGRAM_URL}. The Pi-native mem_* tools are registered, but the native memory provider is not currently responding. Run mem_doctor or restart Engram.`;
+}
+
+async function executeMemoryTool(toolName: string, params: Record<string, unknown>, ctx: MemoryToolContext) {
   await initOnce(ctx.cwd);
   await refreshProjectDetection(ctx.cwd);
   const action = humanToolName(toolName);
@@ -611,7 +820,9 @@ async function executeMemoryTool(toolName: string, params: Record<string, unknow
 
   try {
     const data = await callMemoryTool(toolName, params, ctx);
-    if (data === null) throw new Error("Engram is unavailable");
+    if (data === null) {
+      throw new Error(unreachableMessage(takeLastFetchTimeoutMethod()));
+    }
     const result = { content: [{ type: "text" as const, text: textResult(data) }], details: { data } };
     if (toolName === "mem_doctor" && data && typeof data === "object" && "status" in data && data.status === "error") {
       const errorResult = { ...result, isError: true };
@@ -625,7 +836,8 @@ async function executeMemoryTool(toolName: string, params: Record<string, unknow
     const details = error instanceof EngramHttpError
       ? { error: message, http_status: error.status, data: error.data }
       : { error: message };
-    ctx.ui?.setStatus?.("engram", `🧠 ${project} · error`);
+    ctx.ui?.setStatus?.("engram", `🧠 ${project} · ${errorStatusLabel(message)}`);
+    if (!(error instanceof EngramHttpError)) scheduleEngramSelfHeal(ctx);
     return { content: [{ type: "text" as const, text: message }], details, isError: true };
   }
 }
@@ -640,7 +852,7 @@ function registerMemoryTools(pi: ExtensionAPI): void {
       parameters: MEMORY_TOOL_SCHEMAS[toolName],
       renderShell: "self",
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        return executeMemoryTool(toolName, params as Record<string, unknown>, ctx as SessionContext & { hasUI?: boolean; ui?: { setStatus?: (key: string, text: string | undefined) => void } });
+        return executeMemoryTool(toolName, params as Record<string, unknown>, ctx as MemoryToolContext);
       },
       renderCall(args) {
         return new Text(renderCallText(toolName, args), 0, 0);
@@ -663,6 +875,7 @@ export default function registerEngram(pi: ExtensionAPI) {
     if (!sessionId) return;
     toolCounts.delete(sessionId);
     forgetKnownSession(sessionId);
+    forgetSelfHealContext(sessionId);
   });
 
   pi.on("session_compact", async (event: unknown, ctx: SessionContext) => {

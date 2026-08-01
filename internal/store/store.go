@@ -17,8 +17,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/timeutil"
 	sqlite "modernc.org/sqlite"
 )
+
+func scanObservationRowSQLite(scanner observationScanner, o *Observation) error {
+	return scanner.Scan(
+		&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content,
+		&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.ReviewAfter,
+		&o.Pinned, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
+	)
+}
 
 var openDB = sql.Open
 
@@ -27,11 +36,82 @@ var openDB = sql.Open
 // See https://www.sqlite.org/rescode.html#constraint_foreignkey
 const sqliteConstraintForeignKey = 787
 
+const (
+	sqlitePrimaryBusy   = 5
+	sqlitePrimaryLocked = 6
+)
+
+var sqliteWriteRetryBackoffs = []time.Duration{
+	10 * time.Millisecond,
+	25 * time.Millisecond,
+	50 * time.Millisecond,
+}
+
+// Sentinel errors returned by delete operations so callers can use errors.Is.
+var (
+	ErrSessionDeleteBlocked = errors.New("session deletion is blocked while cloud sync enrollment is active")
+	ErrObservationNotFound  = errors.New("observation not found")
+
+	ErrProjectNotFound = errors.New("project not found")
+)
+
+// Sentinel errors for relation sync apply path (Phase 2).
+
+// ErrRelationFKMissing is returned by applyRelationUpsertTx when one or
+// both observations referenced by the relation payload do not exist locally
+// yet. The caller must write the mutation to sync_apply_deferred and ACK
+// the sequence so the cursor does not stall.
+
+// ErrCrossProjectRelation is returned by JudgeRelation when the source and
+// target observations belong to different projects. The write is rejected
+// entirely; no memory_relations row is created and no sync mutation is
+// enqueued.
+
+// ErrApplyDead is returned when a deferred relation payload cannot be
+// decoded or fails a hard validation. The row is written to
+// sync_apply_deferred with apply_status='dead' and is never retried
+// automatically; Phase 3 adds a republish CLI.
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+const (
+	ObservationStateActive      = "active"
+	ObservationStateNeedsReview = "needs_review"
+)
+
+// State returns the virtual lifecycle state derived from review_after.
+func (o Observation) State() string {
+	if o.ReviewAfter == nil || strings.TrimSpace(*o.ReviewAfter) == "" {
+		return ObservationStateActive
+	}
+	reviewAfter, err := parseObservationTime(*o.ReviewAfter)
+	if err != nil {
+		return ObservationStateActive
+	}
+	if !reviewAfter.After(time.Now().UTC()) {
+		return ObservationStateNeedsReview
+	}
+	return ObservationStateActive
+}
+
+// true for the anchor observation
+
+// The anchor observation
+// Observations before the focus (chronological)
+// Observations after the focus (chronological)
+// Session that contains the focus observation
+
+// "all" (default) | "any"
+
 // ─── Decay constants ─────────────────────────────────────────────────────────
 //
 // Decay defaults — months added to now() to compute review_after on new inserts.
 // expires_at is NULL for all types in Phase 1.
 const (
+	LocalChunkTargetKey = "local"
+
+	// Decay defaults — months added to now() to compute review_after on new inserts.
+	// expires_at is NULL for all types in Phase 1.
 	decayDecisionMonths   = 6
 	decayPolicyMonths     = 12
 	decayPreferenceMonths = 3
@@ -44,6 +124,86 @@ var decayReviewAfterMonths = map[string]int{
 	"policy":     decayPolicyMonths,
 	"preference": decayPreferenceMonths,
 }
+
+const observationSelectColumns = `id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
+	       scope, topic_key, revision_count, duplicate_count, last_seen_at, review_after, pinned, created_at, updated_at, deleted_at`
+
+const (
+	UpgradeStagePlanned           = "planned"
+	UpgradeStageDoctorReady       = "doctor_ready"
+	UpgradeStageDoctorBlocked     = "doctor_blocked"
+	UpgradeStageRepairApplied     = "repair_applied"
+	UpgradeStageBootstrapEnrolled = "bootstrap_enrolled"
+	UpgradeStageBootstrapPushed   = "bootstrap_pushed"
+	UpgradeStageBootstrapVerified = "bootstrap_verified"
+	UpgradeStageRolledBack        = "rolled_back"
+
+	UpgradeRepairClassNone       = "none"
+	UpgradeRepairClassReady      = "ready"
+	UpgradeRepairClassRepairable = "repairable"
+	UpgradeRepairClassBlocked    = "blocked"
+	UpgradeRepairClassPolicy     = "policy"
+)
+
+type CloudUpgradeSnapshot struct {
+	CloudConfigPresent bool   `json:"cloud_config_present"`
+	CloudConfigJSON    string `json:"cloud_config_json,omitempty"`
+	ProjectEnrolled    bool   `json:"project_enrolled"`
+}
+
+type CloudUpgradeState struct {
+	Project          string               `json:"project"`
+	Stage            string               `json:"stage"`
+	RepairClass      string               `json:"repair_class"`
+	Snapshot         CloudUpgradeSnapshot `json:"snapshot"`
+	LastErrorCode    string               `json:"last_error_code,omitempty"`
+	LastErrorMessage string               `json:"last_error_message,omitempty"`
+	FindingsJSON     string               `json:"findings_json,omitempty"`
+	AppliedActions   string               `json:"applied_actions,omitempty"`
+	UpdatedAt        string               `json:"updated_at"`
+}
+
+type CloudUpgradeRepairReport struct {
+	Class         string `json:"class"`
+	ReasonCode    string `json:"reason_code"`
+	Message       string `json:"message"`
+	PlannedAction string `json:"planned_action,omitempty"`
+	Applied       bool   `json:"applied"`
+}
+
+type CloudUpgradeLegacyMutationFinding struct {
+	Seq        int64  `json:"seq"`
+	Entity     string `json:"entity"`
+	Op         string `json:"op"`
+	ReasonCode string `json:"reason_code"`
+	Message    string `json:"message"`
+	Repairable bool   `json:"repairable"`
+	RepairHint string `json:"repair_hint,omitempty"`
+	EntityKey  string `json:"entity_key,omitempty"`
+	TargetKey  string `json:"target_key,omitempty"`
+	Project    string `json:"project,omitempty"`
+}
+
+type CloudUpgradeLegacyMutationReport struct {
+	Project         string                              `json:"project"`
+	RepairableCount int                                 `json:"repairable_count"`
+	BlockedCount    int                                 `json:"blocked_count"`
+	Findings        []CloudUpgradeLegacyMutationFinding `json:"findings,omitempty"`
+}
+
+// EnrolledProject represents a project enrolled for cloud sync.
+
+// syncRelationPayload is the wire format for a memory_relations row sent over
+// the sync_mutations / cloud_mutations rails (entity = 'relation', op = 'upsert').
+//
+// Phase 2 design §1: 13-field subset of the 17-column memory_relations row.
+// Excluded: id (local autoincrement, not portable), superseded_at,
+// superseded_by_relation_id (Phase 3 supersede chain).
+// omitempty matches the style of syncSessionPayload / syncObservationPayload.
+
+// ExportData is the full serializable dump of the engram database.
+
+// ─── Config ──────────────────────────────────────────────────────────────────
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 //
@@ -112,6 +272,13 @@ func (r sqlRowScanner) Close() error {
 	return r.rows.Close()
 }
 
+func closeRowsWithError(rows rowScanner, err error) error {
+	if closeErr := rows.Close(); closeErr != nil {
+		return errors.Join(err, closeErr)
+	}
+	return err
+}
+
 type storeHooks struct {
 	exec    func(db execer, query string, args ...any) (sql.Result, error)
 	query   func(db queryer, query string, args ...any) (*sql.Rows, error)
@@ -143,6 +310,11 @@ func defaultStoreHooks() storeHooks {
 		},
 	}
 }
+
+// DB returns the underlying *sql.DB. Intended for test helpers and integration
+// tests that need to inject raw rows (e.g. legacy data with non-normalized
+// project names) without going through the Store's public API.
+func (s *SQLiteStore) DB() *sql.DB { return s.db }
 
 func (s *SQLiteStore) execHook(db execer, query string, args ...any) (sql.Result, error) {
 	if s.hooks.exec != nil {
@@ -198,6 +370,7 @@ func NewSQLiteStore(cfg Config) (Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("engram: open database: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 
 	// SQLite performance pragmas
 	pragmas := []string{
@@ -220,6 +393,42 @@ func NewSQLiteStore(cfg Config) (Store, error) {
 		return nil, fmt.Errorf("engram: repair enrolled sync journal: %w", err)
 	}
 
+	return s, nil
+}
+
+// newWithoutRepair is the same as New but skips repairEnrolledProjectSyncMutations.
+// It exists solely to support tests that need to seed data and call repair manually.
+func newWithoutRepair(cfg Config) (*SQLiteStore, error) {
+	if !filepath.IsAbs(cfg.DataDir) {
+		return nil, fmt.Errorf("engram: data directory must be an absolute path, got %q — set ENGRAM_DATA_DIR or ensure your home directory is resolvable", cfg.DataDir)
+	}
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		return nil, fmt.Errorf("engram: create data dir: %w", err)
+	}
+
+	dbPath := filepath.Join(cfg.DataDir, "engram.db")
+	db, err := openDB("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("engram: open database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+
+	pragmas := []string{
+		"PRAGMA journal_mode = WAL",
+		"PRAGMA busy_timeout = 5000",
+		"PRAGMA synchronous = NORMAL",
+		"PRAGMA foreign_keys = ON",
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			return nil, fmt.Errorf("engram: pragma %q: %w", p, err)
+		}
+	}
+
+	s := &SQLiteStore{db: db, cfg: cfg, hooks: defaultStoreHooks()}
+	if err := s.migrate(); err != nil {
+		return nil, fmt.Errorf("engram: migration: %w", err)
+	}
 	return s, nil
 }
 
@@ -294,6 +503,7 @@ func (s *SQLiteStore) migrate() error {
 			revision_count INTEGER NOT NULL DEFAULT 1,
 			duplicate_count INTEGER NOT NULL DEFAULT 1,
 			last_seen_at TEXT,
+			pinned     BOOLEAN NOT NULL DEFAULT 0,
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,
@@ -327,6 +537,13 @@ func (s *SQLiteStore) migrate() error {
 			FOREIGN KEY (session_id) REFERENCES sessions(id)
 		);
 
+			CREATE TABLE IF NOT EXISTS prompt_tombstones (
+				sync_id    TEXT PRIMARY KEY,
+				session_id TEXT,
+				project    TEXT,
+				deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+
 		CREATE INDEX IF NOT EXISTS idx_prompts_session ON user_prompts(session_id);
 		CREATE INDEX IF NOT EXISTS idx_prompts_project ON user_prompts(project);
 		CREATE INDEX IF NOT EXISTS idx_prompts_created ON user_prompts(created_at DESC);
@@ -339,8 +556,10 @@ func (s *SQLiteStore) migrate() error {
 		);
 
 			CREATE TABLE IF NOT EXISTS sync_chunks (
-				chunk_id    TEXT PRIMARY KEY,
-				imported_at TEXT NOT NULL DEFAULT (datetime('now'))
+				target_key  TEXT NOT NULL DEFAULT 'local',
+				chunk_id    TEXT NOT NULL,
+				imported_at TEXT NOT NULL DEFAULT (datetime('now')),
+				PRIMARY KEY (target_key, chunk_id)
 			);
 
 			CREATE TABLE IF NOT EXISTS sync_state (
@@ -369,6 +588,18 @@ func (s *SQLiteStore) migrate() error {
 				acked_at    TEXT,
 				FOREIGN KEY (target_key) REFERENCES sync_state(target_key)
 			);
+
+			CREATE TABLE IF NOT EXISTS cloud_upgrade_state (
+				project            TEXT PRIMARY KEY,
+				stage              TEXT NOT NULL DEFAULT 'planned',
+				repair_class       TEXT NOT NULL DEFAULT 'none',
+				snapshot_json      TEXT NOT NULL DEFAULT '{}',
+				last_error_code    TEXT,
+				last_error_message TEXT,
+				findings_json      TEXT,
+				applied_actions    TEXT,
+				updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+			);
 		`
 	if _, err := s.execHook(s.db, schema); err != nil {
 		return err
@@ -385,6 +616,7 @@ func (s *SQLiteStore) migrate() error {
 		{name: "revision_count", definition: "INTEGER NOT NULL DEFAULT 1"},
 		{name: "duplicate_count", definition: "INTEGER NOT NULL DEFAULT 1"},
 		{name: "last_seen_at", definition: "TEXT"},
+		{name: "pinned", definition: "BOOLEAN NOT NULL DEFAULT 0"},
 		{name: "updated_at", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "deleted_at", definition: "TEXT"},
 		{name: "created_by", definition: "TEXT"},
@@ -410,6 +642,7 @@ func (s *SQLiteStore) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_obs_deleted ON observations(deleted_at);
 		CREATE INDEX IF NOT EXISTS idx_obs_dedupe ON observations(normalized_hash, project, scope, type, title, created_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_prompts_sync_id ON user_prompts(sync_id);
+		CREATE INDEX IF NOT EXISTS idx_prompt_tombstones_project ON prompt_tombstones(project, deleted_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_sync_mutations_target_seq ON sync_mutations(target_key, seq);
 		CREATE INDEX IF NOT EXISTS idx_sync_mutations_pending ON sync_mutations(target_key, acked_at, seq);
 	`); err != nil {
@@ -420,6 +653,75 @@ func (s *SQLiteStore) migrate() error {
 	if err := s.addColumnIfNotExists("sync_mutations", "project", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := s.addColumnIfNotExists("sync_state", "reason_code", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfNotExists("sync_state", "reason_message", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.migrateSyncChunksTable(); err != nil {
+		return err
+	}
+
+	// ── Phase: memory-conflict-surfacing — B.1 ──────────────────────────────
+	// Additive nullable columns on observations for conflict surfacing, decay,
+	// and embedding reservation.  All applied via addColumnIfNotExists so that
+	// running migrate() on a fresh DB (where CREATE TABLE already added these
+	// columns) is a no-op.
+	memConflictObsCols := []struct {
+		name       string
+		definition string
+	}{
+		{name: "review_after", definition: "TEXT"},
+		{name: "expires_at", definition: "TEXT"},
+		{name: "embedding", definition: "BLOB"},
+		{name: "embedding_model", definition: "TEXT"},
+		{name: "embedding_created_at", definition: "TEXT"},
+	}
+	for _, c := range memConflictObsCols {
+		if err := s.addColumnIfNotExists("observations", c.name, c.definition); err != nil {
+			return err
+		}
+	}
+
+	// ── Phase: memory-conflict-surfacing — B.2 ──────────────────────────────
+	// Create the memory_relations table (idempotent via IF NOT EXISTS).
+	// source_id / target_id are TEXT sync_id keys (cross-machine portable).
+	// NO UNIQUE on (source_id, target_id) — multi-actor disagreement allowed.
+	if _, err := s.execHook(s.db, `
+		CREATE TABLE IF NOT EXISTS memory_relations (
+			id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+			sync_id                   TEXT    NOT NULL UNIQUE,
+			source_id                 TEXT,
+			target_id                 TEXT,
+			relation                  TEXT    NOT NULL DEFAULT 'pending',
+			reason                    TEXT,
+			evidence                  TEXT,
+			confidence                REAL,
+			judgment_status           TEXT    NOT NULL DEFAULT 'pending',
+			marked_by_actor           TEXT,
+			marked_by_kind            TEXT,
+			marked_by_model           TEXT,
+			session_id                TEXT,
+			superseded_at             TEXT,
+			superseded_by_relation_id INTEGER REFERENCES memory_relations(id) ON DELETE SET NULL,
+			created_at                TEXT    NOT NULL DEFAULT (datetime('now')),
+			updated_at                TEXT    NOT NULL DEFAULT (datetime('now'))
+		);
+	`); err != nil {
+		return err
+	}
+
+	// ── Phase: memory-conflict-surfacing — B.3 ──────────────────────────────
+	// Indexes for memory_relations (all idempotent via IF NOT EXISTS).
+	if _, err := s.execHook(s.db, `
+		CREATE INDEX IF NOT EXISTS idx_memrel_source    ON memory_relations(source_id, judgment_status);
+		CREATE INDEX IF NOT EXISTS idx_memrel_target    ON memory_relations(target_id, judgment_status);
+		CREATE INDEX IF NOT EXISTS idx_memrel_supersede ON memory_relations(superseded_by_relation_id);
+	`); err != nil {
+		return err
+	}
+
 	if _, err := s.execHook(s.db, `
 		CREATE TABLE IF NOT EXISTS sync_enrolled_projects (
 			project     TEXT PRIMARY KEY,
@@ -452,6 +754,19 @@ func (s *SQLiteStore) migrate() error {
 	`); err != nil {
 		return err
 	}
+	if _, err := s.execHook(s.db, `
+		UPDATE sync_mutations
+		SET project = COALESCE((
+			SELECT sessions.project
+			FROM sessions
+			WHERE sessions.id = json_extract(sync_mutations.payload, '$.session_id')
+		), '')
+		WHERE project = ''
+		  AND payload != ''
+		  AND ifnull(json_extract(payload, '$.session_id'), '') != ''
+	`); err != nil {
+		return err
+	}
 
 	if _, err := s.execHook(s.db, `UPDATE observations SET scope = 'project' WHERE scope IS NULL OR scope = ''`); err != nil {
 		return err
@@ -475,10 +790,19 @@ func (s *SQLiteStore) migrate() error {
 	if _, err := s.execHook(s.db, `UPDATE user_prompts SET project = '' WHERE project IS NULL`); err != nil {
 		return err
 	}
+	if _, err := s.execHook(s.db, `UPDATE prompt_tombstones SET project = '' WHERE project IS NULL`); err != nil {
+		return err
+	}
 	if _, err := s.execHook(s.db, `UPDATE user_prompts SET sync_id = 'prompt-' || lower(hex(randomblob(16))) WHERE sync_id IS NULL OR sync_id = ''`); err != nil {
 		return err
 	}
 	if _, err := s.execHook(s.db, `INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES ('cloud', 'idle', datetime('now'))`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(s.db, `
+		CREATE INDEX IF NOT EXISTS idx_cloud_upgrade_state_stage ON cloud_upgrade_state(stage);
+		CREATE INDEX IF NOT EXISTS idx_sync_mutations_lookup ON sync_mutations(target_key, entity, entity_key, source);
+	`); err != nil {
 		return err
 	}
 
@@ -624,6 +948,32 @@ func (s *SQLiteStore) migrate() error {
 		}
 	}
 
+	// Phase 3: add republish CLI, surface dead rows via mem_status.
+	if _, err := s.execHook(s.db, `
+		CREATE TABLE IF NOT EXISTS sync_apply_deferred (
+			sync_id           TEXT    PRIMARY KEY,
+			entity            TEXT    NOT NULL,
+			payload           TEXT    NOT NULL,
+			apply_status      TEXT    NOT NULL DEFAULT 'deferred',
+			retry_count       INTEGER NOT NULL DEFAULT 0,
+			last_error        TEXT,
+			last_attempted_at TEXT,
+			first_seen_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_sad_status_seen
+			ON sync_apply_deferred(apply_status, first_seen_at);
+	`); err != nil {
+		return err
+	}
+
+	// Phase 3b: composite index for conflict-audit list/count queries.
+	if _, err := s.execHook(s.db, `
+		CREATE INDEX IF NOT EXISTS idx_memrel_status_created
+			ON memory_relations(judgment_status, created_at DESC);
+	`); err != nil {
+		return err
+	}
+
 	// Autosync Phase: add reason_code and reason_message columns to sync_state.
 	// These are used by MarkSyncBlocked and ApplyPulledMutation to surface
 	// deterministic block reasons (auth_required, non_enrolled_pending_mutations, etc.).
@@ -637,6 +987,866 @@ func (s *SQLiteStore) migrate() error {
 	}
 
 	return nil
+}
+
+func (s *SQLiteStore) SaveCloudUpgradeState(state CloudUpgradeState) error {
+	project, _ := NormalizeProject(state.Project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return fmt.Errorf("cloud upgrade project must not be empty")
+	}
+	state.Project = project
+	state.Stage = normalizeUpgradeStage(state.Stage)
+	state.RepairClass = normalizeUpgradeRepairClass(state.RepairClass)
+
+	snapshotJSON, err := json.Marshal(state.Snapshot)
+	if err != nil {
+		return fmt.Errorf("marshal cloud upgrade snapshot: %w", err)
+	}
+
+	_, err = s.execHook(s.db, `
+		INSERT INTO cloud_upgrade_state (
+			project, stage, repair_class, snapshot_json, last_error_code, last_error_message, findings_json, applied_actions, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+		ON CONFLICT(project) DO UPDATE SET
+			stage = excluded.stage,
+			repair_class = excluded.repair_class,
+			snapshot_json = excluded.snapshot_json,
+			last_error_code = excluded.last_error_code,
+			last_error_message = excluded.last_error_message,
+			findings_json = excluded.findings_json,
+			applied_actions = excluded.applied_actions,
+			updated_at = datetime('now')
+	`, state.Project, state.Stage, state.RepairClass, string(snapshotJSON), nullableString(state.LastErrorCode), nullableString(state.LastErrorMessage), nullableString(state.FindingsJSON), nullableString(state.AppliedActions))
+	return err
+}
+
+func (s *SQLiteStore) GetCloudUpgradeState(project string) (*CloudUpgradeState, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil, nil
+	}
+
+	row := s.db.QueryRow(`
+		SELECT project, stage, repair_class, snapshot_json, ifnull(last_error_code, ''), ifnull(last_error_message, ''), ifnull(findings_json, ''), ifnull(applied_actions, ''), updated_at
+		FROM cloud_upgrade_state
+		WHERE project = ?
+	`, project)
+
+	var state CloudUpgradeState
+	var snapshotJSON string
+	if err := row.Scan(&state.Project, &state.Stage, &state.RepairClass, &snapshotJSON, &state.LastErrorCode, &state.LastErrorMessage, &state.FindingsJSON, &state.AppliedActions, &state.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if strings.TrimSpace(snapshotJSON) != "" {
+		if err := json.Unmarshal([]byte(snapshotJSON), &state.Snapshot); err != nil {
+			return nil, fmt.Errorf("parse cloud upgrade snapshot: %w", err)
+		}
+	}
+	state.Stage = normalizeUpgradeStage(state.Stage)
+	state.RepairClass = normalizeUpgradeRepairClass(state.RepairClass)
+	return &state, nil
+}
+
+func (s *SQLiteStore) ClearCloudUpgradeState(project string) error {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil
+	}
+	_, err := s.execHook(s.db, `DELETE FROM cloud_upgrade_state WHERE project = ?`, project)
+	return err
+}
+
+func (s *SQLiteStore) CanRollbackCloudUpgrade(project string) (bool, error) {
+	state, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		return false, err
+	}
+	if state == nil {
+		return false, nil
+	}
+	return state.Stage != UpgradeStageBootstrapVerified, nil
+}
+
+func (s *SQLiteStore) RollbackCloudUpgrade(project string) (CloudUpgradeState, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return CloudUpgradeState{}, fmt.Errorf("cloud upgrade rollback requires project")
+	}
+
+	state, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		return CloudUpgradeState{}, fmt.Errorf("read cloud upgrade rollback state: %w", err)
+	}
+	if state == nil {
+		return CloudUpgradeState{}, fmt.Errorf("rollback requires existing upgrade checkpoint state")
+	}
+	if state.Stage == UpgradeStageBootstrapVerified {
+		return CloudUpgradeState{}, fmt.Errorf("rollback is unavailable post-bootstrap; use explicit disconnect/unenroll flows")
+	}
+
+	if state.Snapshot.ProjectEnrolled {
+		if err := s.EnrollProject(project); err != nil {
+			return CloudUpgradeState{}, fmt.Errorf("restore project enrollment from rollback snapshot: %w", err)
+		}
+	} else {
+		if err := s.UnenrollProject(project); err != nil {
+			return CloudUpgradeState{}, fmt.Errorf("restore project unenrollment from rollback snapshot: %w", err)
+		}
+	}
+
+	state.Stage = UpgradeStageRolledBack
+	state.LastErrorCode = ""
+	state.LastErrorMessage = ""
+	state.FindingsJSON = ""
+	state.AppliedActions = ""
+	if err := s.SaveCloudUpgradeState(*state); err != nil {
+		return CloudUpgradeState{}, fmt.Errorf("persist rolled back upgrade state: %w", err)
+	}
+
+	rolledBack, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		return CloudUpgradeState{}, fmt.Errorf("load rolled back cloud upgrade state: %w", err)
+	}
+	if rolledBack == nil {
+		return CloudUpgradeState{}, fmt.Errorf("rolled back cloud upgrade state not found")
+	}
+	return *rolledBack, nil
+}
+
+func (s *SQLiteStore) RepairCloudUpgrade(project string, apply bool) (CloudUpgradeRepairReport, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return CloudUpgradeRepairReport{
+			Class:      UpgradeRepairClassBlocked,
+			ReasonCode: "upgrade_blocked_project_required",
+			Message:    "project is required for cloud upgrade repair",
+		}, nil
+	}
+
+	if blocked, report, err := s.cloudUpgradeManualActionReport(project); err != nil {
+		return CloudUpgradeRepairReport{}, err
+	} else if blocked {
+		return report, nil
+	}
+
+	enrolled, err := s.IsProjectEnrolled(project)
+	if err != nil {
+		return CloudUpgradeRepairReport{}, fmt.Errorf("check project enrollment: %w", err)
+	}
+	if !enrolled {
+		return CloudUpgradeRepairReport{
+			Class:      UpgradeRepairClassBlocked,
+			ReasonCode: "upgrade_blocked_manual",
+			Message:    fmt.Sprintf("project %q is not enrolled; run doctor/bootstrap guidance first", project),
+		}, nil
+	}
+
+	legacyReport, err := s.DiagnoseCloudUpgradeLegacyMutations(project)
+	if err != nil {
+		return CloudUpgradeRepairReport{}, fmt.Errorf("diagnose legacy cloud upgrade mutations: %w", err)
+	}
+	// When both repairable and blocked mutations coexist we must not hold the
+	// entire repair pass hostage to the non-repairable entries. Apply the
+	// repairable subset first, then surface the residual blockers.
+	appliedRepairs := false
+	if apply && legacyReport.RepairableCount > 0 {
+		if err := s.applyCloudUpgradeLegacyMutationRepairs(project); err != nil {
+			return CloudUpgradeRepairReport{}, fmt.Errorf("apply cloud upgrade legacy mutation repairs: %w", err)
+		}
+		appliedRepairs = true
+	}
+
+	if legacyReport.BlockedCount > 0 {
+		// Scan for the first non-repairable finding so the operator sees the
+		// actual blocker. Findings[0] is ordered by seq and may be a repairable
+		// entry, which previously produced a misleading error message (#446).
+		var blocked CloudUpgradeLegacyMutationFinding
+		for _, f := range legacyReport.Findings {
+			if !f.Repairable {
+				blocked = f
+				break
+			}
+		}
+		var msg string
+		switch {
+		case appliedRepairs:
+			msg = fmt.Sprintf("applied %d repairable payload(s); %d remain blocked: manual-action-required: %s (seq=%d entity=%s entity_key=%q op=%s)",
+				legacyReport.RepairableCount, legacyReport.BlockedCount, blocked.Message, blocked.Seq, blocked.Entity, blocked.EntityKey, blocked.Op)
+		case legacyReport.RepairableCount > 0:
+			msg = fmt.Sprintf("%d repairable payload(s) would apply; %d would remain blocked: manual-action-required: %s (seq=%d entity=%s entity_key=%q op=%s)",
+				legacyReport.RepairableCount, legacyReport.BlockedCount, blocked.Message, blocked.Seq, blocked.Entity, blocked.EntityKey, blocked.Op)
+		default:
+			msg = fmt.Sprintf("manual-action-required: %s (seq=%d entity=%s entity_key=%q op=%s)",
+				blocked.Message, blocked.Seq, blocked.Entity, blocked.EntityKey, blocked.Op)
+		}
+		return CloudUpgradeRepairReport{
+			Class:      UpgradeRepairClassBlocked,
+			ReasonCode: UpgradeReasonBlockedLegacyMutationManual,
+			Message:    msg,
+			Applied:    appliedRepairs,
+		}, nil
+	}
+
+	if legacyReport.RepairableCount > 0 {
+		if !appliedRepairs {
+			return CloudUpgradeRepairReport{
+				Class:         UpgradeRepairClassRepairable,
+				ReasonCode:    UpgradeReasonRepairableLegacyMutationPayload,
+				Message:       fmt.Sprintf("project %q has %d repairable legacy mutation payload issue(s)", project, legacyReport.RepairableCount),
+				PlannedAction: "repair_legacy_mutation_payloads",
+				Applied:       false,
+			}, nil
+		}
+		_ = s.SaveCloudUpgradeState(CloudUpgradeState{
+			Project:     project,
+			Stage:       UpgradeStageRepairApplied,
+			RepairClass: UpgradeRepairClassRepairable,
+		})
+		return CloudUpgradeRepairReport{
+			Class:         UpgradeRepairClassRepairable,
+			ReasonCode:    UpgradeReasonRepairableLegacyMutationPayload,
+			Message:       fmt.Sprintf("applied deterministic legacy mutation payload repairs for project %q", project),
+			PlannedAction: "repair_legacy_mutation_payloads",
+			Applied:       true,
+		}, nil
+	}
+
+	requiresBackfill, err := s.projectSyncBackfillRequired(project)
+	if err != nil {
+		return CloudUpgradeRepairReport{}, err
+	}
+	if !requiresBackfill {
+		return CloudUpgradeRepairReport{
+			Class:      UpgradeRepairClassReady,
+			ReasonCode: "upgrade_repair_noop",
+			Message:    fmt.Sprintf("project %q has no deterministic local repairs to apply", project),
+		}, nil
+	}
+
+	report := CloudUpgradeRepairReport{
+		Class:         UpgradeRepairClassRepairable,
+		ReasonCode:    "upgrade_repair_backfill_sync_journal",
+		Message:       fmt.Sprintf("project %q has deterministic local sync metadata gaps", project),
+		PlannedAction: "backfill_sync_journal",
+		Applied:       false,
+	}
+	if !apply {
+		return report, nil
+	}
+
+	if err := s.withTx(func(tx *sql.Tx) error {
+		return s.backfillProjectSyncMutationsTx(tx, project)
+	}); err != nil {
+		return CloudUpgradeRepairReport{}, fmt.Errorf("apply cloud upgrade repair: %w", err)
+	}
+	report.Applied = true
+	_ = s.SaveCloudUpgradeState(CloudUpgradeState{
+		Project:     project,
+		Stage:       UpgradeStageRepairApplied,
+		RepairClass: UpgradeRepairClassRepairable,
+	})
+	return report, nil
+}
+
+type cloudUpgradeLegacyMutationEvaluation struct {
+	finding         CloudUpgradeLegacyMutationFinding
+	hasIssue        bool
+	repairedPayload string
+	canRepair       bool
+}
+
+func (s *SQLiteStore) DiagnoseCloudUpgradeLegacyMutations(project string) (CloudUpgradeLegacyMutationReport, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return CloudUpgradeLegacyMutationReport{Project: project}, nil
+	}
+
+	evaluations, err := s.evaluateCloudUpgradeLegacyMutations(project)
+	if err != nil {
+		return CloudUpgradeLegacyMutationReport{}, err
+	}
+	report := CloudUpgradeLegacyMutationReport{Project: project}
+	for _, eval := range evaluations {
+		if !eval.hasIssue {
+			continue
+		}
+		report.Findings = append(report.Findings, eval.finding)
+		if eval.canRepair {
+			report.RepairableCount++
+		} else {
+			report.BlockedCount++
+		}
+	}
+	return report, nil
+}
+
+func (s *SQLiteStore) applyCloudUpgradeLegacyMutationRepairs(project string) error {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil
+	}
+	return s.withTx(func(tx *sql.Tx) error {
+		mutations, err := s.listPendingProjectMutationsTx(tx, project)
+		if err != nil {
+			return err
+		}
+		for _, mutation := range mutations {
+			eval, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, mutation)
+			if err != nil {
+				return err
+			}
+			if !eval.hasIssue || !eval.canRepair || strings.TrimSpace(eval.repairedPayload) == "" {
+				continue
+			}
+			if _, err := s.execHook(tx,
+				`UPDATE sync_mutations SET payload = ? WHERE target_key = ? AND project = ? AND seq = ? AND acked_at IS NULL`,
+				eval.repairedPayload,
+				DefaultSyncTargetKey,
+				project,
+				mutation.Seq,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *SQLiteStore) evaluateCloudUpgradeLegacyMutations(project string) ([]cloudUpgradeLegacyMutationEvaluation, error) {
+	return s.withReadTx(func(tx *sql.Tx) ([]cloudUpgradeLegacyMutationEvaluation, error) {
+		mutations, err := s.listPendingProjectMutationsTx(tx, project)
+		if err != nil {
+			return nil, err
+		}
+		evaluations := make([]cloudUpgradeLegacyMutationEvaluation, 0, len(mutations))
+		for _, mutation := range mutations {
+			eval, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, mutation)
+			if err != nil {
+				return nil, err
+			}
+			evaluations = append(evaluations, eval)
+		}
+		return evaluations, nil
+	})
+}
+
+func (s *SQLiteStore) withReadTx(fn func(tx *sql.Tx) ([]cloudUpgradeLegacyMutationEvaluation, error)) ([]cloudUpgradeLegacyMutationEvaluation, error) {
+	tx, err := s.beginTxHook()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	return fn(tx)
+}
+
+func (s *SQLiteStore) listPendingProjectMutationsTx(tx *sql.Tx, project string) ([]SyncMutation, error) {
+	rows, err := s.queryItHook(tx, `
+		SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
+		FROM sync_mutations
+		WHERE target_key = ? AND project = ? AND acked_at IS NULL
+		ORDER BY seq ASC
+	`, DefaultSyncTargetKey, project)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	mutations := make([]SyncMutation, 0)
+	for rows.Next() {
+		var m SyncMutation
+		if err := rows.Scan(&m.Seq, &m.TargetKey, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.Source, &m.Project, &m.OccurredAt, &m.AckedAt); err != nil {
+			return nil, err
+		}
+		mutations = append(mutations, m)
+	}
+	return mutations, rows.Err()
+}
+
+func (s *SQLiteStore) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMutation) (cloudUpgradeLegacyMutationEvaluation, error) {
+	entity := strings.TrimSpace(mutation.Entity)
+	op := strings.TrimSpace(mutation.Op)
+	payload := strings.TrimSpace(mutation.Payload)
+	base := CloudUpgradeLegacyMutationFinding{
+		Seq:       mutation.Seq,
+		Entity:    entity,
+		Op:        op,
+		EntityKey: strings.TrimSpace(mutation.EntityKey),
+		TargetKey: strings.TrimSpace(mutation.TargetKey),
+		Project:   strings.TrimSpace(mutation.Project),
+	}
+
+	repairable := func(msg, hint string, repairedPayload string) cloudUpgradeLegacyMutationEvaluation {
+		finding := base
+		finding.Repairable = true
+		finding.ReasonCode = UpgradeReasonRepairableLegacyMutationPayload
+		finding.Message = msg
+		finding.RepairHint = hint
+		return cloudUpgradeLegacyMutationEvaluation{finding: finding, hasIssue: true, canRepair: true, repairedPayload: repairedPayload}
+	}
+	blocked := func(code, msg string) cloudUpgradeLegacyMutationEvaluation {
+		finding := base
+		finding.Repairable = false
+		finding.ReasonCode = code
+		finding.Message = msg
+		return cloudUpgradeLegacyMutationEvaluation{finding: finding, hasIssue: true, canRepair: false}
+	}
+
+	if payload == "" {
+		return blocked(UpgradeReasonBlockedLegacyMutationManual, "legacy mutation payload is empty"), nil
+	}
+
+	supported := (entity == SyncEntitySession && (op == SyncOpUpsert || op == SyncOpDelete)) ||
+		((entity == SyncEntityObservation || entity == SyncEntityPrompt) && (op == SyncOpUpsert || op == SyncOpDelete)) ||
+		(entity == SyncEntityRelation && op == SyncOpUpsert)
+	if !supported {
+		return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("unsupported legacy mutation %q/%q", entity, op)), nil
+	}
+
+	switch entity {
+	case SyncEntitySession:
+		var body syncSessionPayload
+		if err := decodeSyncPayload([]byte(payload), &body); err != nil {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("decode session payload: %v", err)), nil
+		}
+		body.ID = strings.TrimSpace(body.ID)
+		body.Directory = strings.TrimSpace(body.Directory)
+		changed := false
+		if body.ID == "" && strings.TrimSpace(mutation.EntityKey) != "" {
+			body.ID = strings.TrimSpace(mutation.EntityKey)
+			changed = true
+		}
+		if body.ID == "" {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, "session payload id is required"), nil
+		}
+		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.ID {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("session entity_key %q does not match payload id %q", mutation.EntityKey, body.ID)), nil
+		}
+		if op == SyncOpUpsert && body.Directory == "" {
+			var directory string
+			err := tx.QueryRow(`SELECT ifnull(directory, '') FROM sessions WHERE id = ?`, body.ID).Scan(&directory)
+			if errors.Is(err, sql.ErrNoRows) || strings.TrimSpace(directory) == "" {
+				return blocked(UpgradeReasonBlockedLegacyMutationManual, "session payload directory is required and cannot be inferred from local state"), nil
+			}
+			if err != nil {
+				return cloudUpgradeLegacyMutationEvaluation{}, err
+			}
+			body.Directory = strings.TrimSpace(directory)
+			changed = true
+		}
+		if !changed {
+			return cloudUpgradeLegacyMutationEvaluation{}, nil
+		}
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return cloudUpgradeLegacyMutationEvaluation{}, err
+		}
+		return repairable("session payload is missing required fields", "repair fills session id/directory from local sessions table", string(encoded)), nil
+
+	case SyncEntityObservation:
+		var body syncObservationPayload
+		if err := decodeSyncPayload([]byte(payload), &body); err != nil {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("decode observation payload: %v", err)), nil
+		}
+		body.SyncID = strings.TrimSpace(body.SyncID)
+		body.SessionID = strings.TrimSpace(body.SessionID)
+		body.Type = strings.TrimSpace(body.Type)
+		body.Title = strings.TrimSpace(body.Title)
+		body.Content = strings.TrimSpace(body.Content)
+		body.Scope = strings.TrimSpace(body.Scope)
+		changed := false
+		if body.SyncID == "" && strings.TrimSpace(mutation.EntityKey) != "" {
+			body.SyncID = strings.TrimSpace(mutation.EntityKey)
+			changed = true
+		}
+		if body.SyncID == "" {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, "observation payload sync_id is required"), nil
+		}
+		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.SyncID {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("observation entity_key %q does not match payload sync_id %q", mutation.EntityKey, body.SyncID)), nil
+		}
+		if op == SyncOpUpsert {
+			obs, err := s.getObservationBySyncIDTx(tx, body.SyncID, true)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return cloudUpgradeLegacyMutationEvaluation{}, err
+			}
+			if strings.TrimSpace(body.SessionID) == "" && obs != nil && strings.TrimSpace(obs.SessionID) != "" {
+				body.SessionID = strings.TrimSpace(obs.SessionID)
+				changed = true
+			}
+			if strings.TrimSpace(body.Type) == "" && obs != nil && strings.TrimSpace(obs.Type) != "" {
+				body.Type = strings.TrimSpace(obs.Type)
+				changed = true
+			}
+			if strings.TrimSpace(body.Title) == "" && obs != nil && strings.TrimSpace(obs.Title) != "" {
+				body.Title = strings.TrimSpace(obs.Title)
+				changed = true
+			}
+			if strings.TrimSpace(body.Content) == "" && obs != nil && strings.TrimSpace(obs.Content) != "" {
+				body.Content = strings.TrimSpace(obs.Content)
+				changed = true
+			}
+			if strings.TrimSpace(body.Scope) == "" && obs != nil && strings.TrimSpace(obs.Scope) != "" {
+				body.Scope = strings.TrimSpace(obs.Scope)
+				changed = true
+			}
+			missing := []string{}
+			if strings.TrimSpace(body.SessionID) == "" {
+				missing = append(missing, "session_id")
+			}
+			if strings.TrimSpace(body.Type) == "" {
+				missing = append(missing, "type")
+			}
+			if strings.TrimSpace(body.Title) == "" {
+				missing = append(missing, "title")
+			}
+			if strings.TrimSpace(body.Content) == "" {
+				missing = append(missing, "content")
+			}
+			if strings.TrimSpace(body.Scope) == "" {
+				missing = append(missing, "scope")
+			}
+			if len(missing) > 0 {
+				return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("observation payload missing required upsert fields: %s", strings.Join(missing, ", "))), nil
+			}
+		}
+		if !changed {
+			return cloudUpgradeLegacyMutationEvaluation{}, nil
+		}
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return cloudUpgradeLegacyMutationEvaluation{}, err
+		}
+		return repairable("observation payload is missing required fields for canonical bootstrap", "repair fills missing observation fields from local observations table", string(encoded)), nil
+
+	case SyncEntityPrompt:
+		var body syncPromptPayload
+		if err := decodeSyncPayload([]byte(payload), &body); err != nil {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("decode prompt payload: %v", err)), nil
+		}
+		body.SyncID = strings.TrimSpace(body.SyncID)
+		body.SessionID = strings.TrimSpace(body.SessionID)
+		body.Content = strings.TrimSpace(body.Content)
+		changed := false
+		if body.SyncID == "" && strings.TrimSpace(mutation.EntityKey) != "" {
+			body.SyncID = strings.TrimSpace(mutation.EntityKey)
+			changed = true
+		}
+		if body.SyncID == "" {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, "prompt payload sync_id is required"), nil
+		}
+		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.SyncID {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("prompt entity_key %q does not match payload sync_id %q", mutation.EntityKey, body.SyncID)), nil
+		}
+		if op == SyncOpUpsert {
+			var local syncPromptPayload
+			err := tx.QueryRow(
+				`SELECT sync_id, session_id, content, project, created_at FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`,
+				body.SyncID,
+			).Scan(&local.SyncID, &local.SessionID, &local.Content, &local.Project, &local.CreatedAt)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return cloudUpgradeLegacyMutationEvaluation{}, err
+			}
+			if strings.TrimSpace(body.SessionID) == "" && err == nil && strings.TrimSpace(local.SessionID) != "" {
+				body.SessionID = strings.TrimSpace(local.SessionID)
+				changed = true
+			}
+			if strings.TrimSpace(body.Content) == "" && err == nil && strings.TrimSpace(local.Content) != "" {
+				body.Content = strings.TrimSpace(local.Content)
+				changed = true
+			}
+			missing := []string{}
+			if strings.TrimSpace(body.SessionID) == "" {
+				missing = append(missing, "session_id")
+			}
+			if strings.TrimSpace(body.Content) == "" {
+				missing = append(missing, "content")
+			}
+			if len(missing) > 0 {
+				return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("prompt payload missing required upsert fields: %s", strings.Join(missing, ", "))), nil
+			}
+		}
+		if !changed {
+			return cloudUpgradeLegacyMutationEvaluation{}, nil
+		}
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return cloudUpgradeLegacyMutationEvaluation{}, err
+		}
+		return repairable("prompt payload is missing required fields for canonical bootstrap", "repair fills missing prompt fields from local prompts table", string(encoded)), nil
+
+	case SyncEntityRelation:
+		var body syncRelationPayload
+		if err := decodeSyncPayload([]byte(payload), &body); err != nil {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("decode relation payload: %v", err)), nil
+		}
+		body.SyncID = strings.TrimSpace(body.SyncID)
+		body.SourceID = strings.TrimSpace(body.SourceID)
+		body.TargetID = strings.TrimSpace(body.TargetID)
+		body.Relation = strings.TrimSpace(body.Relation)
+		body.JudgmentStatus = strings.TrimSpace(body.JudgmentStatus)
+		body.Project = strings.TrimSpace(body.Project)
+		changed := false
+		if body.SyncID == "" && strings.TrimSpace(mutation.EntityKey) != "" {
+			body.SyncID = strings.TrimSpace(mutation.EntityKey)
+			changed = true
+		}
+		if body.SyncID == "" {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, "relation payload sync_id is required"), nil
+		}
+		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.SyncID {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("relation entity_key %q does not match payload sync_id %q", mutation.EntityKey, body.SyncID)), nil
+		}
+
+		type localRelationPayload struct {
+			SyncID         string
+			SourceID       string
+			TargetID       string
+			Relation       string
+			Reason         sql.NullString
+			Evidence       sql.NullString
+			Confidence     sql.NullFloat64
+			JudgmentStatus string
+			MarkedByActor  sql.NullString
+			MarkedByKind   sql.NullString
+			MarkedByModel  sql.NullString
+			SessionID      sql.NullString
+			CreatedAt      string
+			UpdatedAt      string
+		}
+		var local localRelationPayload
+		err := tx.QueryRow(`
+			SELECT ifnull(sync_id, ''), ifnull(source_id, ''), ifnull(target_id, ''), ifnull(relation, ''),
+			       reason, evidence, confidence, ifnull(judgment_status, ''), marked_by_actor,
+			       marked_by_kind, marked_by_model, session_id, ifnull(created_at, ''), ifnull(updated_at, '')
+			FROM memory_relations
+			WHERE sync_id = ?
+			ORDER BY id DESC LIMIT 1
+		`, body.SyncID).Scan(
+			&local.SyncID, &local.SourceID, &local.TargetID, &local.Relation,
+			&local.Reason, &local.Evidence, &local.Confidence, &local.JudgmentStatus,
+			&local.MarkedByActor, &local.MarkedByKind, &local.MarkedByModel, &local.SessionID,
+			&local.CreatedAt, &local.UpdatedAt,
+		)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return cloudUpgradeLegacyMutationEvaluation{}, err
+		}
+		if err == nil {
+			if body.SourceID == "" && strings.TrimSpace(local.SourceID) != "" {
+				body.SourceID = strings.TrimSpace(local.SourceID)
+				changed = true
+			}
+			if body.TargetID == "" && strings.TrimSpace(local.TargetID) != "" {
+				body.TargetID = strings.TrimSpace(local.TargetID)
+				changed = true
+			}
+			if body.Relation == "" && strings.TrimSpace(local.Relation) != "" {
+				body.Relation = strings.TrimSpace(local.Relation)
+				changed = true
+			}
+			if body.Reason == nil && local.Reason.Valid {
+				v := local.Reason.String
+				body.Reason = &v
+				changed = true
+			}
+			if body.Evidence == nil && local.Evidence.Valid {
+				v := local.Evidence.String
+				body.Evidence = &v
+				changed = true
+			}
+			if body.Confidence == nil && local.Confidence.Valid {
+				v := local.Confidence.Float64
+				body.Confidence = &v
+				changed = true
+			}
+			if body.JudgmentStatus == "" && strings.TrimSpace(local.JudgmentStatus) != "" {
+				body.JudgmentStatus = strings.TrimSpace(local.JudgmentStatus)
+				changed = true
+			}
+			if (body.MarkedByActor == nil || strings.TrimSpace(*body.MarkedByActor) == "") && local.MarkedByActor.Valid && strings.TrimSpace(local.MarkedByActor.String) != "" {
+				v := strings.TrimSpace(local.MarkedByActor.String)
+				body.MarkedByActor = &v
+				changed = true
+			}
+			if (body.MarkedByKind == nil || strings.TrimSpace(*body.MarkedByKind) == "") && local.MarkedByKind.Valid && strings.TrimSpace(local.MarkedByKind.String) != "" {
+				v := strings.TrimSpace(local.MarkedByKind.String)
+				body.MarkedByKind = &v
+				changed = true
+			}
+			if body.MarkedByModel == nil && local.MarkedByModel.Valid {
+				v := local.MarkedByModel.String
+				body.MarkedByModel = &v
+				changed = true
+			}
+			if body.SessionID == nil && local.SessionID.Valid {
+				v := local.SessionID.String
+				body.SessionID = &v
+				changed = true
+			}
+			if strings.TrimSpace(body.CreatedAt) == "" && strings.TrimSpace(local.CreatedAt) != "" {
+				body.CreatedAt = strings.TrimSpace(local.CreatedAt)
+				changed = true
+			}
+			if strings.TrimSpace(body.UpdatedAt) == "" && strings.TrimSpace(local.UpdatedAt) != "" {
+				body.UpdatedAt = strings.TrimSpace(local.UpdatedAt)
+				changed = true
+			}
+		}
+		if body.Project == "" && strings.TrimSpace(mutation.Project) != "" {
+			body.Project = strings.TrimSpace(mutation.Project)
+			changed = true
+		}
+		missing := []string{}
+		if body.SourceID == "" {
+			missing = append(missing, "source_id")
+		}
+		if body.TargetID == "" {
+			missing = append(missing, "target_id")
+		}
+		if body.Relation == "" {
+			missing = append(missing, "relation")
+		}
+		if body.JudgmentStatus == "" {
+			missing = append(missing, "judgment_status")
+		}
+		if body.MarkedByActor == nil || strings.TrimSpace(*body.MarkedByActor) == "" {
+			missing = append(missing, "marked_by_actor")
+		}
+		if body.MarkedByKind == nil || strings.TrimSpace(*body.MarkedByKind) == "" {
+			missing = append(missing, "marked_by_kind")
+		}
+		if body.Project == "" {
+			missing = append(missing, "project")
+		}
+		if len(missing) > 0 {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("relation payload missing required upsert fields: %s", strings.Join(missing, ", "))), nil
+		}
+		if !changed {
+			return cloudUpgradeLegacyMutationEvaluation{}, nil
+		}
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return cloudUpgradeLegacyMutationEvaluation{}, err
+		}
+		return repairable("relation payload is missing required fields for canonical bootstrap", "repair fills missing relation fields from local memory_relations table and mutation project", string(encoded)), nil
+	}
+
+	return cloudUpgradeLegacyMutationEvaluation{}, nil
+}
+
+func (s *SQLiteStore) cloudUpgradeManualActionReport(project string) (bool, CloudUpgradeRepairReport, error) {
+	targetKey := DefaultSyncTargetKey
+	if project != "" {
+		targetKey = fmt.Sprintf("%s:%s", DefaultSyncTargetKey, project)
+	}
+	state, err := s.GetSyncState(targetKey)
+	if err != nil {
+		return false, CloudUpgradeRepairReport{}, fmt.Errorf("read sync state for cloud upgrade repair: %w", err)
+	}
+	if state == nil {
+		return false, CloudUpgradeRepairReport{}, nil
+	}
+	reasonCode := strings.TrimSpace(derefString(state.ReasonCode))
+	if reasonCode == "" {
+		return false, CloudUpgradeRepairReport{}, nil
+	}
+
+	reasonMap := map[string]string{
+		"auth_required":      "upgrade_policy_auth_required",
+		"policy_forbidden":   "upgrade_policy_forbidden",
+		"cloud_config_error": "upgrade_policy_cloud_config_error",
+	}
+	repairReasonCode, requiresManualAction := reasonMap[reasonCode]
+	if !requiresManualAction {
+		return false, CloudUpgradeRepairReport{}, nil
+	}
+	reasonMessage := strings.TrimSpace(derefString(state.ReasonMessage))
+	if reasonMessage == "" {
+		reasonMessage = "cloud policy/auth precondition must be resolved before repair"
+	}
+	return true, CloudUpgradeRepairReport{
+		Class:      UpgradeRepairClassPolicy,
+		ReasonCode: repairReasonCode,
+		Message:    fmt.Sprintf("manual-action-required: %s", reasonMessage),
+		Applied:    false,
+	}, nil
+}
+
+func (s *SQLiteStore) projectSyncBackfillRequired(project string) (bool, error) {
+	var missing int
+	err := s.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1
+			FROM sessions sess
+			WHERE sess.project = ?
+			  AND NOT EXISTS (
+				SELECT 1 FROM sync_mutations sm
+				WHERE sm.target_key = ?
+				  AND sm.entity = ?
+				  AND sm.entity_key = sess.id
+				  AND sm.source = ?
+			  )
+			UNION ALL
+			SELECT 1
+			FROM observations obs
+			LEFT JOIN sessions sess ON sess.id = obs.session_id
+			WHERE (
+				ifnull(obs.project, '') = ?
+				OR (ifnull(obs.project, '') = '' AND ifnull(sess.project, '') = ?)
+			)
+			  AND obs.deleted_at IS NULL
+			  AND NOT EXISTS (
+				SELECT 1 FROM sync_mutations sm
+				WHERE sm.target_key = ?
+				  AND sm.entity = ?
+				  AND sm.entity_key = obs.sync_id
+				  AND sm.source = ?
+			  )
+		)
+	`, project, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal, project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal).Scan(&missing)
+	if err != nil {
+		return false, fmt.Errorf("detect project sync metadata gaps: %w", err)
+	}
+	return missing == 1, nil
+}
+
+func normalizeUpgradeStage(stage string) string {
+	stage = strings.TrimSpace(strings.ToLower(stage))
+	switch stage {
+	case UpgradeStagePlanned,
+		UpgradeStageDoctorReady,
+		UpgradeStageDoctorBlocked,
+		UpgradeStageRepairApplied,
+		UpgradeStageBootstrapEnrolled,
+		UpgradeStageBootstrapPushed,
+		UpgradeStageBootstrapVerified,
+		UpgradeStageRolledBack:
+		return stage
+	default:
+		return UpgradeStagePlanned
+	}
+}
+
+func normalizeUpgradeRepairClass(class string) string {
+	class = strings.TrimSpace(strings.ToLower(class))
+	switch class {
+	case UpgradeRepairClassNone,
+		UpgradeRepairClassReady,
+		UpgradeRepairClassRepairable,
+		UpgradeRepairClassBlocked,
+		UpgradeRepairClassPolicy:
+		return class
+	default:
+		return UpgradeRepairClassNone
+	}
 }
 
 func (s *SQLiteStore) migrateFTSTopicKey() error {
@@ -698,10 +1908,15 @@ func (s *SQLiteStore) CreateSession(id, project, directory string) error {
 		if err := s.createSessionTx(tx, id, project, directory); err != nil {
 			return err
 		}
+		var startedAt string
+		if err := tx.QueryRow(`SELECT started_at FROM sessions WHERE id = ?`, id).Scan(&startedAt); err != nil {
+			return err
+		}
 		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
 			ID:        id,
 			Project:   project,
 			Directory: directory,
+			StartedAt: startedAt,
 		})
 	})
 }
@@ -723,13 +1938,13 @@ func (s *SQLiteStore) EndSession(id string, summary string) error {
 			return nil
 		}
 
-		var endedAt string
+		var startedAt, endedAt string
 		var project, directory string
 		var storedSummary *string
 		if err := tx.QueryRow(
-			`SELECT project, directory, ended_at, summary FROM sessions WHERE id = ?`,
+			`SELECT project, directory, started_at, ended_at, summary FROM sessions WHERE id = ?`,
 			id,
-		).Scan(&project, &directory, &endedAt, &storedSummary); err != nil {
+		).Scan(&project, &directory, &startedAt, &endedAt, &storedSummary); err != nil {
 			return err
 		}
 
@@ -737,6 +1952,7 @@ func (s *SQLiteStore) EndSession(id string, summary string) error {
 			ID:        id,
 			Project:   project,
 			Directory: directory,
+			StartedAt: startedAt,
 			EndedAt:   &endedAt,
 			Summary:   storedSummary,
 		})
@@ -752,6 +1968,50 @@ func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 		return nil, err
 	}
 	return &sess, nil
+}
+
+// MostRecentActiveSession resolves the active (un-ended) session for a project
+// from the persisted sessions table. It returns the session ID and ok=true when
+// such a session exists, or ok=false when none does.
+//
+// This is the cross-process resolution that fixes issue #386: the SessionStart
+// hook registers a UUID session via the HTTP server (POST /sessions) in one
+// process, while mem_save runs in the separate MCP (stdio) process. The two
+// share only the SQLite store, so the active session must be read from disk —
+// never from in-memory state.
+//
+// Selection rules:
+//   - Scope to the (normalized) project.
+//   - Require ended_at IS NULL — ended sessions are never returned, so stale
+//     sessions naturally fall out without any explicit clearing step.
+//   - Exclude the manual-save fallback sessions (id LIKE 'manual-save%'); those
+//     are created by the fallback path itself and must not be resolved as "the
+//     active session", which would make resolution circular.
+//   - When multiple un-ended sessions exist, pick the MOST RECENT by
+//     started_at DESC, with id DESC as a deterministic tie-breaker.
+func (s *SQLiteStore) MostRecentActiveSession(project string) (string, bool, error) {
+	project, _ = NormalizeProject(project)
+	if project == "" {
+		return "", false, nil
+	}
+
+	var id string
+	err := s.db.QueryRow(`
+		SELECT id
+		FROM sessions
+		WHERE LOWER(project) = ?
+		  AND ended_at IS NULL
+		  AND id NOT LIKE 'manual-save%'
+		ORDER BY datetime(started_at) DESC, id DESC
+		LIMIT 1
+	`, project).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return id, true, nil
 }
 
 func (s *SQLiteStore) RecentSessions(project string, limit int) ([]SessionSummary, error) {
@@ -772,11 +2032,11 @@ func (s *SQLiteStore) RecentSessions(project string, limit int) ([]SessionSummar
 	args := []any{}
 
 	if project != "" {
-		query += " AND s.project = ?"
+		query += " AND LOWER(s.project) = ?"
 		args = append(args, project)
 	}
 
-	query += " GROUP BY s.id ORDER BY MAX(COALESCE(o.created_at, s.started_at)) DESC LIMIT ?"
+	query += " GROUP BY s.id ORDER BY MAX(datetime(COALESCE(o.created_at, s.started_at))) DESC, s.id DESC LIMIT ?"
 	args = append(args, limit)
 
 	rows, err := s.queryItHook(s.db, query, args...)
@@ -816,7 +2076,7 @@ func (s *SQLiteStore) AllSessions(project string, limit int) ([]SessionSummary, 
 		args = append(args, project)
 	}
 
-	query += " GROUP BY s.id ORDER BY MAX(COALESCE(o.created_at, s.started_at)) DESC LIMIT ?"
+	query += " GROUP BY s.id ORDER BY MAX(datetime(COALESCE(o.created_at, s.started_at))) DESC, s.id DESC LIMIT ?"
 	args = append(args, limit)
 
 	rows, err := s.queryItHook(s.db, query, args...)
@@ -843,8 +2103,7 @@ func (s *SQLiteStore) AllObservations(project, scope string, limit int) ([]Obser
 	}
 
 	query := `
-		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at
+		SELECT ` + observationSelectColumns + `
 		FROM observations o
 		WHERE o.deleted_at IS NULL
 	`
@@ -859,7 +2118,7 @@ func (s *SQLiteStore) AllObservations(project, scope string, limit int) ([]Obser
 		args = append(args, normalizeScope(scope))
 	}
 
-	query += " ORDER BY o.created_at DESC LIMIT ?"
+	query += " ORDER BY datetime(o.created_at) DESC, o.id DESC LIMIT ?"
 	args = append(args, limit)
 
 	return s.queryObservations(query, args...)
@@ -872,8 +2131,7 @@ func (s *SQLiteStore) SessionObservations(sessionID string, limit int) ([]Observ
 	}
 
 	query := `
-		SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		       scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		SELECT ` + observationSelectColumns + `
 		FROM observations
 		WHERE session_id = ? AND deleted_at IS NULL
 		ORDER BY created_at ASC
@@ -1035,15 +2293,14 @@ func (s *SQLiteStore) RecentObservations(project, scope string, limit int) ([]Ob
 	}
 
 	query := `
-		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at
+		SELECT ` + observationSelectColumns + `
 		FROM observations o
 		WHERE o.deleted_at IS NULL
 	`
 	args := []any{}
 
 	if project != "" {
-		query += " AND o.project = ?"
+		query += " AND LOWER(o.project) = ?"
 		args = append(args, project)
 	}
 	if scope != "" {
@@ -1051,10 +2308,134 @@ func (s *SQLiteStore) RecentObservations(project, scope string, limit int) ([]Ob
 		args = append(args, normalizeScope(scope))
 	}
 
-	query += " ORDER BY o.created_at DESC, o.id DESC LIMIT ?"
+	query += " ORDER BY datetime(o.created_at) DESC, o.id DESC LIMIT ?"
 	args = append(args, limit)
 
 	return s.queryObservations(query, args...)
+}
+
+func (s *SQLiteStore) PinnedObservations(project, scope string) ([]Observation, error) {
+	project, _ = NormalizeProject(project)
+
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL AND o.pinned = 1
+	`
+	args := []any{}
+
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	if scope != "" {
+		query += " AND o.scope = ?"
+		args = append(args, normalizeScope(scope))
+	}
+
+	query += " ORDER BY datetime(o.created_at) DESC, o.id DESC"
+	return s.queryObservations(query, args...)
+}
+
+func (s *SQLiteStore) PinObservation(id int64) error {
+	return s.setObservationPinned(id, true)
+}
+
+func (s *SQLiteStore) UnpinObservation(id int64) error {
+	return s.setObservationPinned(id, false)
+}
+
+func (s *SQLiteStore) setObservationPinned(id int64, pinned bool) error {
+	value := 0
+	if pinned {
+		value = 1
+	}
+	res, err := s.execHook(s.db, `UPDATE observations SET pinned = ? WHERE id = ? AND deleted_at IS NULL`, value, id)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrObservationNotFound
+	}
+	return nil
+}
+
+func (s *SQLiteStore) recentUnpinnedObservations(project, scope string, limit int) ([]Observation, error) {
+	project, _ = NormalizeProject(project)
+	if limit <= 0 {
+		limit = s.cfg.MaxContextResults
+	}
+
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL AND o.pinned = 0
+	`
+	args := []any{}
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	if scope != "" {
+		query += " AND o.scope = ?"
+		args = append(args, normalizeScope(scope))
+	}
+	query += " ORDER BY datetime(o.created_at) DESC, o.id DESC LIMIT ?"
+	args = append(args, limit)
+	return s.queryObservations(query, args...)
+}
+
+// ObservationsNeedingReview returns non-deleted observations whose review_after has passed.
+// An empty project searches all projects, matching existing browse/search conventions.
+func (s *SQLiteStore) ObservationsNeedingReview(project string, limit int) ([]Observation, error) {
+	project, _ = NormalizeProject(project)
+	if limit <= 0 {
+		limit = s.cfg.MaxContextResults
+	}
+	query := `
+		SELECT ` + observationSelectColumns + `
+		FROM observations o
+		WHERE o.deleted_at IS NULL
+		  AND o.review_after IS NOT NULL
+		  AND datetime(o.review_after) <= datetime('now')
+	`
+	args := []any{}
+	if project != "" {
+		query += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	query += " ORDER BY datetime(o.review_after) ASC, o.id ASC LIMIT ?"
+	args = append(args, limit)
+
+	return s.queryObservations(query, args...)
+}
+
+// MarkReviewed resets an observation's review_after using its type's configured decay offset.
+// Types without a decay offset return to a NULL review_after value.
+// This lifecycle reset is intentionally local-only until the sync wire format includes review_after.
+func (s *SQLiteStore) MarkReviewed(id int64) error {
+	return s.withTx(func(tx *sql.Tx) error {
+		obs, err := s.getObservationTx(tx, id)
+		if err == sql.ErrNoRows {
+			return ErrObservationNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		var reviewAfter any
+		if months, ok := decayReviewAfterMonths[obs.Type]; ok {
+			reviewAfter = time.Now().UTC().AddDate(0, months, 0).Format("2006-01-02 15:04:05")
+		}
+		if _, err := s.execHook(tx, `UPDATE observations SET review_after = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`, reviewAfter, id); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 // ─── User Prompts ────────────────────────────────────────────────────────────
@@ -1063,10 +2444,7 @@ func (s *SQLiteStore) AddPrompt(p AddPromptParams) (int64, error) {
 	// Normalize project name before storing
 	p.Project, _ = NormalizeProject(p.Project)
 
-	content := stripPrivateTags(p.Content)
-	if len(content) > s.cfg.MaxObservationLength {
-		content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
-	}
+	content := s.preparePromptContent(p.Content)
 
 	var promptID int64
 	err := s.withTx(func(tx *sql.Tx) error {
@@ -1082,17 +2460,85 @@ func (s *SQLiteStore) AddPrompt(p AddPromptParams) (int64, error) {
 		if err != nil {
 			return err
 		}
+		var createdAt string
+		if err := tx.QueryRow(`SELECT created_at FROM user_prompts WHERE id = ?`, promptID).Scan(&createdAt); err != nil {
+			return err
+		}
+		if _, err := s.execHook(tx, `DELETE FROM prompt_tombstones WHERE sync_id = ?`, syncID); err != nil {
+			return err
+		}
 		return s.enqueueSyncMutationTx(tx, SyncEntityPrompt, syncID, SyncOpUpsert, syncPromptPayload{
 			SyncID:    syncID,
 			SessionID: p.SessionID,
 			Content:   content,
 			Project:   nullableString(p.Project),
+			CreatedAt: createdAt,
 		})
 	})
 	if err != nil {
 		return 0, err
 	}
 	return promptID, nil
+}
+
+func (s *SQLiteStore) AddPromptIfMissing(p AddPromptParams) (int64, bool, error) {
+	p.Project, _ = NormalizeProject(p.Project)
+	content := s.preparePromptContent(p.Content)
+
+	var promptID int64
+	inserted := false
+	err := s.withTx(func(tx *sql.Tx) error {
+		err := tx.QueryRow(
+			`SELECT id FROM user_prompts WHERE session_id = ? AND ifnull(project, '') = ? AND content = ? ORDER BY id DESC LIMIT 1`,
+			p.SessionID, p.Project, content,
+		).Scan(&promptID)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+
+		syncID := newSyncID("prompt")
+		res, err := s.execHook(tx,
+			`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`,
+			syncID, p.SessionID, content, nullableString(p.Project),
+		)
+		if err != nil {
+			return err
+		}
+		promptID, err = res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		var createdAt string
+		if err := tx.QueryRow(`SELECT created_at FROM user_prompts WHERE id = ?`, promptID).Scan(&createdAt); err != nil {
+			return err
+		}
+		if _, err := s.execHook(tx, `DELETE FROM prompt_tombstones WHERE sync_id = ?`, syncID); err != nil {
+			return err
+		}
+		inserted = true
+		return s.enqueueSyncMutationTx(tx, SyncEntityPrompt, syncID, SyncOpUpsert, syncPromptPayload{
+			SyncID:    syncID,
+			SessionID: p.SessionID,
+			Content:   content,
+			Project:   nullableString(p.Project),
+			CreatedAt: createdAt,
+		})
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	return promptID, inserted, nil
+}
+
+func (s *SQLiteStore) preparePromptContent(content string) string {
+	content = stripPrivateTags(content)
+	if len(content) > s.cfg.MaxObservationLength {
+		content = content[:s.cfg.MaxObservationLength] + "... [truncated]"
+	}
+	return content
 }
 
 func (s *SQLiteStore) RecentPrompts(project string, limit int) ([]Prompt, error) {
@@ -1178,12 +2624,24 @@ func (s *SQLiteStore) SearchPrompts(query string, project string, limit int) ([]
 // (including soft-deleted ones) to prevent orphaned rows.
 // It returns ErrSessionNotFound if no session with that ID exists.
 //
-// Note: this delete only removes local rows. It does not enqueue a delete
-// sync mutation, but any previously enqueued mutations for the session or its
-// prompts may still be synced later if autosync is enabled, and a later pull
-// may recreate the deleted rows locally.
+// When the session belongs to an enrolled project, this operation also enqueues
+// a session/delete mutation so cloud replicas can remove the session.
 func (s *SQLiteStore) DeleteSession(id string) error {
 	return s.withTx(func(tx *sql.Tx) error {
+		var project string
+		if err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, id).Scan(&project); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
+			}
+			return fmt.Errorf("delete session: load session: %w", err)
+		}
+
+		var enrolled int
+		if err := tx.QueryRow(`SELECT 1 FROM sync_enrolled_projects WHERE project = ? LIMIT 1`, project).Scan(&enrolled); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("delete session: check enrollment: %w", err)
+			}
+		}
 		// Count ALL observations for the session, including soft-deleted ones,
 		// because the FK constraint on observations.session_id has no ON DELETE CASCADE.
 		var count int
@@ -1222,21 +2680,41 @@ func (s *SQLiteStore) DeleteSession(id string) error {
 			return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
 		}
 
+		if enrolled == 1 {
+			now := Now()
+			if err := s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpDelete, syncSessionPayload{
+				ID:        id,
+				Project:   project,
+				DeletedAt: &now,
+			}); err != nil {
+				return fmt.Errorf("delete session: enqueue mutation: %w", err)
+			}
+		}
+
 		return nil
 	})
 }
 
 // ─── Delete Prompt ───────────────────────────────────────────────────────────
 
-// DeletePrompt hard-deletes a single prompt by ID.
+// DeletePrompt hard-deletes a single prompt by ID and records a sync tombstone.
 // It returns ErrPromptNotFound if no prompt with that ID exists.
-//
-// Note: this delete only removes local rows. It does not enqueue a delete
-// sync mutation, but any previously enqueued mutations for the prompt
-// may still be synced later if autosync is enabled, and a later pull
-// may recreate the deleted row locally.
 func (s *SQLiteStore) DeletePrompt(id int64) error {
 	return s.withTx(func(tx *sql.Tx) error {
+		var payload syncPromptPayload
+		var project string
+		if err := tx.QueryRow(`SELECT sync_id, session_id, ifnull(project, '') FROM user_prompts WHERE id = ?`, id).Scan(&payload.SyncID, &payload.SessionID, &project); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
+			}
+			return fmt.Errorf("delete prompt: load row: %w", err)
+		}
+		payload.Project = nullableString(project)
+		now := Now()
+		payload.Deleted = true
+		payload.HardDelete = true
+		payload.DeletedAt = &now
+
 		res, err := s.execHook(tx, `DELETE FROM user_prompts WHERE id = ?`, id)
 		if err != nil {
 			return fmt.Errorf("delete prompt: %w", err)
@@ -1248,6 +2726,17 @@ func (s *SQLiteStore) DeletePrompt(id int64) error {
 		if n == 0 {
 			return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
 		}
+		if _, err := s.execHook(tx,
+			`INSERT INTO prompt_tombstones (sync_id, session_id, project, deleted_at)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(sync_id) DO UPDATE SET session_id = excluded.session_id, project = excluded.project, deleted_at = excluded.deleted_at`,
+			payload.SyncID, payload.SessionID, payload.Project, now,
+		); err != nil {
+			return fmt.Errorf("delete prompt: upsert tombstone: %w", err)
+		}
+		if err := s.enqueueSyncMutationTx(tx, SyncEntityPrompt, payload.SyncID, SyncOpDelete, payload); err != nil {
+			return fmt.Errorf("delete prompt: enqueue mutation: %w", err)
+		}
 		return nil
 	})
 }
@@ -1256,16 +2745,11 @@ func (s *SQLiteStore) DeletePrompt(id int64) error {
 
 func (s *SQLiteStore) GetObservation(id int64) (*Observation, error) {
 	row := s.db.QueryRow(
-		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		`SELECT `+observationSelectColumns+`
 		 FROM observations WHERE id = ? AND deleted_at IS NULL`, id,
 	)
 	var o Observation
-	if err := row.Scan(
-		&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-		&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
-		&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
-	); err != nil {
+	if err := scanObservationRowSQLite(row, &o); err != nil {
 		return nil, err
 	}
 	return &o, nil
@@ -1348,7 +2832,7 @@ func (s *SQLiteStore) DeleteObservation(id int64, hardDelete bool) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		obs, err := s.getObservationTx(tx, id)
 		if err == sql.ErrNoRows {
-			return nil
+			return ErrObservationNotFound
 		}
 		if err != nil {
 			return err
@@ -1358,6 +2842,20 @@ func (s *SQLiteStore) DeleteObservation(id int64, hardDelete bool) error {
 		if hardDelete {
 			if _, err := s.execHook(tx, `DELETE FROM observations WHERE id = ?`, id); err != nil {
 				return err
+			}
+			// ── Phase: memory-conflict-surfacing — C.11 ──────────────────────
+			// Orphan any memory_relations rows that reference this observation's
+			// sync_id (as source or target). Relations are never cascade-deleted;
+			// they become audit history with judgment_status='orphaned'.
+			if obs.SyncID != "" {
+				if _, err := s.execHook(tx, `
+					UPDATE memory_relations
+					SET judgment_status = 'orphaned',
+					    updated_at      = datetime('now')
+					WHERE source_id = ? OR target_id = ?
+				`, obs.SyncID, obs.SyncID); err != nil {
+					return fmt.Errorf("orphan memory_relations after hard-delete: %w", err)
+				}
 			}
 		} else {
 			if _, err := s.execHook(tx,
@@ -1376,6 +2874,8 @@ func (s *SQLiteStore) DeleteObservation(id int64, hardDelete bool) error {
 
 		return s.enqueueSyncMutationTx(tx, SyncEntityObservation, obs.SyncID, SyncOpDelete, syncObservationPayload{
 			SyncID:     obs.SyncID,
+			SessionID:  obs.SessionID,
+			Project:    obs.Project,
 			Deleted:    true,
 			DeletedAt:  &deletedAt,
 			HardDelete: hardDelete,
@@ -1494,6 +2994,14 @@ func (s *SQLiteStore) Timeline(observationID int64, before, after int) (*Timelin
 // ─── Search (FTS5) ───────────────────────────────────────────────────────────
 
 func (s *SQLiteStore) Search(query string, opts SearchOptions) ([]SearchResult, error) {
+	// Validate match_mode early so invalid values always error regardless of query shape.
+	switch opts.MatchMode {
+	case "", "all", "any":
+		// valid
+	default:
+		return nil, fmt.Errorf("invalid match_mode %q: must be \"all\" or \"any\"", opts.MatchMode)
+	}
+
 	// Normalize project filter so "Engram" finds records stored as "engram"
 	opts.Project, _ = NormalizeProject(opts.Project)
 
@@ -1508,8 +3016,7 @@ func (s *SQLiteStore) Search(query string, opts SearchOptions) ([]SearchResult, 
 	var directResults []SearchResult
 	if strings.Contains(query, "/") {
 		tkSQL := `
-			SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-			       scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+			SELECT ` + observationSelectColumns + `
 			FROM observations
 			WHERE topic_key = ? AND deleted_at IS NULL
 		`
@@ -1520,7 +3027,7 @@ func (s *SQLiteStore) Search(query string, opts SearchOptions) ([]SearchResult, 
 			tkArgs = append(tkArgs, opts.Type)
 		}
 		if opts.Project != "" {
-			tkSQL += " AND project = ?"
+			tkSQL += " AND LOWER(project) = ?"
 			tkArgs = append(tkArgs, opts.Project)
 		}
 		if opts.Scope != "" {
@@ -1549,7 +3056,7 @@ func (s *SQLiteStore) Search(query string, opts SearchOptions) ([]SearchResult, 
 				if err := tkRows.Scan(
 					&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
 					&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
-					&sr.LastSeenAt, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+					&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 				); err != nil {
 					break
 				}
@@ -1559,13 +3066,18 @@ func (s *SQLiteStore) Search(query string, opts SearchOptions) ([]SearchResult, 
 		}
 	}
 
-	// Sanitize query for FTS5 — wrap each term in quotes to avoid syntax errors
-	ftsQuery := sanitizeFTS(query)
+	// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
+	var ftsQuery string
+	if opts.MatchMode == "any" {
+		ftsQuery = sanitizeFTSCandidates(query)
+	} else {
+		ftsQuery = sanitizeFTS(query)
+	}
 
 	sqlQ := `
 		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at,
-		       fts.rank
+		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
+		       bm25(observations_fts, 5.0, 1.0, 0.0, 0.0, 0.0, 3.0) as rank
 		FROM observations_fts fts
 		JOIN observations o ON o.id = fts.rowid
 		WHERE observations_fts MATCH ? AND o.deleted_at IS NULL
@@ -1578,7 +3090,7 @@ func (s *SQLiteStore) Search(query string, opts SearchOptions) ([]SearchResult, 
 	}
 
 	if opts.Project != "" {
-		sqlQ += " AND o.project = ?"
+		sqlQ += " AND LOWER(o.project) = ?"
 		args = append(args, opts.Project)
 	}
 
@@ -1620,7 +3132,7 @@ func (s *SQLiteStore) Search(query string, opts SearchOptions) ([]SearchResult, 
 		if err := rows.Scan(
 			&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
 			&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
-			&sr.LastSeenAt, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 			&sr.Rank,
 		); err != nil {
 			return nil, err
@@ -1664,6 +3176,19 @@ func (s *SQLiteStore) Stats() (*Stats, error) {
 	return stats, nil
 }
 
+// ─── Project Existence ───────────────────────────────────────────────────────
+
+// ProjectExists returns true if the named project has at least one record in
+// any of observations, sessions, prompts, or enrollment tables.
+// Uses a single UNION ALL LIMIT 1 query for efficiency (REQ-315).
+// The sync_enrolled_projects branch ensures a project enrolled via EnrollProject()
+// without any other data is still recognized (JC1).
+
+// Use LOWER(project) = ? so legacy data stored with mixed-case names
+// (created before project normalization was enforced on writes) is found
+// when queried with the current normalized (lowercase) name. The caller
+// is expected to pass an already-normalized name (NormalizeProject result).
+
 // ─── Context Formatting ─────────────────────────────────────────────────────
 
 func (s *SQLiteStore) FormatContext(project, scope string) (string, error) {
@@ -1672,7 +3197,12 @@ func (s *SQLiteStore) FormatContext(project, scope string) (string, error) {
 		return "", err
 	}
 
-	observations, err := s.RecentObservations(project, scope, s.cfg.MaxContextResults)
+	pinned, err := s.PinnedObservations(project, scope)
+	if err != nil {
+		return "", err
+	}
+
+	observations, err := s.recentUnpinnedObservations(project, scope, s.cfg.MaxContextResults)
 	if err != nil {
 		return "", err
 	}
@@ -1682,7 +3212,7 @@ func (s *SQLiteStore) FormatContext(project, scope string) (string, error) {
 		return "", err
 	}
 
-	if len(sessions) == 0 && len(observations) == 0 && len(prompts) == 0 {
+	if len(sessions) == 0 && len(pinned) == 0 && len(observations) == 0 && len(prompts) == 0 {
 		return "", nil
 	}
 
@@ -1697,7 +3227,7 @@ func (s *SQLiteStore) FormatContext(project, scope string) (string, error) {
 				summary = fmt.Sprintf(": %s", truncate(*sess.Summary, 200))
 			}
 			fmt.Fprintf(&b, "- **%s** (%s)%s [%d observations]\n",
-				sess.Project, sess.StartedAt, summary, sess.ObservationCount)
+				sess.Project, timeutil.FormatLocal(sess.StartedAt), summary, sess.ObservationCount)
 		}
 		b.WriteString("\n")
 	}
@@ -1705,7 +3235,16 @@ func (s *SQLiteStore) FormatContext(project, scope string) (string, error) {
 	if len(prompts) > 0 {
 		b.WriteString("### Recent User Prompts\n")
 		for _, p := range prompts {
-			fmt.Fprintf(&b, "- %s: %s\n", p.CreatedAt, truncate(p.Content, 200))
+			fmt.Fprintf(&b, "- %s: %s\n", timeutil.FormatLocal(p.CreatedAt), truncate(p.Content, 200))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(pinned) > 0 {
+		b.WriteString("### Pinned\n")
+		for _, obs := range pinned {
+			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
+				obs.Type, obs.Title, truncate(obs.Content, 300))
 		}
 		b.WriteString("\n")
 	}
@@ -1725,14 +3264,108 @@ func (s *SQLiteStore) FormatContext(project, scope string) (string, error) {
 // ─── Export / Import ─────────────────────────────────────────────────────────
 
 func (s *SQLiteStore) Export() (*ExportData, error) {
+	return s.exportWithProjectScope("")
+}
+
+// ExportProject returns an export restricted to records relevant to a single
+// normalized project. This avoids full-database exports when only one project
+// needs to sync.
+func (s *SQLiteStore) ExportProject(project string) (*ExportData, error) {
+	normalizedProject, _ := NormalizeProject(project)
+	normalizedProject = strings.TrimSpace(normalizedProject)
+	if normalizedProject == "" {
+		return nil, fmt.Errorf("project is required")
+	}
+	return s.exportWithProjectScope(normalizedProject)
+}
+
+// ExportRelationMutations returns relation upsert mutations for non-orphaned
+// relation rows whose source and target observations are available locally.
+func (s *SQLiteStore) ExportRelationMutations(project string) ([]SyncMutation, error) {
+	normalizedProject, _ := NormalizeProject(project)
+	normalizedProject = strings.TrimSpace(normalizedProject)
+
+	query := `
+		SELECT r.sync_id, r.source_id, r.target_id, r.relation, r.reason, r.evidence, r.confidence,
+		       r.judgment_status, r.marked_by_actor, r.marked_by_kind, r.marked_by_model,
+		       r.session_id, coalesce(nullif(src.project, ''), src_s.project, ''), r.created_at, r.updated_at
+		FROM memory_relations r
+		JOIN observations src ON src.sync_id = r.source_id AND src.deleted_at IS NULL
+		JOIN observations tgt ON tgt.sync_id = r.target_id AND tgt.deleted_at IS NULL
+		LEFT JOIN sessions src_s ON src_s.id = src.session_id
+		LEFT JOIN sessions tgt_s ON tgt_s.id = tgt.session_id
+		WHERE r.judgment_status != ?`
+	args := []any{JudgmentStatusOrphaned}
+	if normalizedProject != "" {
+		query += ` AND coalesce(nullif(src.project, ''), src_s.project, '') = ?
+			AND coalesce(nullif(tgt.project, ''), tgt_s.project, '') = ?`
+		args = append(args, normalizedProject, normalizedProject)
+	}
+	query += ` ORDER BY r.created_at, r.sync_id`
+
+	rows, err := s.queryItHook(s.db, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("export relation mutations: %w", err)
+	}
+	defer rows.Close()
+
+	mutations := []SyncMutation{}
+	for rows.Next() {
+		var p syncRelationPayload
+		if err := rows.Scan(
+			&p.SyncID, &p.SourceID, &p.TargetID, &p.Relation, &p.Reason, &p.Evidence, &p.Confidence,
+			&p.JudgmentStatus, &p.MarkedByActor, &p.MarkedByKind, &p.MarkedByModel,
+			&p.SessionID, &p.Project, &p.CreatedAt, &p.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("export relation mutations: scan: %w", err)
+		}
+		payload, err := json.Marshal(p)
+		if err != nil {
+			return nil, fmt.Errorf("export relation mutations: marshal %s: %w", p.SyncID, err)
+		}
+		mutations = append(mutations, SyncMutation{
+			Entity:     SyncEntityRelation,
+			EntityKey:  strings.TrimSpace(p.SyncID),
+			Op:         SyncOpUpsert,
+			Payload:    string(payload),
+			Project:    strings.TrimSpace(p.Project),
+			OccurredAt: p.UpdatedAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("export relation mutations: rows: %w", err)
+	}
+	return mutations, nil
+}
+
+func (s *SQLiteStore) exportWithProjectScope(project string) (*ExportData, error) {
 	data := &ExportData{
 		Version:    "0.1.0",
 		ExportedAt: Now(),
 	}
 
+	sessionQuery := "SELECT id, project, directory, started_at, ended_at, summary FROM sessions"
+	sessionArgs := []any{}
+	if project != "" {
+		sessionQuery += `
+			WHERE project = ?
+			   OR id IN (
+				SELECT session_id FROM observations
+				 WHERE ifnull(project, '') = ?
+				    OR (ifnull(project, '') = '' AND session_id IN (SELECT id FROM sessions WHERE project = ?))
+				UNION
+				SELECT session_id FROM user_prompts
+				 WHERE ifnull(project, '') = ?
+				    OR (ifnull(project, '') = '' AND session_id IN (SELECT id FROM sessions WHERE project = ?))
+			)`
+		sessionArgs = append(sessionArgs, project, project, project, project, project)
+	}
+	sessionQuery += " ORDER BY started_at"
+
 	// Sessions
 	rows, err := s.queryItHook(s.db,
-		"SELECT id, project, directory, started_at, ended_at, summary FROM sessions ORDER BY started_at",
+		sessionQuery,
+		sessionArgs...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("export sessions: %w", err)
@@ -1750,22 +3383,24 @@ func (s *SQLiteStore) Export() (*ExportData, error) {
 	}
 
 	// Observations
-	obsRows, err := s.queryItHook(s.db,
-		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
-		 FROM observations ORDER BY id`,
-	)
+	obsQuery := `SELECT ` + observationSelectColumns + `
+	 FROM observations`
+	obsArgs := []any{}
+	if project != "" {
+		obsQuery += `
+			WHERE ifnull(project, '') = ?
+			   OR (ifnull(project, '') = '' AND session_id IN (SELECT id FROM sessions WHERE project = ?))`
+		obsArgs = append(obsArgs, project, project)
+	}
+	obsQuery += " ORDER BY id"
+	obsRows, err := s.queryItHook(s.db, obsQuery, obsArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("export observations: %w", err)
 	}
 	defer obsRows.Close()
 	for obsRows.Next() {
 		var o Observation
-		if err := obsRows.Scan(
-			&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-			&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
-			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
-		); err != nil {
+		if err := scanObservationRowSQLite(obsRows, &o); err != nil {
 			return nil, err
 		}
 		data.Observations = append(data.Observations, o)
@@ -1775,9 +3410,16 @@ func (s *SQLiteStore) Export() (*ExportData, error) {
 	}
 
 	// Prompts
-	promptRows, err := s.queryItHook(s.db,
-		"SELECT id, ifnull(sync_id, '') as sync_id, session_id, content, ifnull(project, '') as project, created_at FROM user_prompts ORDER BY id",
-	)
+	promptQuery := "SELECT id, ifnull(sync_id, '') as sync_id, session_id, content, ifnull(project, '') as project, created_at FROM user_prompts"
+	promptArgs := []any{}
+	if project != "" {
+		promptQuery += `
+			WHERE ifnull(project, '') = ?
+			   OR (ifnull(project, '') = '' AND session_id IN (SELECT id FROM sessions WHERE project = ?))`
+		promptArgs = append(promptArgs, project, project)
+	}
+	promptQuery += " ORDER BY id"
+	promptRows, err := s.queryItHook(s.db, promptQuery, promptArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("export prompts: %w", err)
 	}
@@ -1819,12 +3461,14 @@ func (s *SQLiteStore) Import(data *ExportData) (*ImportResult, error) {
 		result.SessionsImported += int(n)
 	}
 
-	// Import observations (use new IDs — AUTOINCREMENT)
+	// Import observations (use new IDs — AUTOINCREMENT, skip duplicate sync IDs)
 	for _, obs := range data.Observations {
-		_, err := s.execHook(tx,
-			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			normalizeExistingSyncID(obs.SyncID, "obs"),
+		syncID := normalizeExistingSyncID(obs.SyncID, "obs")
+		res, err := s.execHook(tx,
+			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, review_after, created_at, updated_at, deleted_at)
+			 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			 WHERE NOT EXISTS (SELECT 1 FROM observations WHERE sync_id = ?)`,
+			syncID,
 			obs.SessionID,
 			obs.Type,
 			obs.Title,
@@ -1837,14 +3481,17 @@ func (s *SQLiteStore) Import(data *ExportData) (*ImportResult, error) {
 			maxInt(obs.RevisionCount, 1),
 			maxInt(obs.DuplicateCount, 1),
 			obs.LastSeenAt,
+			obs.ReviewAfter,
 			obs.CreatedAt,
 			obs.UpdatedAt,
 			obs.DeletedAt,
+			syncID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("import observation %d: %w", obs.ID, err)
 		}
-		result.ObservationsImported++
+		n, _ := res.RowsAffected()
+		result.ObservationsImported += int(n)
 	}
 
 	// Import prompts
@@ -1869,9 +3516,15 @@ func (s *SQLiteStore) Import(data *ExportData) (*ImportResult, error) {
 
 // ─── Sync Chunk Tracking ─────────────────────────────────────────────────────
 
-// GetSyncedChunks returns a set of chunk IDs that have been imported/exported.
+// GetSyncedChunks returns local-target chunk IDs for backwards compatibility.
 func (s *SQLiteStore) GetSyncedChunks() (map[string]bool, error) {
-	rows, err := s.queryItHook(s.db, "SELECT chunk_id FROM sync_chunks")
+	return s.GetSyncedChunksForTarget(LocalChunkTargetKey)
+}
+
+// GetSyncedChunksForTarget returns chunk IDs tracked for a specific sync target.
+func (s *SQLiteStore) GetSyncedChunksForTarget(targetKey string) (map[string]bool, error) {
+	targetKey = normalizeChunkTargetKey(targetKey)
+	rows, err := s.queryItHook(s.db, "SELECT chunk_id FROM sync_chunks WHERE target_key = ?", targetKey)
 	if err != nil {
 		return nil, fmt.Errorf("get synced chunks: %w", err)
 	}
@@ -1888,11 +3541,17 @@ func (s *SQLiteStore) GetSyncedChunks() (map[string]bool, error) {
 	return chunks, rows.Err()
 }
 
-// RecordSyncedChunk marks a chunk as imported/exported so it won't be processed again.
+// RecordSyncedChunk marks a local-target chunk as imported/exported.
 func (s *SQLiteStore) RecordSyncedChunk(chunkID string) error {
+	return s.RecordSyncedChunkForTarget(LocalChunkTargetKey, chunkID)
+}
+
+// RecordSyncedChunkForTarget marks a chunk as imported/exported for a target.
+func (s *SQLiteStore) RecordSyncedChunkForTarget(targetKey, chunkID string) error {
+	targetKey = normalizeChunkTargetKey(targetKey)
 	_, err := s.execHook(s.db,
-		"INSERT OR IGNORE INTO sync_chunks (chunk_id) VALUES (?)",
-		chunkID,
+		"INSERT OR IGNORE INTO sync_chunks (target_key, chunk_id) VALUES (?, ?)",
+		targetKey, chunkID,
 	)
 	return err
 }
@@ -1938,6 +3597,36 @@ func (s *SQLiteStore) ListPendingSyncMutations(targetKey string, limit int) ([]S
 	return mutations, rows.Err()
 }
 
+func (s *SQLiteStore) ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int64, limit int) ([]SyncMutation, error) {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.queryItHook(s.db, `
+		SELECT sm.seq, sm.target_key, sm.entity, sm.entity_key, sm.op, sm.payload, sm.source, sm.project, sm.occurred_at, sm.acked_at
+		FROM sync_mutations sm
+		LEFT JOIN sync_enrolled_projects sep ON sm.project = sep.project
+		WHERE sm.target_key = ? AND sm.acked_at IS NULL
+		  AND sm.seq > ?
+		  AND (sm.project = '' OR sep.project IS NOT NULL)
+		ORDER BY sm.seq ASC
+		LIMIT ?`, targetKey, afterSeq, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	mutations := make([]SyncMutation, 0, limit)
+	for rows.Next() {
+		var mutation SyncMutation
+		if err := rows.Scan(&mutation.Seq, &mutation.TargetKey, &mutation.Entity, &mutation.EntityKey, &mutation.Op, &mutation.Payload, &mutation.Source, &mutation.Project, &mutation.OccurredAt, &mutation.AckedAt); err != nil {
+			return nil, err
+		}
+		mutations = append(mutations, mutation)
+	}
+	return mutations, rows.Err()
+}
+
 // SkipAckNonEnrolledMutations acks (marks as skipped) all pending mutations
 // that belong to non-enrolled projects, preventing journal bloat. Empty-project
 // mutations are never skipped — they always sync regardless of enrollment.
@@ -1964,6 +3653,35 @@ func (s *SQLiteStore) AckSyncMutations(targetKey string, lastAckedSeq int64) err
 	}
 	targetKey = normalizeSyncTargetKey(targetKey)
 	return s.withTx(func(tx *sql.Tx) error {
+		affectedProjects := map[string]struct{}{}
+		if targetKey == DefaultSyncTargetKey {
+			rows, err := s.queryItHook(tx,
+				`SELECT DISTINCT ifnull(project, '') FROM sync_mutations
+				 WHERE target_key = ? AND seq <= ? AND acked_at IS NULL`,
+				targetKey, lastAckedSeq,
+			)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var project string
+				if err := rows.Scan(&project); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				project, _ = NormalizeProject(project)
+				project = strings.TrimSpace(project)
+				if project != "" {
+					affectedProjects[project] = struct{}{}
+				}
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			_ = rows.Close()
+		}
+
 		state, err := s.getSyncStateTx(tx, targetKey)
 		if err != nil {
 			return err
@@ -1982,13 +3700,36 @@ func (s *SQLiteStore) AckSyncMutations(targetKey string, lastAckedSeq int64) err
 		if acked >= state.LastEnqueuedSeq {
 			lifecycle = SyncLifecycleHealthy
 		}
-		_, err = s.execHook(tx,
-			`UPDATE sync_state
-			 SET last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now')
-			 WHERE target_key = ?`,
-			acked, lifecycle, targetKey,
-		)
-		return err
+		if isActivelyDegradedState(state, time.Now().UTC()) {
+			lifecycle = SyncLifecycleDegraded
+		}
+		if lifecycle == SyncLifecycleDegraded {
+			_, err = s.execHook(tx,
+				`UPDATE sync_state
+				 SET last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now')
+				 WHERE target_key = ?`,
+				acked, lifecycle, targetKey,
+			)
+		} else {
+			_, err = s.execHook(tx,
+				`UPDATE sync_state
+				 SET last_acked_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+				 WHERE target_key = ?`,
+				acked, lifecycle, targetKey,
+			)
+		}
+		if err != nil {
+			return err
+		}
+		if targetKey != DefaultSyncTargetKey {
+			return nil
+		}
+		for project := range affectedProjects {
+			if err := s.refreshProjectSyncStateTx(tx, project); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -2000,6 +3741,31 @@ func (s *SQLiteStore) AckSyncMutationSeqs(targetKey string, seqs []int64) error 
 	}
 	targetKey = normalizeSyncTargetKey(targetKey)
 	return s.withTx(func(tx *sql.Tx) error {
+		affectedProjects := map[string]struct{}{}
+		if targetKey == DefaultSyncTargetKey {
+			for _, seq := range seqs {
+				if seq <= 0 {
+					continue
+				}
+				var project string
+				err := tx.QueryRow(
+					`SELECT ifnull(project, '') FROM sync_mutations WHERE target_key = ? AND seq = ?`,
+					targetKey, seq,
+				).Scan(&project)
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				project, _ = NormalizeProject(project)
+				project = strings.TrimSpace(project)
+				if project != "" {
+					affectedProjects[project] = struct{}{}
+				}
+			}
+		}
+
 		state, err := s.getSyncStateTx(tx, targetKey)
 		if err != nil {
 			return err
@@ -2027,12 +3793,146 @@ func (s *SQLiteStore) AckSyncMutationSeqs(targetKey string, seqs []int64) error 
 		if remaining == 0 {
 			lifecycle = SyncLifecycleHealthy
 		}
-		_, err = s.execHook(tx,
-			`UPDATE sync_state SET last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now') WHERE target_key = ?`,
-			maxSeq, lifecycle, targetKey,
-		)
-		return err
+		if isActivelyDegradedState(state, time.Now().UTC()) {
+			lifecycle = SyncLifecycleDegraded
+		}
+		if lifecycle == SyncLifecycleDegraded {
+			_, err = s.execHook(tx,
+				`UPDATE sync_state SET last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now') WHERE target_key = ?`,
+				maxSeq, lifecycle, targetKey,
+			)
+		} else {
+			_, err = s.execHook(tx,
+				`UPDATE sync_state SET last_acked_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now') WHERE target_key = ?`,
+				maxSeq, lifecycle, targetKey,
+			)
+		}
+		if err != nil {
+			return err
+		}
+		if targetKey != DefaultSyncTargetKey {
+			return nil
+		}
+		for project := range affectedProjects {
+			if err := s.refreshProjectSyncStateTx(tx, project); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
+}
+
+func (s *SQLiteStore) HasPendingSyncMutationsForProject(project string) (bool, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return false, nil
+	}
+
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sync_mutations WHERE target_key = ? AND project = ? AND acked_at IS NULL`,
+		DefaultSyncTargetKey,
+		project,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (s *SQLiteStore) refreshProjectSyncStateTx(tx *sql.Tx, project string) error {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil
+	}
+	projectTargetKey := syncTargetKeyForProject(project)
+	state, err := s.getSyncStateTx(tx, projectTargetKey)
+	if err != nil {
+		return err
+	}
+
+	var maxAckedSeq int64
+	if err := tx.QueryRow(
+		`SELECT ifnull(MAX(seq), 0)
+		 FROM sync_mutations
+		 WHERE target_key = ? AND project = ? AND acked_at IS NOT NULL`,
+		DefaultSyncTargetKey,
+		project,
+	).Scan(&maxAckedSeq); err != nil {
+		return err
+	}
+	if maxAckedSeq < state.LastAckedSeq {
+		maxAckedSeq = state.LastAckedSeq
+	}
+
+	var maxEnqueuedSeq int64
+	if err := tx.QueryRow(
+		`SELECT ifnull(MAX(seq), 0)
+		 FROM sync_mutations
+		 WHERE target_key = ? AND project = ?`,
+		DefaultSyncTargetKey,
+		project,
+	).Scan(&maxEnqueuedSeq); err != nil {
+		return err
+	}
+	if maxEnqueuedSeq < state.LastEnqueuedSeq {
+		maxEnqueuedSeq = state.LastEnqueuedSeq
+	}
+
+	var pendingCount int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*)
+		 FROM sync_mutations
+		 WHERE target_key = ? AND project = ? AND acked_at IS NULL`,
+		DefaultSyncTargetKey,
+		project,
+	).Scan(&pendingCount); err != nil {
+		return err
+	}
+
+	lifecycle := SyncLifecycleHealthy
+	if pendingCount > 0 {
+		lifecycle = SyncLifecyclePending
+	}
+	if isActivelyDegradedState(state, time.Now().UTC()) {
+		lifecycle = SyncLifecycleDegraded
+	}
+
+	if lifecycle == SyncLifecycleDegraded {
+		_, err = s.execHook(tx,
+			`UPDATE sync_state
+			 SET last_enqueued_seq = ?, last_acked_seq = ?, lifecycle = ?, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			maxEnqueuedSeq, maxAckedSeq, lifecycle, projectTargetKey,
+		)
+	} else {
+		_, err = s.execHook(tx,
+			`UPDATE sync_state
+			 SET last_enqueued_seq = ?, last_acked_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			maxEnqueuedSeq, maxAckedSeq, lifecycle, projectTargetKey,
+		)
+	}
+	return err
+}
+
+func isActivelyDegradedState(state *SyncState, now time.Time) bool {
+	if state == nil || state.Lifecycle != SyncLifecycleDegraded {
+		return false
+	}
+	reasonCode := strings.TrimSpace(derefString(state.ReasonCode))
+	switch reasonCode {
+	case "blocked_unenrolled", "paused", "auth_required", "policy_forbidden", "cloud_config_error":
+		return true
+	}
+	if state.BackoffUntil != nil {
+		if backoffUntil, err := time.Parse(time.RFC3339, strings.TrimSpace(*state.BackoffUntil)); err == nil && backoffUntil.After(now) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *SQLiteStore) AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error) {
@@ -2083,6 +3983,14 @@ func (s *SQLiteStore) ReleaseSyncLease(targetKey, owner string) error {
 	return err
 }
 
+func (s *SQLiteStore) MarkSyncPaused(targetKey, message string) error {
+	return s.MarkSyncBlocked(targetKey, "paused", message)
+}
+
+func (s *SQLiteStore) MarkSyncAuthRequired(targetKey, message string) error {
+	return s.MarkSyncBlocked(targetKey, "auth_required", message)
+}
+
 func (s *SQLiteStore) MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	backoff := backoffUntil.UTC().Format(time.RFC3339)
@@ -2093,9 +4001,9 @@ func (s *SQLiteStore) MarkSyncFailure(targetKey, message string, backoffUntil ti
 		}
 		_, err = s.execHook(tx,
 			`UPDATE sync_state
-			 SET lifecycle = ?, consecutive_failures = ?, backoff_until = ?, last_error = ?, updated_at = datetime('now')
+			 SET lifecycle = ?, consecutive_failures = ?, backoff_until = ?, reason_code = ?, reason_message = ?, last_error = ?, updated_at = datetime('now')
 			 WHERE target_key = ?`,
-			SyncLifecycleDegraded, state.ConsecutiveFailures+1, backoff, message, targetKey,
+			SyncLifecycleDegraded, state.ConsecutiveFailures+1, backoff, "transport_failed", message, message, targetKey,
 		)
 		return err
 	})
@@ -2103,13 +4011,34 @@ func (s *SQLiteStore) MarkSyncFailure(targetKey, message string, backoffUntil ti
 
 func (s *SQLiteStore) MarkSyncHealthy(targetKey string) error {
 	targetKey = normalizeSyncTargetKey(targetKey)
-	_, err := s.execHook(s.db,
-		`UPDATE sync_state
-		 SET lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, last_error = NULL, updated_at = datetime('now')
-		 WHERE target_key = ?`,
-		SyncLifecycleHealthy, targetKey,
-	)
-	return err
+	return s.withTx(func(tx *sql.Tx) error {
+		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			return err
+		}
+		_, err := s.execHook(tx,
+			`UPDATE sync_state
+			 SET lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			SyncLifecycleHealthy, targetKey,
+		)
+		return err
+	})
+}
+
+func (s *SQLiteStore) MarkSyncPending(targetKey string) error {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	return s.withTx(func(tx *sql.Tx) error {
+		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			return err
+		}
+		_, err := s.execHook(tx,
+			`UPDATE sync_state
+			 SET lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			SyncLifecyclePending, targetKey,
+		)
+		return err
+	})
 }
 
 func (s *SQLiteStore) ApplyPulledMutation(targetKey string, mutation SyncMutation) error {
@@ -2125,7 +4054,7 @@ func (s *SQLiteStore) ApplyPulledMutation(targetKey string, mutation SyncMutatio
 
 		applyErr := s.applyPulledMutationTx(tx, mutation)
 		if applyErr != nil {
-			// Phase E: per-entity skip+log policy.
+			// Phase E: per-entity skip+log policy (design §9).
 			// For relation FK misses, write to sync_apply_deferred and ACK the seq
 			// so the cursor can advance. All other errors propagate and halt the pull.
 			if mutation.Entity == SyncEntityRelation && errors.Is(applyErr, ErrRelationFKMissing) {
@@ -2144,6 +4073,7 @@ func (s *SQLiteStore) ApplyPulledMutation(targetKey string, mutation SyncMutatio
 				// Fall through to advance the cursor (ACK the seq).
 			} else if mutation.Entity == SyncEntityRelation && errors.Is(applyErr, ErrApplyDead) {
 				// Payload is permanently undecodable — write directly as dead and ACK.
+				// There is no point retrying; a malformed payload will never become valid.
 				log.Printf("[store] ApplyPulledMutation: relation payload dead seq=%d entity_key=%s err=%v — marking dead",
 					mutation.Seq, mutation.EntityKey, applyErr)
 				if _, deferErr := s.execHook(tx, `
@@ -2173,6 +4103,65 @@ func (s *SQLiteStore) ApplyPulledMutation(targetKey string, mutation SyncMutatio
 	})
 }
 
+// ApplyPulledChunk atomically applies all mutations contained in a pulled chunk
+// and records the chunk as synced in the same transaction. This guarantees
+// retry safety: a failed chunk import leaves no partial semantic mutations.
+func (s *SQLiteStore) ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMutation) error {
+	targetKey = normalizeSyncTargetKey(targetKey)
+	chunkTargetKey := normalizeChunkTargetKey(targetKey)
+	chunkID = strings.TrimSpace(chunkID)
+	if chunkID == "" {
+		return fmt.Errorf("chunk id is required")
+	}
+
+	return s.withTx(func(tx *sql.Tx) error {
+		if _, err := s.getSyncStateTx(tx, targetKey); err != nil {
+			return err
+		}
+
+		var alreadyImported int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM sync_chunks WHERE target_key = ? AND chunk_id = ?`, chunkTargetKey, chunkID).Scan(&alreadyImported); err != nil {
+			return err
+		}
+		if alreadyImported > 0 {
+			return nil
+		}
+
+		state, err := s.getSyncStateTx(tx, targetKey)
+		if err != nil {
+			return err
+		}
+
+		seq := state.LastPulledSeq
+		for i, mutation := range mutations {
+			seq++
+			mutation.Seq = seq
+			mutation.TargetKey = targetKey
+			mutation.Source = SyncSourceRemote
+			if err := s.applyPulledMutationTx(tx, mutation); err != nil {
+				return fmt.Errorf("apply chunk mutation %d: %w", i, err)
+			}
+		}
+
+		if _, err := s.execHook(tx,
+			`INSERT OR IGNORE INTO sync_chunks (target_key, chunk_id) VALUES (?, ?)`,
+			chunkTargetKey, chunkID,
+		); err != nil {
+			return err
+		}
+
+		_, err = s.execHook(tx,
+			`UPDATE sync_state
+			 SET last_pulled_seq = ?, lifecycle = ?, consecutive_failures = 0, backoff_until = NULL, reason_code = NULL, reason_message = NULL, last_error = NULL, updated_at = datetime('now')
+			 WHERE target_key = ?`,
+			seq, SyncLifecycleHealthy, targetKey,
+		)
+		return err
+	})
+}
+
+// applyPulledMutationTx dispatches a pulled mutation to the appropriate apply handler.
+
 // applyPulledMutationTx dispatches a pulled mutation to the appropriate apply handler.
 func (s *SQLiteStore) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 	switch mutation.Entity {
@@ -2198,6 +4187,9 @@ func (s *SQLiteStore) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) e
 		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
 			return err
 		}
+		if mutation.Op == SyncOpDelete {
+			return s.applyPromptDeleteTx(tx, payload)
+		}
 		return s.applyPromptUpsertTx(tx, payload)
 	default:
 		return fmt.Errorf("unknown sync entity %q", mutation.Entity)
@@ -2206,13 +4198,12 @@ func (s *SQLiteStore) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) e
 
 func (s *SQLiteStore) GetObservationBySyncID(syncID string) (*Observation, error) {
 	row := s.db.QueryRow(
-		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		`SELECT `+observationSelectColumns+`
 		 FROM observations WHERE sync_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`,
 		syncID,
 	)
 	var o Observation
-	if err := row.Scan(&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content, &o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt); err != nil {
+	if err := scanObservationRowSQLite(row, &o); err != nil {
 		return nil, err
 	}
 	return &o, nil
@@ -2223,6 +4214,7 @@ func (s *SQLiteStore) GetObservationBySyncID(syncID string) (*Observation, error
 // EnrollProject registers a project for cloud sync. Idempotent — re-enrolling
 // an already-enrolled project is a no-op.
 func (s *SQLiteStore) EnrollProject(project string) error {
+	project, _ = NormalizeProject(project)
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -2248,6 +4240,7 @@ func (s *SQLiteStore) EnrollProject(project string) error {
 // UnenrollProject removes a project from cloud sync enrollment. Idempotent —
 // unenrolling a non-enrolled project is a no-op.
 func (s *SQLiteStore) UnenrollProject(project string) error {
+	project, _ = NormalizeProject(project)
 	if project == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
@@ -2281,6 +4274,10 @@ func (s *SQLiteStore) ListEnrolledProjects() ([]EnrolledProject, error) {
 
 // IsProjectEnrolled returns true if the given project is enrolled for cloud sync.
 func (s *SQLiteStore) IsProjectEnrolled(project string) (bool, error) {
+	project, _ = NormalizeProject(project)
+	if project == "" {
+		return false, nil
+	}
 	var exists int
 	err := s.db.QueryRow(
 		`SELECT 1 FROM sync_enrolled_projects WHERE project = ? LIMIT 1`,
@@ -2366,16 +4363,22 @@ type ProjectNameCount struct {
 // Uses a single UNION ALL LIMIT 1 query for efficiency.
 // The sync_enrolled_projects branch ensures a project enrolled via EnrollProject()
 // without any other data is still recognized.
+
+// ProjectExists returns true if the named project has at least one record in
+// any of observations, sessions, prompts, or enrollment tables.
+// Uses a single UNION ALL LIMIT 1 query for efficiency.
+// The sync_enrolled_projects branch ensures a project enrolled via EnrollProject()
+// without any other data is still recognized.
 func (s *SQLiteStore) ProjectExists(name string) (bool, error) {
 	const query = `
 SELECT 1 FROM (
-  SELECT project FROM observations WHERE project = ? AND deleted_at IS NULL
+  SELECT project FROM observations WHERE LOWER(project) = LOWER(?) AND deleted_at IS NULL
   UNION ALL
-  SELECT project FROM sessions WHERE project = ?
+  SELECT project FROM sessions WHERE LOWER(project) = LOWER(?)
   UNION ALL
-  SELECT project FROM user_prompts WHERE project = ?
+  SELECT project FROM user_prompts WHERE LOWER(project) = LOWER(?)
   UNION ALL
-  SELECT project FROM sync_enrolled_projects WHERE project = ?
+  SELECT project FROM sync_enrolled_projects WHERE LOWER(project) = LOWER(?)
 ) LIMIT 1`
 	var dummy int
 	err := s.db.QueryRow(query, name, name, name, name).Scan(&dummy)
@@ -2556,6 +4559,9 @@ func (s *SQLiteStore) CountObservationsForProject(name string) (int, error) {
 	return count, err
 }
 
+// MergeResult summarizes the result of merging multiple project name variants
+// into a single canonical project name.
+
 // MergeProjects migrates all records from each source project name into the
 // canonical name. Sources that equal the canonical (after normalization) or
 // have no records are silently skipped — the operation is idempotent.
@@ -2569,34 +4575,51 @@ func (s *SQLiteStore) MergeProjects(sources []string, canonical string) (*MergeR
 	result := &MergeResult{Canonical: canonical}
 
 	err := s.withTx(func(tx *sql.Tx) error {
-		for _, src := range sources {
-			src, _ = NormalizeProject(src)
-			if src == "" || src == canonical {
+		seenSources := make(map[string]struct{})
+		for _, srcInput := range sources {
+			srcNormalized, _ := NormalizeProject(srcInput)
+			if srcNormalized == "" || srcNormalized == canonical {
+				continue
+			}
+			if _, seen := seenSources[srcNormalized]; seen {
+				continue
+			}
+			seenSources[srcNormalized] = struct{}{}
+
+			sourceVariants := projectMergeSourceVariants(srcInput, srcNormalized, canonical)
+			if len(sourceVariants) == 0 {
 				continue
 			}
 
-			res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project = ?`, canonical, src)
+			placeholders := sqlPlaceholders(len(sourceVariants))
+			args := make([]any, 0, len(sourceVariants)+1)
+			args = append(args, canonical)
+			for _, variant := range sourceVariants {
+				args = append(args, variant)
+			}
+
+			res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project IN (`+placeholders+`)`, args...)
 			if err != nil {
-				return fmt.Errorf("merge observations %q → %q: %w", src, canonical, err)
+				return fmt.Errorf("merge observations %q → %q: %w", srcNormalized, canonical, err)
 			}
 			n, _ := res.RowsAffected()
 			result.ObservationsUpdated += n
 
-			res, err = s.execHook(tx, `UPDATE sessions SET project = ? WHERE project = ?`, canonical, src)
+			res, err = s.execHook(tx, `UPDATE sessions SET project = ? WHERE project IN (`+placeholders+`)`, args...)
 			if err != nil {
-				return fmt.Errorf("merge sessions %q → %q: %w", src, canonical, err)
+				return fmt.Errorf("merge sessions %q → %q: %w", srcNormalized, canonical, err)
 			}
 			n, _ = res.RowsAffected()
 			result.SessionsUpdated += n
 
-			res, err = s.execHook(tx, `UPDATE user_prompts SET project = ? WHERE project = ?`, canonical, src)
+			res, err = s.execHook(tx, `UPDATE user_prompts SET project = ? WHERE project IN (`+placeholders+`)`, args...)
 			if err != nil {
-				return fmt.Errorf("merge prompts %q → %q: %w", src, canonical, err)
+				return fmt.Errorf("merge prompts %q → %q: %w", srcNormalized, canonical, err)
 			}
 			n, _ = res.RowsAffected()
 			result.PromptsUpdated += n
 
-			result.SourcesMerged = append(result.SourcesMerged, src)
+			result.SourcesMerged = append(result.SourcesMerged, srcNormalized)
 		}
 		// Enqueue sync mutations so cloud sync picks up the merged records.
 		// Same pattern used by EnrollProject.
@@ -2609,7 +4632,48 @@ func (s *SQLiteStore) MergeProjects(sources []string, canonical string) (*MergeR
 	return result, nil
 }
 
+// sqlPlaceholders returns a comma-separated list of parameter markers only.
+// Values are still passed separately through query arguments; no user data is
+// interpolated into SQL here.
+func sqlPlaceholders(count int) string {
+	return strings.TrimRight(strings.Repeat("?,", count), ",")
+}
+
+func projectMergeSourceVariants(rawSource, normalizedSource, canonical string) []string {
+	seen := make(map[string]struct{})
+	variants := make([]string, 0, 5)
+	// Match both the historical raw project name and its normalized form so
+	// legacy rows are migrated without reintroducing canonical-source churn.
+	candidates := []string{strings.TrimSpace(rawSource), normalizedSource}
+	parts := strings.FieldsFunc(normalizedSource, func(r rune) bool {
+		return r == ' ' || r == '-' || r == '_'
+	})
+	if len(parts) > 1 {
+		for _, sep := range []string{" ", "-", "_"} {
+			candidates = append(candidates, strings.Join(parts, sep))
+		}
+	}
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || candidate == canonical {
+			continue
+		}
+		candidateNormalized, _ := NormalizeProject(candidate)
+		if candidateNormalized == canonical {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		variants = append(variants, candidate)
+	}
+	return variants
+}
+
 // ─── Project Pruning ─────────────────────────────────────────────────────────
+
+// PruneResult holds the outcome of pruning a single project.
 
 // PruneProject removes all sessions and prompts for a project that has zero
 // (non-deleted) observations. Returns an error if the project still has
@@ -2652,18 +4716,154 @@ func (s *SQLiteStore) PruneProject(project string) (*PruneResult, error) {
 	return result, nil
 }
 
+// ─── Delete Project ───────────────────────────────────────────────────────────
+
+// DeleteProjectResult summarises a cascade project deletion.
+type DeleteProjectResult struct {
+	Project             string `json:"project"`
+	ObservationsDeleted int64  `json:"observations_deleted"`
+	PromptsDeleted      int64  `json:"prompts_deleted"`
+	SessionsDeleted     int64  `json:"sessions_deleted"`
+	HardDelete          bool   `json:"hard_delete"`
+}
+
+// DeleteProject removes all data associated with a project in a single
+// transaction.
+//
+// When hardDelete is true: observation rows are permanently removed, prompts
+// are hard-deleted, and sessions are hard-deleted. memory_relations that
+// reference any removed observation are marked orphaned (audit history).
+//
+// When hardDelete is false: observations are soft-deleted (deleted_at set),
+// and prompts are hard-deleted. Sessions are NOT removed in this path because
+// observations.session_id is a NOT NULL FK to sessions — removing sessions
+// while soft-deleted observation rows still reference them would violate the FK
+// constraint. The session rows remain and can be cleaned up with
+// engram delete session <id> once the observations are purged.
+//
+// Returns ErrProjectNotFound when no sessions or observations exist for the
+// given project name.
+func (s *SQLiteStore) DeleteProject(project string, hardDelete bool) (*DeleteProjectResult, error) {
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil, fmt.Errorf("project name must not be empty")
+	}
+
+	result := &DeleteProjectResult{Project: project, HardDelete: hardDelete}
+
+	err := s.withTx(func(tx *sql.Tx) error {
+		// Existence check: at least one session or observation must exist.
+		var sessionCount int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM sessions WHERE project = ?`, project).Scan(&sessionCount); err != nil {
+			return fmt.Errorf("delete project: count sessions: %w", err)
+		}
+		var obsCount int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM observations WHERE project = ?`, project).Scan(&obsCount); err != nil {
+			return fmt.Errorf("delete project: count observations: %w", err)
+		}
+		if sessionCount == 0 && obsCount == 0 {
+			return fmt.Errorf("%w: %q", ErrProjectNotFound, project)
+		}
+
+		// 1. Delete/soft-delete observations.
+		if hardDelete {
+			// Orphan memory_relations rows that reference any observation in this project.
+			if _, err := s.execHook(tx, `
+				UPDATE memory_relations
+				SET judgment_status = 'orphaned',
+				    updated_at      = datetime('now')
+				WHERE source_id IN (SELECT sync_id FROM observations WHERE project = ?)
+				   OR target_id IN (SELECT sync_id FROM observations WHERE project = ?)
+			`, project, project); err != nil {
+				return fmt.Errorf("delete project: orphan relations: %w", err)
+			}
+			res, err := s.execHook(tx, `DELETE FROM observations WHERE project = ?`, project)
+			if err != nil {
+				return fmt.Errorf("delete project: hard-delete observations: %w", err)
+			}
+			result.ObservationsDeleted, _ = res.RowsAffected()
+		} else {
+			res, err := s.execHook(tx, `
+				UPDATE observations
+				SET deleted_at = datetime('now'),
+				    updated_at = datetime('now')
+				WHERE project = ? AND deleted_at IS NULL
+			`, project)
+			if err != nil {
+				return fmt.Errorf("delete project: soft-delete observations: %w", err)
+			}
+			result.ObservationsDeleted, _ = res.RowsAffected()
+		}
+
+		// 2. Delete prompts for the project (no soft-delete mechanism exists).
+		res, err := s.execHook(tx, `DELETE FROM user_prompts WHERE project = ?`, project)
+		if err != nil {
+			return fmt.Errorf("delete project: delete prompts: %w", err)
+		}
+		result.PromptsDeleted, _ = res.RowsAffected()
+
+		// 3. Delete sessions — only when hard-deleting, because observation rows
+		//    reference sessions via a NOT NULL FK and soft-deleted rows are still
+		//    present in the table.
+		if hardDelete {
+			res, err = s.execHook(tx, `DELETE FROM sessions WHERE project = ?`, project)
+			if err != nil {
+				return fmt.Errorf("delete project: delete sessions: %w", err)
+			}
+			result.SessionsDeleted, _ = res.RowsAffected()
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func (s *SQLiteStore) withTx(fn func(tx *sql.Tx) error) error {
-	tx, err := s.beginTxHook()
-	if err != nil {
-		return err
+	return withSQLiteWriteRetry(func() error {
+		tx, err := s.beginTxHook()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return s.commitHook(tx)
+	})
+}
+
+func withSQLiteWriteRetry(fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt <= len(sqliteWriteRetryBackoffs); attempt++ {
+		if err := fn(); err != nil {
+			lastErr = err
+			if !isRetryableSQLiteLockError(err) || attempt == len(sqliteWriteRetryBackoffs) {
+				return err
+			}
+			time.Sleep(sqliteWriteRetryBackoffs[attempt])
+			continue
+		}
+		return nil
 	}
-	defer tx.Rollback()
-	if err := fn(tx); err != nil {
-		return err
+	return lastErr
+}
+
+func isRetryableSQLiteLockError(err error) bool {
+	if err == nil {
+		return false
 	}
-	return s.commitHook(tx)
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		primaryCode := sqliteErr.Code() & 0xff
+		return primaryCode == sqlitePrimaryBusy || primaryCode == sqlitePrimaryLocked
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database is busy") || strings.Contains(msg, "sqlite_busy") || strings.Contains(msg, "sqlite_locked")
 }
 
 func (s *SQLiteStore) createSessionTx(tx *sql.Tx, id, project, directory string) error {
@@ -2688,10 +4888,10 @@ func (s *SQLiteStore) ensureSyncState(targetKey string) error {
 func (s *SQLiteStore) getSyncState(targetKey string) (*SyncState, error) {
 	row := s.db.QueryRow(`
 		SELECT target_key, lifecycle, last_enqueued_seq, last_acked_seq, last_pulled_seq,
-		       consecutive_failures, backoff_until, lease_owner, lease_until, last_error, updated_at
+		       consecutive_failures, backoff_until, lease_owner, lease_until, reason_code, reason_message, last_error, updated_at
 		FROM sync_state WHERE target_key = ?`, targetKey)
 	var state SyncState
-	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.LastError, &state.UpdatedAt); err != nil {
+	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.ReasonCode, &state.ReasonMessage, &state.LastError, &state.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &state, nil
@@ -2706,10 +4906,10 @@ func (s *SQLiteStore) getSyncStateTx(tx *sql.Tx, targetKey string) (*SyncState, 
 	}
 	row := tx.QueryRow(`
 		SELECT target_key, lifecycle, last_enqueued_seq, last_acked_seq, last_pulled_seq,
-		       consecutive_failures, backoff_until, lease_owner, lease_until, last_error, updated_at
+		       consecutive_failures, backoff_until, lease_owner, lease_until, reason_code, reason_message, last_error, updated_at
 		FROM sync_state WHERE target_key = ?`, targetKey)
 	var state SyncState
-	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.LastError, &state.UpdatedAt); err != nil {
+	if err := row.Scan(&state.TargetKey, &state.Lifecycle, &state.LastEnqueuedSeq, &state.LastAckedSeq, &state.LastPulledSeq, &state.ConsecutiveFailures, &state.BackoffUntil, &state.LeaseOwner, &state.LeaseUntil, &state.ReasonCode, &state.ReasonMessage, &state.LastError, &state.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &state, nil
@@ -2722,43 +4922,131 @@ func (s *SQLiteStore) backfillProjectSyncMutationsTx(tx *sql.Tx, project string)
 	if err := s.backfillObservationSyncMutationsTx(tx, project); err != nil {
 		return err
 	}
-	return s.backfillPromptSyncMutationsTx(tx, project)
+	if err := s.backfillPromptSyncMutationsTx(tx, project); err != nil {
+		return err
+	}
+	return s.backfillRelationSyncMutationsTx(tx, project)
+}
+
+// projectNeedsBackfill returns true when a project has any sessions, live observations,
+// or prompts that are missing a corresponding sync_mutation row.
+// It runs three lightweight COUNT queries — no cursor is held open.
+func (s *SQLiteStore) projectNeedsBackfill(project string) (bool, error) {
+	type countQuery struct {
+		q    string
+		args []any
+	}
+	queries := []countQuery{
+		{
+			q: `SELECT COUNT(*) FROM sessions
+			    WHERE project = ?
+			      AND NOT EXISTS (
+			        SELECT 1 FROM sync_mutations sm
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = sessions.id AND sm.source = ?
+			      )`,
+			args: []any{project, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal},
+		},
+		{
+			q: `SELECT COUNT(*) FROM observations o
+			    LEFT JOIN sessions s ON s.id = o.session_id
+			    WHERE (ifnull(o.project,'') = ? OR (ifnull(o.project,'') = '' AND ifnull(s.project,'') = ?))
+			      AND o.deleted_at IS NULL
+			      AND NOT EXISTS (
+			        SELECT 1 FROM sync_mutations sm
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = o.sync_id AND sm.source = ?
+			      )`,
+			args: []any{project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal},
+		},
+		{
+			q: `SELECT COUNT(*) FROM user_prompts p
+			    LEFT JOIN sessions s ON s.id = p.session_id
+			    WHERE (ifnull(p.project,'') = ? OR (ifnull(p.project,'') = '' AND ifnull(s.project,'') = ?))
+			      AND NOT EXISTS (
+			        SELECT 1 FROM sync_mutations sm
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = p.sync_id AND sm.source = ?
+			      )`,
+			args: []any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal},
+		},
+		{
+			// Count only fully-judged relations (not orphaned, not pending, with
+			// marked_by_actor/kind populated) whose source and target observations
+			// are locally available and that have no local upsert sync_mutations row.
+			// Mirrors the SELECT in backfillRelationSyncMutationsTx exactly — any
+			// divergence causes the fast-path skip to desync from the write path.
+			// Pending/unmarked rows lack marked_by_* and would be rejected by cloud
+			// validation (HTTP 400), so we exclude them from both the count and the
+			// backfill to avoid polluting the sync journal with undeliverable mutations.
+			q: `SELECT COUNT(*)
+			    FROM memory_relations r
+			    JOIN observations src ON src.sync_id = r.source_id AND src.deleted_at IS NULL
+			    JOIN observations tgt ON tgt.sync_id = r.target_id AND tgt.deleted_at IS NULL
+			    LEFT JOIN sessions src_s ON src_s.id = src.session_id
+			    WHERE r.judgment_status NOT IN (?, ?)
+			      AND ifnull(r.marked_by_actor, '') != ''
+			      AND ifnull(r.marked_by_kind, '') != ''
+			      AND coalesce(nullif(src.project, ''), src_s.project, '') = ?
+			      AND NOT EXISTS (
+			        SELECT 1 FROM sync_mutations sm
+			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = r.sync_id AND sm.source = ?
+			      )`,
+			args: []any{JudgmentStatusOrphaned, JudgmentStatusPending, project, DefaultSyncTargetKey, SyncEntityRelation, SyncSourceLocal},
+		},
+	}
+	for _, cq := range queries {
+		var n int
+		if err := s.db.QueryRow(cq.q, cq.args...).Scan(&n); err != nil {
+			return false, err
+		}
+		if n > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *SQLiteStore) repairEnrolledProjectSyncMutations() error {
-	return s.withTx(func(tx *sql.Tx) error {
-		rows, err := s.queryItHook(tx,
-			`SELECT project FROM sync_enrolled_projects ORDER BY project ASC`,
-		)
+	// Collect enrolled projects outside a transaction so we avoid holding a read
+	// cursor open while we later write inside backfillProjectSyncMutationsTx.
+	rows, err := s.db.Query(`SELECT project FROM sync_enrolled_projects ORDER BY project ASC`)
+	if err != nil {
+		return err
+	}
+	var projects []string
+	for rows.Next() {
+		var project string
+		if err := rows.Scan(&project); err != nil {
+			return closeRowsWithError(rows, err)
+		}
+		projects = append(projects, project)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, project := range projects {
+		// Fast path: if the project is already fully backfilled, skip the write tx entirely.
+		needs, err := s.projectNeedsBackfill(project)
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
-
-		var projects []string
-		for rows.Next() {
-			var project string
-			if err := rows.Scan(&project); err != nil {
-				return err
-			}
-			projects = append(projects, project)
+		if !needs {
+			continue
 		}
-		if err := rows.Err(); err != nil {
+		if err := s.withTx(func(tx *sql.Tx) error {
+			return s.backfillProjectSyncMutationsTx(tx, project)
+		}); err != nil {
 			return err
 		}
-
-		for _, project := range projects {
-			if err := s.backfillProjectSyncMutationsTx(tx, project); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func (s *SQLiteStore) backfillSessionSyncMutationsTx(tx *sql.Tx, project string) error {
 	rows, err := s.queryItHook(tx, `
-		SELECT id, project, directory, ended_at, summary
+		SELECT id, project, directory, started_at, ended_at, summary
 		FROM sessions
 		WHERE project = ?
 		  AND NOT EXISTS (
@@ -2775,85 +5063,332 @@ func (s *SQLiteStore) backfillSessionSyncMutationsTx(tx *sql.Tx, project string)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
+	// Phase 1: collect all missing sessions into memory before any INSERT.
+	// Keeping the cursor open while inserting into sync_mutations causes SQLite
+	// to re-evaluate the NOT EXISTS subquery against the in-progress write set,
+	// which can produce an O(N*M) busy loop on large stores.
+	var pending []syncSessionPayload
 	for rows.Next() {
 		var payload syncSessionPayload
-		if err := rows.Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.EndedAt, &payload.Summary); err != nil {
-			return err
+		if err := rows.Scan(&payload.ID, &payload.Project, &payload.Directory, &payload.StartedAt, &payload.EndedAt, &payload.Summary); err != nil {
+			return closeRowsWithError(rows, err)
 		}
+		pending = append(pending, payload)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Phase 2: insert now that the read cursor is closed.
+	for _, payload := range pending {
 		if err := s.enqueueSyncMutationTx(tx, SyncEntitySession, payload.ID, SyncOpUpsert, payload); err != nil {
 			return err
 		}
 	}
-	return rows.Err()
+	return nil
 }
 
 func (s *SQLiteStore) backfillObservationSyncMutationsTx(tx *sql.Tx, project string) error {
+	// ── Live observations ─────────────────────────────────────────────────────
 	rows, err := s.queryItHook(tx, `
-		SELECT sync_id, session_id, type, title, content, tool_name, project, scope, topic_key
-		FROM observations
-		WHERE ifnull(project, '') = ?
+		SELECT o.sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project, o.scope, o.topic_key,
+		       o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at
+		FROM observations o
+		LEFT JOIN sessions s ON s.id = o.session_id
+		WHERE (
+			ifnull(o.project, '') = ?
+			OR (ifnull(o.project, '') = '' AND ifnull(s.project, '') = ?)
+		)
 		  AND deleted_at IS NULL
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM sync_mutations sm
 			WHERE sm.target_key = ?
 			  AND sm.entity = ?
-			  AND sm.entity_key = observations.sync_id
+			  AND sm.entity_key = o.sync_id
 			  AND sm.source = ?
 		  )
-		ORDER BY id ASC`,
-		project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal,
+		ORDER BY o.id ASC`,
+		project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal,
 	)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
+	// Phase 1: collect live observations before any INSERT.
+	var pending []syncObservationPayload
 	for rows.Next() {
 		var payload syncObservationPayload
-		if err := rows.Scan(&payload.SyncID, &payload.SessionID, &payload.Type, &payload.Title, &payload.Content, &payload.ToolName, &payload.Project, &payload.Scope, &payload.TopicKey); err != nil {
-			return err
+		if err := rows.Scan(
+			&payload.SyncID,
+			&payload.SessionID,
+			&payload.Type,
+			&payload.Title,
+			&payload.Content,
+			&payload.ToolName,
+			&payload.Project,
+			&payload.Scope,
+			&payload.TopicKey,
+			&payload.RevisionCount,
+			&payload.DuplicateCount,
+			&payload.LastSeenAt,
+			&payload.CreatedAt,
+			&payload.UpdatedAt,
+		); err != nil {
+			return closeRowsWithError(rows, err)
 		}
+		pending = append(pending, payload)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Phase 2: insert live observation mutations.
+	for _, payload := range pending {
 		if err := s.enqueueSyncMutationTx(tx, SyncEntityObservation, payload.SyncID, SyncOpUpsert, payload); err != nil {
 			return err
 		}
 	}
-	return rows.Err()
-}
 
-func (s *SQLiteStore) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error {
-	rows, err := s.queryItHook(tx, `
-		SELECT sync_id, session_id, content, project
-		FROM user_prompts
-		WHERE ifnull(project, '') = ?
+	// ── Deleted observations ──────────────────────────────────────────────────
+	deletedRows, err := s.queryItHook(tx, `
+		SELECT o.sync_id, o.session_id, o.project, o.deleted_at
+		FROM observations o
+		LEFT JOIN sessions s ON s.id = o.session_id
+		WHERE (
+			ifnull(o.project, '') = ?
+			OR (ifnull(o.project, '') = '' AND ifnull(s.project, '') = ?)
+		)
+		  AND o.deleted_at IS NOT NULL
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM sync_mutations sm
 			WHERE sm.target_key = ?
 			  AND sm.entity = ?
-			  AND sm.entity_key = user_prompts.sync_id
+			  AND sm.entity_key = o.sync_id
+			  AND sm.op = ?
 			  AND sm.source = ?
 		  )
-		ORDER BY id ASC`,
-		project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal,
+		ORDER BY o.id ASC`,
+		project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, SyncSourceLocal,
 	)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
-	for rows.Next() {
-		var payload syncPromptPayload
-		if err := rows.Scan(&payload.SyncID, &payload.SessionID, &payload.Content, &payload.Project); err != nil {
+	// Phase 1: collect deleted observations before any INSERT.
+	var deletedPending []syncObservationPayload
+	for deletedRows.Next() {
+		var payload syncObservationPayload
+		if err := deletedRows.Scan(&payload.SyncID, &payload.SessionID, &payload.Project, &payload.DeletedAt); err != nil {
+			return closeRowsWithError(deletedRows, err)
+		}
+		payload.Deleted = true
+		payload.HardDelete = false
+		deletedPending = append(deletedPending, payload)
+	}
+	if err := deletedRows.Close(); err != nil {
+		return err
+	}
+	if err := deletedRows.Err(); err != nil {
+		return err
+	}
+
+	// Phase 2: insert deleted observation mutations.
+	for _, payload := range deletedPending {
+		if err := s.enqueueSyncMutationTx(tx, SyncEntityObservation, payload.SyncID, SyncOpDelete, payload); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (s *SQLiteStore) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error {
+	// ── Live prompts ──────────────────────────────────────────────────────────
+	rows, err := s.queryItHook(tx, `
+		SELECT p.sync_id, p.session_id, p.content, p.project, p.created_at
+		FROM user_prompts p
+		LEFT JOIN sessions s ON s.id = p.session_id
+		WHERE (
+			ifnull(p.project, '') = ?
+			OR (ifnull(p.project, '') = '' AND ifnull(s.project, '') = ?)
+		)
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM sync_mutations sm
+			WHERE sm.target_key = ?
+			  AND sm.entity = ?
+			  AND sm.entity_key = p.sync_id
+			  AND sm.source = ?
+		  )
+		ORDER BY p.id ASC`,
+		project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Phase 1: collect live prompts before any INSERT.
+	var pending []syncPromptPayload
+	for rows.Next() {
+		var payload syncPromptPayload
+		if err := rows.Scan(&payload.SyncID, &payload.SessionID, &payload.Content, &payload.Project, &payload.CreatedAt); err != nil {
+			return closeRowsWithError(rows, err)
+		}
+		pending = append(pending, payload)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Phase 2: insert live prompt mutations.
+	for _, payload := range pending {
 		if err := s.enqueueSyncMutationTx(tx, SyncEntityPrompt, payload.SyncID, SyncOpUpsert, payload); err != nil {
 			return err
 		}
 	}
-	return rows.Err()
+
+	// ── Tombstoned prompts ────────────────────────────────────────────────────
+	tombstoneRows, err := s.queryItHook(tx, `
+		SELECT prompt_tombstones.sync_id, prompt_tombstones.session_id, prompt_tombstones.project, prompt_tombstones.deleted_at
+		FROM prompt_tombstones
+		LEFT JOIN sessions s ON s.id = prompt_tombstones.session_id
+		WHERE (
+			ifnull(prompt_tombstones.project, '') = ?
+			OR (ifnull(prompt_tombstones.project, '') = '' AND ifnull(s.project, '') = ?)
+		)
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM sync_mutations sm
+			WHERE sm.target_key = ?
+			  AND sm.entity = ?
+			  AND sm.entity_key = prompt_tombstones.sync_id
+			  AND sm.source = ?
+			  AND sm.op = ?
+		  )
+		ORDER BY deleted_at ASC`,
+		project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal, SyncOpDelete,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Phase 1: collect tombstones before any INSERT.
+	var tombstonePending []syncPromptPayload
+	for tombstoneRows.Next() {
+		var payload syncPromptPayload
+		if err := tombstoneRows.Scan(&payload.SyncID, &payload.SessionID, &payload.Project, &payload.DeletedAt); err != nil {
+			return closeRowsWithError(tombstoneRows, err)
+		}
+		payload.Deleted = true
+		payload.HardDelete = true
+		tombstonePending = append(tombstonePending, payload)
+	}
+	if err := tombstoneRows.Close(); err != nil {
+		return err
+	}
+	if err := tombstoneRows.Err(); err != nil {
+		return err
+	}
+
+	// Phase 2: insert tombstone mutations.
+	for _, payload := range tombstonePending {
+		if err := s.enqueueSyncMutationTx(tx, SyncEntityPrompt, payload.SyncID, SyncOpDelete, payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backfillRelationSyncMutationsTx creates sync_mutations rows for non-orphaned
+// relations that have no corresponding local sync_mutations row.
+//
+// This fills the cloud-journal gap described in issue #496: a relation can exist
+// in memory_relations with no sync_mutations row and therefore never replicates.
+//
+// Design mirrors backfillObservationSyncMutationsTx exactly:
+//   - Phase 1: collect all missing rows into a slice (close cursor first).
+//   - Phase 2: insert, avoiding the SQLite cursor-open-during-write busy loop.
+//
+// The SELECT mirrors ExportRelationMutations' join/orphan-filter structure
+// (join both observations, exclude orphaned status, exclude rows that already
+// have a local upsert mutation), but scopes by source-observation project only.
+// ExportRelationMutations additionally filters by tgt.project; the backfill
+// intentionally omits that filter to avoid skipping cross-project edges where
+// only the source belongs to this project.
+func (s *SQLiteStore) backfillRelationSyncMutationsTx(tx *sql.Tx, project string) error {
+	// Only backfill fully-judged relations: exclude orphaned/pending and any row
+	// that is missing marked_by_actor or marked_by_kind.  Cloud validation
+	// (chunkcodec + server) hard-rejects mutations without those fields (HTTP 400),
+	// so enqueueing them would block the entire sync batch.
+	// This predicate must stay identical to the COUNT in projectNeedsBackfill.
+	rows, err := s.queryItHook(tx, `
+		SELECT r.sync_id, r.source_id, r.target_id, r.relation, r.reason, r.evidence, r.confidence,
+		       r.judgment_status, r.marked_by_actor, r.marked_by_kind, r.marked_by_model,
+		       r.session_id,
+		       coalesce(nullif(src.project, ''), src_s.project, ''),
+		       r.created_at, r.updated_at
+		FROM memory_relations r
+		JOIN observations src ON src.sync_id = r.source_id AND src.deleted_at IS NULL
+		JOIN observations tgt ON tgt.sync_id = r.target_id AND tgt.deleted_at IS NULL
+		LEFT JOIN sessions src_s ON src_s.id = src.session_id
+		WHERE r.judgment_status NOT IN (?, ?)
+		  AND ifnull(r.marked_by_actor, '') != ''
+		  AND ifnull(r.marked_by_kind, '') != ''
+		  AND coalesce(nullif(src.project, ''), src_s.project, '') = ?
+		  AND NOT EXISTS (
+		    SELECT 1 FROM sync_mutations sm
+		    WHERE sm.target_key = ?
+		      AND sm.entity = ?
+		      AND sm.entity_key = r.sync_id
+		      AND sm.source = ?
+		  )
+		ORDER BY r.created_at ASC, r.sync_id ASC`,
+		JudgmentStatusOrphaned, JudgmentStatusPending,
+		project,
+		DefaultSyncTargetKey, SyncEntityRelation, SyncSourceLocal,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Phase 1: collect into memory before any INSERT to avoid cursor-open-during-write.
+	var pending []syncRelationPayload
+	for rows.Next() {
+		var p syncRelationPayload
+		if err := rows.Scan(
+			&p.SyncID, &p.SourceID, &p.TargetID, &p.Relation, &p.Reason, &p.Evidence, &p.Confidence,
+			&p.JudgmentStatus, &p.MarkedByActor, &p.MarkedByKind, &p.MarkedByModel,
+			&p.SessionID, &p.Project, &p.CreatedAt, &p.UpdatedAt,
+		); err != nil {
+			return closeRowsWithError(rows, err)
+		}
+		pending = append(pending, p)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Phase 2: insert now that the read cursor is closed.
+	for _, p := range pending {
+		if err := s.enqueueSyncMutationTx(tx, SyncEntityRelation, p.SyncID, SyncOpUpsert, p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *SQLiteStore) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op string, payload any) error {
@@ -2862,6 +5397,17 @@ func (s *SQLiteStore) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op st
 		return err
 	}
 	project := extractProjectFromPayload(payload)
+	project, _ = NormalizeProject(strings.TrimSpace(project))
+	if project == "" {
+		sessionID := extractSessionIDFromPayload(payload)
+		if sessionID != "" {
+			if derived, err := s.resolveSessionProjectTx(tx, sessionID); err != nil {
+				return err
+			} else {
+				project = derived
+			}
+		}
+	}
 	if _, err := s.execHook(tx,
 		`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
 		DefaultSyncTargetKey, SyncLifecycleIdle,
@@ -2886,25 +5432,118 @@ func (s *SQLiteStore) enqueueSyncMutationTx(tx *sql.Tx, entity, entityKey, op st
 		 WHERE target_key = ?`,
 		SyncLifecyclePending, seq, DefaultSyncTargetKey,
 	)
+	if err != nil {
+		return err
+	}
+	if project == "" {
+		return nil
+	}
+	projectTargetKey := syncTargetKeyForProject(project)
+	if _, err := s.execHook(tx,
+		`INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES (?, ?, datetime('now'))`,
+		projectTargetKey, SyncLifecycleIdle,
+	); err != nil {
+		return err
+	}
+	_, err = s.execHook(tx,
+		`UPDATE sync_state
+		 SET lifecycle = ?, last_enqueued_seq = ?, updated_at = datetime('now')
+		 WHERE target_key = ?`,
+		SyncLifecyclePending, seq, projectTargetKey,
+	)
 	return err
 }
 
+func syncTargetKeyForProject(project string) string {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return DefaultSyncTargetKey
+	}
+	return fmt.Sprintf("%s:%s", DefaultSyncTargetKey, project)
+}
+
+func extractSessionIDFromPayload(payload any) string {
+	switch p := payload.(type) {
+	case syncObservationPayload:
+		return strings.TrimSpace(p.SessionID)
+	case syncPromptPayload:
+		return strings.TrimSpace(p.SessionID)
+	default:
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return ""
+		}
+		var generic struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(data, &generic); err != nil {
+			return ""
+		}
+		return strings.TrimSpace(generic.SessionID)
+	}
+}
+
+func (s *SQLiteStore) resolveSessionProjectTx(tx *sql.Tx, sessionID string) (string, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return "", nil
+	}
+	var project string
+	err := tx.QueryRow(`SELECT ifnull(project, '') FROM sessions WHERE id = ?`, sessionID).Scan(&project)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	project, _ = NormalizeProject(strings.TrimSpace(project))
+	return project, nil
+}
+
+// applyRelationUpsertTx handles a pulled mutation with entity='relation' and
+// op='upsert'. It implements the pull-side behavior for Phase 2:
+//
+//  1. JSON-decode the payload into syncRelationPayload. Decode errors return
+//     ErrApplyDead (non-retryable).
+//  2. Verify both source and target observations exist locally by sync_id.
+//     If either is missing, return ErrRelationFKMissing. The caller must write
+//     the raw mutation to sync_apply_deferred and ACK the seq.
+//  3. INSERT INTO memory_relations with ON CONFLICT(sync_id) DO UPDATE
+//     (last-write-wins, preserving the original created_at).
+//  4. On successful apply, DELETE any pre-existing deferred row for this sync_id
+//     so it is not retried unnecessarily.
+
+// Step 1: decode payload.
+
+// Step 1b: required field validation — missing source_id or target_id is not
+// a retryable FK miss; it is a permanent payload defect (ErrApplyDead).
+
+// Step 2: FK precondition — both observations must exist locally (by sync_id).
+
+// Step 3: upsert into memory_relations keyed on sync_id (idempotent re-apply).
+
+// Step 4: clean up deferred row if one exists (resolves any prior FK-miss deferral).
+
+// extractProjectFromPayload returns the project string from a sync payload struct.
+// It handles both string and *string Project fields across all entity payload types.
+// Returns empty string if the payload has no project or project is nil.
+
+// Fallback: marshal to JSON and extract $.project via json.Unmarshal.
+
 func (s *SQLiteStore) getObservationTx(tx *sql.Tx, id int64) (*Observation, error) {
 	row := tx.QueryRow(
-		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		`SELECT `+observationSelectColumns+`
 		 FROM observations WHERE id = ? AND deleted_at IS NULL`, id,
 	)
 	var o Observation
-	if err := row.Scan(&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content, &o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt); err != nil {
+	if err := scanObservationRowSQLite(row, &o); err != nil {
 		return nil, err
 	}
 	return &o, nil
 }
 
 func (s *SQLiteStore) getObservationBySyncIDTx(tx *sql.Tx, syncID string, includeDeleted bool) (*Observation, error) {
-	query := `SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+	query := `SELECT ` + observationSelectColumns + `
 		 FROM observations WHERE sync_id = ?`
 	if !includeDeleted {
 		query += ` AND deleted_at IS NULL`
@@ -2912,44 +5551,126 @@ func (s *SQLiteStore) getObservationBySyncIDTx(tx *sql.Tx, syncID string, includ
 	query += ` ORDER BY id DESC LIMIT 1`
 	row := tx.QueryRow(query, syncID)
 	var o Observation
-	if err := row.Scan(&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content, &o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt); err != nil {
+	if err := scanObservationRowSQLite(row, &o); err != nil {
 		return nil, err
 	}
 	return &o, nil
 }
 
 func (s *SQLiteStore) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) error {
+	if isSessionDeletePayload(payload) {
+		return s.applySessionDeleteTx(tx, payload)
+	}
 	_, err := s.execHook(tx,
-		`INSERT INTO sessions (id, project, directory, ended_at, summary)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO sessions (id, project, directory, started_at, ended_at, summary)
+		 VALUES (?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')), ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   project = excluded.project,
 		   directory = excluded.directory,
+		   started_at = COALESCE(NULLIF(excluded.started_at, ''), sessions.started_at),
 		   ended_at = COALESCE(excluded.ended_at, sessions.ended_at),
 		   summary = COALESCE(excluded.summary, sessions.summary)`,
-		payload.ID, payload.Project, payload.Directory, payload.EndedAt, payload.Summary,
+		payload.ID, payload.Project, payload.Directory, strings.TrimSpace(payload.StartedAt), payload.EndedAt, payload.Summary,
 	)
 	return err
 }
 
+func isSessionDeletePayload(payload syncSessionPayload) bool {
+	if payload.Deleted || payload.HardDelete {
+		return true
+	}
+	if payload.DeletedAt == nil {
+		return false
+	}
+	return strings.TrimSpace(*payload.DeletedAt) != ""
+}
+
+func (s *SQLiteStore) applySessionDeleteTx(tx *sql.Tx, payload syncSessionPayload) error {
+	sessionID := strings.TrimSpace(payload.ID)
+	if sessionID == "" {
+		return nil
+	}
+	if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE session_id = ?`, sessionID); err != nil {
+		return err
+	}
+	_, err := s.execHook(tx, `DELETE FROM sessions WHERE id = ?`, sessionID)
+	return err
+}
+
 func (s *SQLiteStore) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayload) error {
+	revisionCount := maxInt(payload.RevisionCount, 1)
+	duplicateCount := maxInt(payload.DuplicateCount, 1)
+	createdAt := strings.TrimSpace(payload.CreatedAt)
+	updatedAt := strings.TrimSpace(payload.UpdatedAt)
+	if createdAt == "" {
+		createdAt = Now()
+	}
+	if updatedAt == "" {
+		updatedAt = createdAt
+	}
+
 	existing, err := s.getObservationBySyncIDTx(tx, payload.SyncID, true)
 	if err == sql.ErrNoRows {
 		_, err = s.execHook(tx,
-			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, updated_at, deleted_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), NULL)`,
-			payload.SyncID, payload.SessionID, payload.Type, payload.Title, payload.Content, payload.ToolName, payload.Project, normalizeScope(payload.Scope), payload.TopicKey, hashNormalized(payload.Content),
+			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+			payload.SyncID,
+			payload.SessionID,
+			payload.Type,
+			payload.Title,
+			payload.Content,
+			payload.ToolName,
+			payload.Project,
+			normalizeScope(payload.Scope),
+			payload.TopicKey,
+			hashNormalized(payload.Content),
+			revisionCount,
+			duplicateCount,
+			payload.LastSeenAt,
+			createdAt,
+			updatedAt,
 		)
 		return err
 	}
 	if err != nil {
 		return err
 	}
+
+	if payload.RevisionCount <= 0 {
+		revisionCount = maxInt(existing.RevisionCount, 1)
+	}
+	if payload.DuplicateCount <= 0 {
+		duplicateCount = maxInt(existing.DuplicateCount, 1)
+	}
+	if payload.LastSeenAt == nil {
+		payload.LastSeenAt = existing.LastSeenAt
+	}
+	if strings.TrimSpace(payload.CreatedAt) == "" {
+		createdAt = existing.CreatedAt
+	}
+	if strings.TrimSpace(payload.UpdatedAt) == "" {
+		updatedAt = existing.UpdatedAt
+	}
+
 	_, err = s.execHook(tx,
 		`UPDATE observations
-		 SET session_id = ?, type = ?, title = ?, content = ?, tool_name = ?, project = ?, scope = ?, topic_key = ?, normalized_hash = ?, revision_count = revision_count + 1, updated_at = datetime('now'), deleted_at = NULL
+		 SET session_id = ?, type = ?, title = ?, content = ?, tool_name = ?, project = ?, scope = ?, topic_key = ?, normalized_hash = ?, revision_count = ?, duplicate_count = ?, last_seen_at = ?, created_at = ?, updated_at = ?, deleted_at = NULL
 		 WHERE id = ?`,
-		payload.SessionID, payload.Type, payload.Title, payload.Content, payload.ToolName, payload.Project, normalizeScope(payload.Scope), payload.TopicKey, hashNormalized(payload.Content), existing.ID,
+		payload.SessionID,
+		payload.Type,
+		payload.Title,
+		payload.Content,
+		payload.ToolName,
+		payload.Project,
+		normalizeScope(payload.Scope),
+		payload.TopicKey,
+		hashNormalized(payload.Content),
+		revisionCount,
+		duplicateCount,
+		payload.LastSeenAt,
+		createdAt,
+		updatedAt,
+		existing.ID,
 	)
 	return err
 }
@@ -2979,23 +5700,107 @@ func (s *SQLiteStore) applyObservationDeleteTx(tx *sql.Tx, payload syncObservati
 }
 
 func (s *SQLiteStore) applyPromptUpsertTx(tx *sql.Tx, payload syncPromptPayload) error {
+	var tombstoneDeletedAt string
+	err := tx.QueryRow(`SELECT deleted_at FROM prompt_tombstones WHERE sync_id = ?`, payload.SyncID).Scan(&tombstoneDeletedAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		if isStalePromptUpsert(payload, tombstoneDeletedAt) {
+			return nil
+		}
+		if _, err := s.execHook(tx, `DELETE FROM prompt_tombstones WHERE sync_id = ?`, payload.SyncID); err != nil {
+			return err
+		}
+	}
+
 	var existingID int64
-	err := tx.QueryRow(`SELECT id FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`, payload.SyncID).Scan(&existingID)
+	err = tx.QueryRow(`SELECT id FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`, payload.SyncID).Scan(&existingID)
 	if err == sql.ErrNoRows {
-		_, err = s.execHook(tx,
-			`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`,
-			payload.SyncID, payload.SessionID, payload.Content, payload.Project,
-		)
+		if strings.TrimSpace(payload.CreatedAt) == "" {
+			_, err = s.execHook(tx,
+				`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`,
+				payload.SyncID, payload.SessionID, payload.Content, payload.Project,
+			)
+		} else {
+			_, err = s.execHook(tx,
+				`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at) VALUES (?, ?, ?, ?, ?)`,
+				payload.SyncID, payload.SessionID, payload.Content, payload.Project, payload.CreatedAt,
+			)
+		}
 		return err
 	}
 	if err != nil {
 		return err
 	}
 	_, err = s.execHook(tx,
-		`UPDATE user_prompts SET session_id = ?, content = ?, project = ? WHERE id = ?`,
-		payload.SessionID, payload.Content, payload.Project, existingID,
+		`UPDATE user_prompts
+		 SET session_id = ?,
+		     content = ?,
+		     project = ?,
+		     created_at = CASE WHEN ? = '' THEN created_at ELSE ? END
+		 WHERE id = ?`,
+		payload.SessionID, payload.Content, payload.Project, strings.TrimSpace(payload.CreatedAt), payload.CreatedAt, existingID,
 	)
 	return err
+}
+
+func (s *SQLiteStore) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error {
+	if strings.TrimSpace(payload.SyncID) == "" {
+		return nil
+	}
+	if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE sync_id = ?`, payload.SyncID); err != nil {
+		return err
+	}
+	deletedAt := payload.DeletedAt
+	if deletedAt == nil || strings.TrimSpace(*deletedAt) == "" {
+		now := Now()
+		deletedAt = &now
+	}
+	_, err := s.execHook(tx,
+		`INSERT INTO prompt_tombstones (sync_id, session_id, project, deleted_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(sync_id) DO UPDATE SET session_id = excluded.session_id, project = excluded.project, deleted_at = excluded.deleted_at`,
+		payload.SyncID, payload.SessionID, payload.Project, *deletedAt,
+	)
+	return err
+}
+
+func isStalePromptUpsert(payload syncPromptPayload, tombstoneDeletedAt string) bool {
+	upsertTime := normalizeComparableTimestamp(payload.CreatedAt)
+	if strings.TrimSpace(upsertTime) == "" {
+		return true
+	}
+	return upsertTime <= normalizeComparableTimestamp(tombstoneDeletedAt)
+}
+
+func normalizeComparableTimestamp(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if parsed, err := time.Parse(time.RFC3339, trimmed); err == nil {
+		return parsed.UTC().Format("2006-01-02 15:04:05")
+	}
+	return trimmed
+}
+
+func parseObservationTime(value string) (time.Time, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return time.Time{}, fmt.Errorf("empty timestamp")
+	}
+	formats := []string{"2006-01-02 15:04:05", time.RFC3339, time.RFC3339Nano, "2006-01-02"}
+	for _, layout := range formats {
+		if parsed, err := time.Parse(layout, trimmed); err == nil {
+			return parsed.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unsupported timestamp %q", value)
+}
+
+type observationScanner interface {
+	Scan(dest ...any) error
 }
 
 func (s *SQLiteStore) queryObservations(query string, args ...any) ([]Observation, error) {
@@ -3008,11 +5813,7 @@ func (s *SQLiteStore) queryObservations(query string, args ...any) ([]Observatio
 	var results []Observation
 	for rows.Next() {
 		var o Observation
-		if err := rows.Scan(
-			&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-			&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
-			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
-		); err != nil {
+		if err := scanObservationRowSQLite(rows, &o); err != nil {
 			return nil, err
 		}
 		results = append(results, o)
@@ -3025,7 +5826,6 @@ func (s *SQLiteStore) addColumnIfNotExists(tableName, columnName, definition str
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
 	for rows.Next() {
 		var cid int
@@ -3034,13 +5834,18 @@ func (s *SQLiteStore) addColumnIfNotExists(tableName, columnName, definition str
 		var defaultValue any
 		var pk int
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			return err
+			return closeRowsWithError(rows, err)
 		}
 		if name == columnName {
+			rows.Close()
 			return nil
 		}
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
 		return err
 	}
 
@@ -3048,12 +5853,100 @@ func (s *SQLiteStore) addColumnIfNotExists(tableName, columnName, definition str
 	return err
 }
 
+func (s *SQLiteStore) migrateSyncChunksTable() error {
+	rows, err := s.queryItHook(s.db, "PRAGMA table_info(sync_chunks)")
+	if err != nil {
+		return err
+	}
+
+	hasTargetKey := false
+	targetKeyPK := 0
+	chunkIDPK := 0
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return closeRowsWithError(rows, err)
+		}
+		switch name {
+		case "target_key":
+			hasTargetKey = true
+			targetKeyPK = pk
+		case "chunk_id":
+			chunkIDPK = pk
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	// Already migrated: composite PK (target_key, chunk_id).
+	if hasTargetKey && targetKeyPK == 1 && chunkIDPK == 2 {
+		return nil
+	}
+
+	tx, err := s.beginTxHook()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := s.execHook(tx, `
+		CREATE TABLE IF NOT EXISTS sync_chunks_new (
+			target_key  TEXT NOT NULL DEFAULT 'local',
+			chunk_id    TEXT NOT NULL,
+			imported_at TEXT NOT NULL DEFAULT (datetime('now')),
+			PRIMARY KEY (target_key, chunk_id)
+		)
+	`); err != nil {
+		return err
+	}
+
+	if hasTargetKey {
+		if _, err := s.execHook(tx, `
+			INSERT OR IGNORE INTO sync_chunks_new (target_key, chunk_id, imported_at)
+			SELECT CASE
+				WHEN trim(ifnull(target_key, '')) = '' THEN ?
+				ELSE trim(target_key)
+			END,
+			chunk_id,
+			imported_at
+			FROM sync_chunks
+		`, LocalChunkTargetKey); err != nil {
+			return err
+		}
+	} else {
+		if _, err := s.execHook(tx, `
+			INSERT OR IGNORE INTO sync_chunks_new (target_key, chunk_id, imported_at)
+			SELECT ?, chunk_id, imported_at
+			FROM sync_chunks
+		`, LocalChunkTargetKey); err != nil {
+			return err
+		}
+	}
+
+	if _, err := s.execHook(tx, `DROP TABLE sync_chunks`); err != nil {
+		return err
+	}
+	if _, err := s.execHook(tx, `ALTER TABLE sync_chunks_new RENAME TO sync_chunks`); err != nil {
+		return err
+	}
+
+	return s.commitHook(tx)
+}
+
 func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 	rows, err := s.queryItHook(s.db, "PRAGMA table_info(observations)")
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
 	var hasID bool
 	var idIsPrimaryKey bool
@@ -3064,7 +5957,7 @@ func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 		var defaultValue any
 		var pk int
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			return err
+			return closeRowsWithError(rows, err)
 		}
 		if name == "id" {
 			hasID = true
@@ -3073,6 +5966,10 @@ func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 		}
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
 		return err
 	}
 
@@ -3107,6 +6004,7 @@ func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 			revision_count INTEGER NOT NULL DEFAULT 1,
 			duplicate_count INTEGER NOT NULL DEFAULT 1,
 			last_seen_at TEXT,
+			pinned     BOOLEAN NOT NULL DEFAULT 0,
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,
@@ -3121,7 +6019,7 @@ func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 		INSERT INTO observations_migrated (
 			id, sync_id, session_id, type, title, content, tool_name, project,
 			scope, topic_key, normalized_hash, revision_count, duplicate_count,
-			last_seen_at, created_at, updated_at, deleted_at, created_by
+			last_seen_at, pinned, created_at, updated_at, deleted_at, created_by
 		)
 		SELECT
 			CASE
@@ -3142,6 +6040,7 @@ func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 			CASE WHEN revision_count IS NULL OR revision_count < 1 THEN 1 ELSE revision_count END,
 			CASE WHEN duplicate_count IS NULL OR duplicate_count < 1 THEN 1 ELSE duplicate_count END,
 			last_seen_at,
+			0,
 			COALESCE(NULLIF(created_at, ''), datetime('now')),
 			COALESCE(NULLIF(updated_at, ''), NULLIF(created_at, ''), datetime('now')),
 			deleted_at,
@@ -3190,6 +6089,20 @@ func (s *SQLiteStore) migrateLegacyObservationsTable() error {
 	return nil
 }
 
+// NormalizeProject applies canonical project name normalization:
+// lowercase + trim whitespace + collapse consecutive hyphens/underscores.
+// Returns the normalized name and a warning message if the name was changed
+// (empty string if no change was needed).
+// Exported so MCP and CLI handlers can surface the warning to users.
+
+// Collapse multiple consecutive hyphens
+
+// Collapse multiple consecutive underscores
+
+// SuggestTopicKey generates a stable topic key suggestion from type/title/content.
+// It infers a topic family (e.g. architecture/*, bug/*) and then appends
+// a normalized segment from title/content for stable cross-session keys.
+
 func dedupeWindowExpression(window time.Duration) string {
 	if window <= 0 {
 		window = 15 * time.Minute
@@ -3200,6 +6113,65 @@ func dedupeWindowExpression(window time.Duration) string {
 	}
 	return "-" + strconv.Itoa(minutes) + " minutes"
 }
+
+func normalizeChunkTargetKey(targetKey string) string {
+	if strings.TrimSpace(targetKey) == "" {
+		return LocalChunkTargetKey
+	}
+	return strings.TrimSpace(strings.ToLower(targetKey))
+}
+
+// privateTagRegex matches <private>...</private> tags and their contents.
+// Supports multiline and nested content. Case-insensitive.
+
+// stripPrivateTags removes all <private>...</private> content from a string.
+// This ensures sensitive information (API keys, passwords, personal data)
+// is never persisted to the memory database.
+
+// Clean up multiple consecutive [REDACTED] and excessive whitespace
+
+// sanitizeFTS wraps each word in quotes so FTS5 doesn't choke on special chars.
+// "fix auth bug" → `"fix" "auth" "bug"`
+
+// Strip existing quotes to avoid double-quoting
+
+// Double interior double-quotes: FTS5 escapes a literal " inside a
+// quoted phrase by doubling it (""). Without this, `hello"world`
+// becomes `"hello"world"` — an unterminated string literal that crashes
+// the query with "SQL logic error: unterminated string". See #574.
+
+// ─── Passive Capture ─────────────────────────────────────────────────────────
+
+// PassiveCaptureParams holds the input for passive memory capture.
+
+// e.g. "subagent-stop", "session-end"
+
+// PassiveCaptureResult holds the output of passive memory capture.
+
+// Total learnings found in text
+// New observations created
+// Skipped because already existed
+
+// learningHeaderPattern matches section headers for learnings in both English and Spanish.
+
+// ExtractLearnings parses structured learning items from text.
+// It looks for sections like "## Key Learnings:" or "## Aprendizajes Clave:"
+// and extracts numbered (1. text) or bullet (- text) items.
+// Returns learnings from the LAST matching section (most recent output).
+
+// Process sections in reverse — use first valid one (most recent)
+
+// Cut off at next major section header
+
+// Try numbered items: "1. text" or "1) text"
+
+// Fall back to bullet items: "- text" or "* text"
+
+// cleanMarkdown strips basic markdown formatting and collapses whitespace.
+
+// bold
+// inline code
+// italic
 
 // PassiveCapture extracts learnings from text and saves them as observations.
 // It deduplicates against existing observations using content hash matching.
@@ -3326,6 +6298,133 @@ func (s *SQLiteStore) ListProjects(includeDeprecated bool) ([]ProjectStats, erro
 		results = append(results, ps)
 	}
 	return results, rows.Err()
+}
+
+// ─── Test-accessor helpers (REQ-009 / Phase G integration tests) ──────────────
+
+// CountRelationSyncMutations returns the number of sync_mutations rows whose
+// entity is NOT 'session', 'observation', or 'prompt'. Used by integration
+// tests to verify the enrollment gate: an UNENROLLED project must never enqueue
+// relation sync mutations (the enqueue in JudgeBySemantic/JudgeRelation is
+// guarded by an enrollment check). The test that calls this uses an unenrolled
+// store, so the count must remain zero.
+//
+// Note: relation sync mutations ARE valid for enrolled projects (#313/#379/#383
+// enabled cloud relation sync; #496 extends it with backfill). This function
+// is not a blanket "relations are local-only" check — it is an enrollment-gate
+// regression guard scoped to the unenrolled test context that uses it.
+func (s *SQLiteStore) CountRelationSyncMutations() (int, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT count(*)
+		FROM sync_mutations
+		WHERE entity NOT IN ('session', 'observation', 'prompt')
+	`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("CountRelationSyncMutations: %w", err)
+	}
+	return count, nil
+}
+
+// ─── Phase E: sync_apply_deferred helpers ────────────────────────────────────
+
+// ReplayDeferredResult holds counts returned by ReplayDeferred.
+
+// ReplayDeferred retries all rows in sync_apply_deferred with apply_status='deferred'
+// (up to 50 per call, ordered by first_seen_at). For each row:
+//   - Calls applyPulledMutationTx inside a transaction.
+//   - On success: the apply itself deletes the deferred row (applyRelationUpsertTx
+//     already includes DELETE FROM sync_apply_deferred on success path).
+//   - On ErrRelationFKMissing: increments retry_count; if retry_count reaches 5,
+//     marks apply_status='dead'. Otherwise updates last_error + last_attempted_at.
+//   - On ErrApplyDead or other decode errors: marks apply_status='dead'.
+//
+// Dead rows are never retried. Idempotent: calling twice in one cycle does not
+// double-retry because successful rows are deleted and failed rows update retry_count
+// in place.
+//
+// Returns counts (retried, succeeded, failed, dead) for caller logging.
+
+// Success: applyRelationUpsertTx already deleted the deferred row.
+
+// Classify the error and update the deferred row.
+
+// Still retryable.
+
+// Dead: either retry cap reached or non-retryable error.
+
+// CountDeferredAndDead returns the count of rows in sync_apply_deferred grouped
+// by apply_status. Only 'deferred' and 'dead' statuses are counted; 'applied'
+// rows (if any) are not included.
+
+// ─── Phase 3: ListDeferred / GetDeferred ─────────────────────────────────────
+
+// ListDeferred returns rows from sync_apply_deferred with optional status filter
+// and pagination. The payload field is decoded to map[string]any; on malformed
+// JSON, PayloadValid is false and PayloadRaw is preserved.
+
+// GetDeferred returns a single row from sync_apply_deferred by sync_id.
+// Returns an error wrapping "not found" when no row exists (matches FindCandidates style).
+
+// scannable is a common interface for *sql.Row and *sql.Rows.Scan.
+type scannable interface {
+	Scan(dest ...any) error
+}
+
+// scanDeferredRow scans a single sync_apply_deferred row into a DeferredRow.
+// The payload is decoded to map[string]any; malformed JSON sets PayloadValid=false.
+func scanDeferredRow(row scannable) (DeferredRow, error) {
+	var r DeferredRow
+	var rawPayload string
+	if err := row.Scan(
+		&r.SyncID, &r.Entity, &rawPayload, &r.ApplyStatus, &r.RetryCount,
+		&r.LastError, &r.LastAttemptedAt, &r.FirstSeenAt,
+	); err != nil {
+		return r, err
+	}
+	r.PayloadRaw = rawPayload
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(rawPayload), &decoded); err == nil {
+		r.Payload = decoded
+		r.PayloadValid = true
+	} else {
+		r.PayloadValid = false
+	}
+	return r, nil
+}
+
+// ListObservationSyncPayloads returns the decoded payloads of all sync_mutations
+// rows whose entity = 'observation'. Used by integration tests to assert that
+// new observation columns (review_after, expires_at, embedding*) are NOT present
+// in the sync wire format in Phase 1 (REQ-009).
+func (s *SQLiteStore) ListObservationSyncPayloads() ([]any, error) {
+	rows, err := s.db.Query(`
+		SELECT payload
+		FROM sync_mutations
+		WHERE entity = 'observation'
+		ORDER BY seq ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListObservationSyncPayloads: query: %w", err)
+	}
+	defer rows.Close()
+
+	var payloads []any
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("ListObservationSyncPayloads: scan: %w", err)
+		}
+		var p syncObservationPayload
+		if err := json.Unmarshal([]byte(raw), &p); err != nil {
+			return nil, fmt.Errorf("ListObservationSyncPayloads: unmarshal: %w", err)
+		}
+		payloads = append(payloads, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListObservationSyncPayloads: rows error: %w", err)
+	}
+	return payloads, nil
 }
 
 // DeprecateProject marks a project as deprecated in project_metadata.
@@ -3473,4 +6572,3 @@ func (s *SQLiteStore) ListContributors(project string) ([]ContributorStats, erro
 
 // Compile-time assertion that *SQLiteStore satisfies the Store interface.
 var _ Store = (*SQLiteStore)(nil)
-

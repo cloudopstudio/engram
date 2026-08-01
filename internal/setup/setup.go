@@ -49,6 +49,7 @@ var (
 	injectOpenCodeMCPFn                = injectOpenCodeMCP
 	injectOpenCodeServerPluginFn       = injectOpenCodeServerPlugin
 	injectOpenCodeTUIPluginFn          = injectOpenCodeTUIPlugin
+	injectOpenCodeSubagentPluginFn     = injectOpenCodeSubagentPlugin
 	installNPMDependenciesFn           = installNPMDependencies
 	injectGeminiMCPFn                  = injectGeminiMCP
 	writeGeminiSystemPromptFn          = writeGeminiSystemPrompt
@@ -57,6 +58,11 @@ var (
 	injectCodexMemoryConfigFn          = injectCodexMemoryConfig
 	addClaudeCodeAllowlistFn           = AddClaudeCodeAllowlist
 	writeClaudeCodeUserMCPFn           = writeClaudeCodeUserMCP
+
+	// resolveMiseNodeVersionFn resolves the active Node version managed by mise.
+	// It runs "mise current node" and returns the result as a "node@X.Y.Z" specifier.
+	// Returns an empty string when the version cannot be determined.
+	resolveMiseNodeVersionFn = resolveMiseNodeVersion
 )
 
 //go:embed plugins/opencode/*
@@ -81,10 +87,11 @@ type Result struct {
 }
 
 const claudeCodeMarketplace = "Gentleman-Programming/engram"
+const codexMarketplace = "Gentleman-Programming/engram"
 
 const openCodeSubagentStatuslinePlugin = "opencode-subagent-statusline"
 
-const piGentleEngramPackage = "npm:gentle-engram@0.1.5"
+const piGentleEngramPackage = "npm:gentle-engram@0.1.8"
 const piMCPAdapterPackage = "npm:pi-mcp-adapter"
 
 // claudeCodeMCPTools are the MCP tool permission names for the agent profile
@@ -239,52 +246,30 @@ After that sentence, summarize:
 Keep it concise and high-signal.`
 
 // SupportedAgents returns the list of agents that have plugins available.
+// The list is derived from the registry (agentAdapters) so adding an agent there
+// surfaces it here and in `engram setup --help` automatically.
 func SupportedAgents() []Agent {
-	return []Agent{
-		{
-			Name:        "opencode",
-			Description: "OpenCode — TypeScript plugin with session tracking, compaction recovery, and Memory Protocol",
-			InstallDir:  openCodePluginDir(),
-		},
-		{
-			Name:        "pi",
-			Description: "Pi — gentle-engram package plus pi-mcp-adapter MCP tools",
-			InstallDir:  piAgentDir(),
-		},
-		{
-			Name:        "claude-code",
-			Description: "Claude Code — Native plugin via marketplace (hooks, skills, MCP, compaction recovery)",
-			InstallDir:  "managed by claude plugin system",
-		},
-		{
-			Name:        "gemini-cli",
-			Description: "Gemini CLI — MCP registration plus system prompt compaction recovery",
-			InstallDir:  geminiConfigPath(),
-		},
-		{
-			Name:        "codex",
-			Description: "Codex — MCP registration plus model/compaction instruction files",
-			InstallDir:  codexConfigPath(),
-		},
+	adapters := agentAdapters()
+	agents := make([]Agent, 0, len(adapters))
+	for _, a := range adapters {
+		agents = append(agents, Agent{
+			Name:        a.slug,
+			Description: a.description,
+			InstallDir:  a.displayDir(),
+		})
 	}
+	return agents
 }
 
-// Install installs the plugin for the given agent.
+// Install installs the plugin for the given agent by looking it up in the
+// registry and running its adapter (a bespoke installer or the generic driver).
 func Install(agentName string) (*Result, error) {
-	switch agentName {
-	case "opencode":
-		return installOpenCode()
-	case "pi":
-		return installPi()
-	case "claude-code":
-		return installClaudeCode()
-	case "gemini-cli":
-		return installGeminiCLI()
-	case "codex":
-		return installCodex()
-	default:
-		return nil, fmt.Errorf("unknown agent: %q (supported: opencode, pi, claude-code, gemini-cli, codex)", agentName)
+	for _, a := range agentAdapters() {
+		if a.slug == agentName {
+			return installFromAdapter(a)
+		}
 	}
+	return nil, fmt.Errorf("unknown agent: %q (supported: %s)", agentName, strings.Join(supportedSlugs(), ", "))
 }
 
 // ─── Pi ──────────────────────────────────────────────────────────────────────
@@ -309,14 +294,26 @@ func installPi() (*Result, error) {
 	}
 
 	agentDir := piAgentDir()
+	settingsPath := filepath.Join(agentDir, "settings.json")
 	files := 0
-	settingsChanged, err := ensurePiPackageSettings(filepath.Join(agentDir, "settings.json"))
+
+	// ensurePiNpmCommand must run before ensurePiPackageSettings so that a single
+	// write covers both npm command pinning and package list updates when both are
+	// needed on a fresh install. If npmCommand was already set we still proceed and
+	// let ensurePiPackageSettings handle the packages field independently.
+	npmChanged, err := ensurePiNpmCommand(settingsPath)
 	if err != nil {
 		return nil, err
 	}
-	if settingsChanged {
+
+	settingsChanged, err := ensurePiPackageSettings(settingsPath)
+	if err != nil {
+		return nil, err
+	}
+	if npmChanged || settingsChanged {
 		files++
 	}
+
 	mcpChanged, err := ensurePiMCPConfig(filepath.Join(agentDir, "mcp.json"))
 	if err != nil {
 		return nil, err
@@ -356,6 +353,60 @@ func ensurePiPackageSettings(settingsPath string) (bool, error) {
 		return false, fmt.Errorf("marshal Pi packages: %w", err)
 	}
 	return true, writeJSONConfig(settingsPath, config)
+}
+
+// ensurePiNpmCommand pins the npm command in Pi's settings.json when mise is
+// detected. This prevents Node version drift from silently changing which npm
+// root Pi uses for package lookups and installs.
+//
+// Behavior:
+//   - If mise is not found in PATH: no-op (returns false, nil).
+//   - If npmCommand already exists in settings.json: no-op (returns false, nil).
+//   - Otherwise: writes npmCommand as ["mise", "exec", "<node-spec>", "--", "npm"].
+//
+// The node spec is resolved via "mise current node". If resolution fails,
+// the bare "node" tool name is used so mise still picks the active version.
+func ensurePiNpmCommand(settingsPath string) (bool, error) {
+	if _, err := lookPathFn("mise"); err != nil {
+		return false, nil // mise not present — nothing to pin
+	}
+
+	config, err := readJSONConfig(settingsPath)
+	if err != nil {
+		return false, fmt.Errorf("read Pi settings for npmCommand: %w", err)
+	}
+
+	if _, exists := config["npmCommand"]; exists {
+		return false, nil // user already configured npmCommand — preserve it
+	}
+
+	nodeSpec := resolveMiseNodeVersionFn()
+	if nodeSpec == "" {
+		nodeSpec = "node" // fallback: let mise pick the active version at runtime
+	}
+
+	npmCmd := []string{"mise", "exec", nodeSpec, "--", "npm"}
+	raw, err := jsonMarshalFn(npmCmd)
+	if err != nil {
+		return false, fmt.Errorf("marshal Pi npmCommand: %w", err)
+	}
+	config["npmCommand"] = raw
+	return true, writeJSONConfig(settingsPath, config)
+}
+
+// resolveMiseNodeVersion returns the active Node version managed by mise as a
+// versioned spec string (e.g. "node@22.12.0"). Returns an empty string when
+// the version cannot be determined.
+func resolveMiseNodeVersion() string {
+	out, err := runCommand("mise", "current", "node")
+	if err != nil {
+		return ""
+	}
+	version := strings.TrimSpace(string(out))
+	if version == "" {
+		return ""
+	}
+	return "node@" + version
 }
 
 func ensurePiMCPConfig(mcpPath string) (bool, error) {
@@ -441,6 +492,8 @@ func rawArrayContainsString(values []json.RawMessage, target string) bool {
 	return false
 }
 
+// ─── Pi ──────────────────────────────────────────────────────────────────────
+
 // ─── OpenCode ────────────────────────────────────────────────────────────────
 
 // patchEngramBINLine rewrites the ENGRAM_BIN constant declaration in the
@@ -503,7 +556,7 @@ func installOpenCode() (*Result, error) {
 		return nil, fmt.Errorf("write %s: %w", dest, err)
 	}
 
-	// Register engram MCP server in opencode.json
+	// Register engram MCP server in opencode.json and the subagent monitor in tui.json.
 	files := 1
 	if err := injectOpenCodeMCPFn(); err != nil {
 		// Non-fatal: plugin works, MCP just needs manual config
@@ -512,7 +565,16 @@ func installOpenCode() (*Result, error) {
 		fmt.Fprintf(os.Stderr, "  Add manually to your opencode.json under \"mcp\":\n")
 		fmt.Fprintf(os.Stderr, "  \"engram\": { \"type\": \"local\", \"command\": [%q, \"mcp\", \"--tools=agent\"], \"enabled\": true }\n", cmd)
 	} else {
-		files = 2
+		files++
+	}
+
+	tuiEnabled := false
+	if err := injectOpenCodeSubagentPluginFn(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not enable subagent monitor in tui.json: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  Add manually to your tui.json under \"plugin\": [%q]\n", openCodeSubagentStatuslinePlugin)
+	} else {
+		files++
+		tuiEnabled = true
 	}
 
 	// Install TUI plugin (opencode-azure-entra-auth) for /engram-login slash command.
@@ -552,9 +614,10 @@ func installOpenCode() (*Result, error) {
 	}
 
 	return &Result{
-		Agent:       "opencode",
-		Destination: dir,
-		Files:       files,
+		Agent:            "opencode",
+		Destination:      dir,
+		Files:            files,
+		TUIPluginEnabled: tuiEnabled,
 	}, nil
 }
 
@@ -763,6 +826,9 @@ func injectOpenCodeServerPlugin(tuiPluginDir string) error {
 	return nil
 }
 
+// injectOpenCodeTUIPlugin adds the subagent monitor package to tui.json.
+// It preserves the existing config and only appends the package when missing.
+
 // installNPMDependencies runs `bun install --production` (or npm install) in
 // the given directory to install @azure/identity. Best-effort — prefers bun
 // (which OpenCode ships with) and falls back to npm. Returns an error only if
@@ -872,6 +938,17 @@ func openCodeConfigPath() string {
 		return jsonc
 	}
 	return filepath.Join(dir, "opencode.json")
+}
+
+// openCodeTUIConfigPath returns the path to the OpenCode TUI config file.
+// It checks for tui.jsonc first, then falls back to tui.json.
+func openCodeTUIConfigPath() string {
+	dir := openCodeConfigDir()
+	jsonc := filepath.Join(dir, "tui.jsonc")
+	if _, err := statFn(jsonc); err == nil {
+		return jsonc
+	}
+	return filepath.Join(dir, "tui.json")
 }
 
 // openCodeConfigDir returns the directory containing the OpenCode config.
@@ -1210,11 +1287,18 @@ func injectGeminiMCP(configPath string) error {
 	return nil
 }
 
-// resolveEngramCommand returns the absolute path to the engram binary.
-// It uses os.Executable() so that headless/systemd environments (where PATH
-// is not reliably inherited by child processes) still find the binary.
-// EvalSymlinks makes the path stable across package-manager upgrades.
-// Falls back to bare "engram" only if os.Executable() itself fails.
+// resolveEngramCommand returns the most stable command to spawn the engram
+// binary. It uses os.Executable() so that headless/systemd environments (where
+// PATH is not reliably inherited by child processes) still find the binary.
+//
+// Homebrew (and Linuxbrew) resolve the `engram` symlink to a versioned Cellar
+// path such as /opt/homebrew/Cellar/engram/1.16.1/bin/engram. That path is
+// removed on the next `brew upgrade`, so baking it into MCP client configs
+// leaves a stale command that fails to spawn (ENOENT). When the resolved
+// executable points into a versioned Cellar directory we prefer the stable
+// <brew-prefix>/bin/engram symlink, which brew repoints at the current version,
+// so registrations survive upgrades. Falls back to bare "engram" only when
+// os.Executable() fails or the stable symlink is missing.
 func resolveEngramCommand() string {
 	exe, err := osExecutable()
 	if err != nil {
@@ -1223,7 +1307,36 @@ func resolveEngramCommand() string {
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = resolved
 	}
+	if stable, ok := stableHomebrewEngramCommand(exe); ok {
+		return stable
+	}
 	return exe
+}
+
+// stableHomebrewEngramCommand maps a versioned Homebrew Cellar path to the
+// stable "<brew-prefix>/bin/engram" symlink that brew keeps pointing at the
+// current version. It returns ("", false) when exe is not a versioned Cellar
+// path, so non-Homebrew installs keep their resolved absolute path. When the
+// derived stable symlink does not exist on disk it falls back to the bare
+// "engram" name so the command still resolves via PATH.
+func stableHomebrewEngramCommand(exe string) (string, bool) {
+	const marker = "/Cellar/engram/"
+	clean := filepath.ToSlash(filepath.Clean(exe))
+	idx := strings.Index(clean, marker)
+	if idx < 0 {
+		return "", false
+	}
+	base := strings.ToLower(filepath.Base(clean))
+	if base != "engram" && base != "engram.exe" {
+		return "", false
+	}
+	// Everything before "/Cellar/" is the brew prefix, e.g. /opt/homebrew or
+	// /home/linuxbrew/.linuxbrew. The bin symlink lives directly under it.
+	stable := clean[:idx] + "/bin/engram"
+	if _, err := statFn(stable); err == nil {
+		return filepath.FromSlash(stable), true
+	}
+	return "engram", true
 }
 
 func writeGeminiSystemPrompt() error {
@@ -1287,6 +1400,38 @@ func installCodex() (*Result, error) {
 	compactPromptPath := codexCompactPromptPath()
 	if err := injectCodexMemoryConfigFn(path, instructionsPath, compactPromptPath); err != nil {
 		return nil, err
+	}
+
+	// Best-effort: install the Codex plugin (hooks) via the Codex CLI.
+	// Failures here are non-fatal — the MCP TOML is already written and works
+	// without the plugin. The plugin adds hooks (compaction recovery, etc.).
+	codexBin, err := lookPathFn("codex")
+	if err != nil {
+		// codex CLI not in PATH — warn and return success with files written so far.
+		fmt.Fprintf(os.Stderr, "warning: codex CLI not found in PATH — MCP config and instruction files were written,\n")
+		fmt.Fprintf(os.Stderr, "  but the Engram plugin (hooks) was not installed.\n")
+		fmt.Fprintf(os.Stderr, "  To install manually, run:\n")
+		fmt.Fprintf(os.Stderr, "    codex plugin marketplace add %s --ref main\n", codexMarketplace)
+		fmt.Fprintf(os.Stderr, "    codex plugin add engram@engram\n")
+		return &Result{
+			Agent:       "codex",
+			Destination: filepath.Dir(path),
+			Files:       3,
+		}, nil
+	}
+
+	// Step 1: add the marketplace (idempotent — tolerate "already" in output).
+	addOut, err := runCommand(codexBin, "plugin", "marketplace", "add", codexMarketplace, "--ref", "main")
+	addOutputStr := strings.TrimSpace(string(addOut))
+	if err != nil && !strings.Contains(strings.ToLower(addOutputStr), "already") {
+		fmt.Fprintf(os.Stderr, "warning: codex plugin marketplace add failed (non-fatal): %s\n", addOutputStr)
+	}
+
+	// Step 2: install the plugin (idempotent — tolerate "already" in output).
+	pluginOut, err := runCommand(codexBin, "plugin", "add", "engram@engram")
+	pluginOutputStr := strings.TrimSpace(string(pluginOut))
+	if err != nil && !strings.Contains(strings.ToLower(pluginOutputStr), "already") {
+		fmt.Fprintf(os.Stderr, "warning: codex plugin add failed (non-fatal): %s\n", pluginOutputStr)
 	}
 
 	return &Result{
@@ -1464,4 +1609,56 @@ func codexInstructionsPath() string {
 
 func codexCompactPromptPath() string {
 	return filepath.Join(filepath.Dir(codexConfigPath()), "engram-compact-prompt.md")
+}
+
+// injectOpenCodeTUIPlugin adds the subagent monitor package to tui.json.
+// It preserves the existing config and only appends the package when missing.
+func injectOpenCodeSubagentPlugin() error {
+	configPath := openCodeTUIConfigPath()
+
+	var config map[string]json.RawMessage
+	data, err := readFileFn(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			config = make(map[string]json.RawMessage)
+		} else {
+			return fmt.Errorf("read config: %w", err)
+		}
+	} else {
+		cleaned := stripJSONC(data)
+		if err := json.Unmarshal(cleaned, &config); err != nil {
+			return fmt.Errorf("parse config: %w", err)
+		}
+	}
+
+	var plugins []string
+	if raw, exists := config["plugin"]; exists {
+		if err := json.Unmarshal(raw, &plugins); err != nil {
+			return fmt.Errorf("parse plugin block: %w", err)
+		}
+	}
+
+	for _, plugin := range plugins {
+		if plugin == openCodeSubagentStatuslinePlugin {
+			return nil
+		}
+	}
+
+	plugins = append(plugins, openCodeSubagentStatuslinePlugin)
+	pluginsJSON, err := jsonMarshalFn(plugins)
+	if err != nil {
+		return fmt.Errorf("marshal plugin block: %w", err)
+	}
+	config["plugin"] = json.RawMessage(pluginsJSON)
+
+	output, err := jsonMarshalIndentFn(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+
+	if err := writeFileFn(configPath, output, 0644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+
+	return nil
 }

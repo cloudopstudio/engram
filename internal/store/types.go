@@ -15,6 +15,7 @@ type Session struct {
 }
 
 type Observation struct {
+	Pinned         bool    `json:"-"`
 	ID             int64   `json:"id"`
 	SyncID         string  `json:"sync_id"`
 	SessionID      string  `json:"session_id"`
@@ -28,12 +29,14 @@ type Observation struct {
 	RevisionCount  int     `json:"revision_count"`
 	DuplicateCount int     `json:"duplicate_count"`
 	LastSeenAt     *string `json:"last_seen_at,omitempty"`
+	ReviewAfter    *string `json:"review_after,omitempty"`
 	CreatedAt      string  `json:"created_at"`
 	UpdatedAt      string  `json:"updated_at"`
 	DeletedAt      *string `json:"deleted_at,omitempty"`
 }
 
 type SearchResult struct {
+	Pinned bool `json:"-"`
 	Observation
 	Rank float64 `json:"rank"`
 }
@@ -82,12 +85,13 @@ type TimelineResult struct {
 }
 
 type SearchOptions struct {
-	Type    string `json:"type,omitempty"`
-	Project string `json:"project,omitempty"`
-	Scope   string `json:"scope,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
-	User    string `json:"user,omitempty"`
-	Since   string `json:"since,omitempty"`
+	MatchMode string `json:"match_mode,omitempty"`
+	Type      string `json:"type,omitempty"`
+	Project   string `json:"project,omitempty"`
+	Scope     string `json:"scope,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
+	User      string `json:"user,omitempty"`
+	Since     string `json:"since,omitempty"`
 }
 
 // ProjectStats holds aggregated stats for a single project.
@@ -153,6 +157,8 @@ type SyncState struct {
 	BackoffUntil        *string `json:"backoff_until,omitempty"`
 	LeaseOwner          *string `json:"lease_owner,omitempty"`
 	LeaseUntil          *string `json:"lease_until,omitempty"`
+	ReasonCode          *string `json:"reason_code,omitempty"`
+	ReasonMessage       *string `json:"reason_message,omitempty"`
 	LastError           *string `json:"last_error,omitempty"`
 	UpdatedAt           string  `json:"updated_at"`
 }

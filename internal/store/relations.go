@@ -74,14 +74,91 @@ type CandidateOptions struct {
 	// BM25Floor is the minimum BM25 score (negative; closer to 0 = better match).
 	// Candidates below the floor are excluded. Default -2.0 when nil.
 	//
-	// Use a pointer so that an explicit 0.0 (very strict) is distinguishable
-	// from the zero value. nil means "use the default (-2.0)".
+	// Use a pointer so that an explicit 0.0 (very strict — nothing passes) is
+	// distinguishable from the zero value (which previously collided with the
+	// default sentinel). nil means "use the default (-2.0)".
 	BM25Floor *float64
 	// SkipInsert controls whether FindCandidates inserts pending relation rows.
 	// When true, candidates are returned but NO rows are written to memory_relations.
-	// Default false preserves the existing behaviour (rows are inserted).
+	// Default false preserves the existing behavior (rows are inserted).
 	SkipInsert bool
 }
+
+// JudgeBySemanticParams holds the inputs for JudgeBySemantic.
+type JudgeBySemanticParams struct {
+	// SourceID is the TEXT sync_id of the source observation (required).
+	SourceID string
+	// TargetID is the TEXT sync_id of the target observation (required).
+	TargetID string
+	// Relation is the verdict verb (required); must be in validRelationVerbs.
+	// Passing "not_conflict" is a no-op: no row is inserted and no error is returned.
+	Relation string
+	// Confidence is the LLM's self-reported confidence score [0.0, 1.0].
+	Confidence float64
+	// Reasoning is the LLM's short explanation.
+	Reasoning string
+	// Model is the LLM model identifier. Stored as marked_by_model.
+	Model string
+}
+
+// ScanResult holds the output of a ScanProject call.
+type ScanResult struct {
+	Project           string `json:"project"`
+	Inspected         int    `json:"inspected"`
+	CandidatesFound   int    `json:"candidates_found"`
+	AlreadyRelated    int    `json:"already_related"`
+	RelationsInserted int    `json:"inserted"`
+	Capped            bool   `json:"capped"`
+	DryRun            bool   `json:"dry_run"`
+
+	// Semantic counters — populated only when ScanOptions.Semantic is true.
+	// Zero-value is safe for existing JSON consumers.
+	SemanticJudged  int `json:"semantic_judged"`
+	SemanticSkipped int `json:"semantic_skipped"`
+	SemanticErrors  int `json:"semantic_errors"`
+}
+
+// ScanOptions controls a ScanProject call.
+type ScanOptions struct {
+	// Project is required — scopes the observation walk.
+	Project string
+	// Since filters observations to created_at >= Since. Zero value means no filter.
+	Since time.Time
+	// Apply controls whether new relation rows are inserted.
+	// When false (dry-run, default), candidates are reported but not written.
+	Apply bool
+	// MaxInsert caps the number of new relation rows inserted in a single Apply run.
+	// Default 100 when 0 or negative.
+	MaxInsert int
+
+	// Semantic controls whether the worker pool LLM-judge step runs.
+	// When false (default), ScanProject behaves exactly as Phase 3.
+	Semantic bool
+	// Concurrency is the worker pool size for semantic calls. Default 5 if 0.
+	Concurrency int
+	// TimeoutPerCall is the per-pair context timeout for runner.Compare.
+	// Default 60s if zero.
+	TimeoutPerCall time.Duration
+	// MaxSemantic caps the number of LLM calls in a single semantic scan. Default 100 if 0.
+	MaxSemantic int
+	// Runner is the SemanticRunner used for LLM comparison. Required when Semantic=true.
+	Runner SemanticRunner
+	// BuildPrompt constructs the LLM prompt for a given (a, b) pair.
+	// Required when Semantic=true.
+	BuildPrompt func(a, b ObservationSnippet) string
+}
+
+// ObservationSnippet carries the fields needed by BuildPrompt to construct an
+// LLM comparison prompt without importing internal/llm from this package.
+type ObservationSnippet struct {
+	ID      int64
+	SyncID  string
+	Title   string
+	Type    string
+	Content string
+}
+
+// ─── Phase 3 types ────────────────────────────────────────────────────────────
 
 // ListRelationsOptions controls ListRelations and CountRelations queries.
 type ListRelationsOptions struct {
@@ -143,24 +220,25 @@ type Candidate struct {
 
 // Relation represents a row in memory_relations.
 type Relation struct {
-	ID                    int64    `json:"id"`
-	SyncID                string   `json:"sync_id"`
-	SourceID              string   `json:"source_id"`
-	TargetID              string   `json:"target_id"`
-	Relation              string   `json:"relation"`
-	Reason                *string  `json:"reason,omitempty"`
-	Evidence              *string  `json:"evidence,omitempty"`
-	Confidence            *float64 `json:"confidence,omitempty"`
-	JudgmentStatus        string   `json:"judgment_status"`
-	MarkedByActor         *string  `json:"marked_by_actor,omitempty"`
-	MarkedByKind          *string  `json:"marked_by_kind,omitempty"`
-	MarkedByModel         *string  `json:"marked_by_model,omitempty"`
-	SessionID             *string  `json:"session_id,omitempty"`
-	CreatedAt             string   `json:"created_at"`
-	UpdatedAt             string   `json:"updated_at"`
+	ID             int64    `json:"id"`
+	SyncID         string   `json:"sync_id"`
+	SourceID       string   `json:"source_id"`
+	TargetID       string   `json:"target_id"`
+	Relation       string   `json:"relation"`
+	Reason         *string  `json:"reason,omitempty"`
+	Evidence       *string  `json:"evidence,omitempty"`
+	Confidence     *float64 `json:"confidence,omitempty"`
+	JudgmentStatus string   `json:"judgment_status"`
+	MarkedByActor  *string  `json:"marked_by_actor,omitempty"`
+	MarkedByKind   *string  `json:"marked_by_kind,omitempty"`
+	MarkedByModel  *string  `json:"marked_by_model,omitempty"`
+	SessionID      *string  `json:"session_id,omitempty"`
+	CreatedAt      string   `json:"created_at"`
+	UpdatedAt      string   `json:"updated_at"`
 
 	// Annotation fields — populated by GetRelationsForObservations via LEFT JOIN.
 	// Excluded from JSON output (used only for in-process annotation building).
+	// REQ-005, REQ-012 | Design §7, §8.
 	SourceIntID   int64  `json:"-"` // integer primary key of source observation
 	SourceTitle   string `json:"-"` // title of source observation; empty if missing/deleted
 	SourceMissing bool   `json:"-"` // true if source is soft-deleted or not found
@@ -209,80 +287,6 @@ type JudgeRelationParams struct {
 	SessionID string
 }
 
-// JudgeBySemanticParams holds the inputs for JudgeBySemantic.
-type JudgeBySemanticParams struct {
-	// SourceID is the TEXT sync_id of the source observation (required).
-	SourceID string
-	// TargetID is the TEXT sync_id of the target observation (required).
-	TargetID string
-	// Relation is the verdict verb (required); must be in validRelationVerbs.
-	// Passing "not_conflict" is a no-op: no row is inserted and no error is returned.
-	Relation string
-	// Confidence is the LLM's self-reported confidence score [0.0, 1.0].
-	Confidence float64
-	// Reasoning is the LLM's short explanation.
-	Reasoning string
-	// Model is the LLM model identifier. Stored as marked_by_model.
-	Model string
-}
-
-// ScanResult holds the output of a ScanProject call.
-type ScanResult struct {
-	Project           string `json:"project"`
-	Inspected         int    `json:"inspected"`
-	CandidatesFound   int    `json:"candidates_found"`
-	AlreadyRelated    int    `json:"already_related"`
-	RelationsInserted int    `json:"inserted"`
-	Capped            bool   `json:"capped"`
-	DryRun            bool   `json:"dry_run"`
-
-	// Semantic counters — populated only when ScanOptions.Semantic is true.
-	// Zero-value is safe for existing JSON consumers.
-	SemanticJudged  int `json:"semantic_judged"`
-	SemanticSkipped int `json:"semantic_skipped"`
-	SemanticErrors  int `json:"semantic_errors"`
-}
-
-// ObservationSnippet carries the fields needed by BuildPrompt to construct an
-// LLM comparison prompt without importing internal/llm from this package.
-type ObservationSnippet struct {
-	ID      int64
-	SyncID  string
-	Title   string
-	Type    string
-	Content string
-}
-
-// ScanOptions controls a ScanProject call.
-type ScanOptions struct {
-	// Project is required — scopes the observation walk.
-	Project string
-	// Since filters observations to created_at >= Since. Zero value means no filter.
-	Since time.Time
-	// Apply controls whether new relation rows are inserted.
-	// When false (dry-run, default), candidates are reported but not written.
-	Apply bool
-	// MaxInsert caps the number of new relation rows inserted in a single Apply run.
-	// Default 100 when 0 or negative.
-	MaxInsert int
-
-	// Semantic controls whether the worker pool LLM-judge step runs.
-	// When false (default), ScanProject behaves exactly as Phase 3.
-	Semantic bool
-	// Concurrency is the worker pool size for semantic calls. Default 5 if 0.
-	Concurrency int
-	// TimeoutPerCall is the per-pair context timeout for runner.Compare.
-	// Default 60s if zero.
-	TimeoutPerCall time.Duration
-	// MaxSemantic caps the number of LLM calls in a single semantic scan. Default 100 if 0.
-	MaxSemantic int
-	// Runner is the SemanticRunner used for LLM comparison. Required when Semantic=true.
-	Runner SemanticRunner
-	// BuildPrompt constructs the LLM prompt for a given (a, b) pair.
-	// Required when Semantic=true.
-	BuildPrompt func(a, b ObservationSnippet) string
-}
-
 // ─── FindCandidates ───────────────────────────────────────────────────────────
 
 // FindCandidates runs a post-transaction FTS5 candidate query for the given
@@ -294,15 +298,19 @@ type ScanOptions struct {
 // Errors from this method are expected to be logged and swallowed by callers —
 // detection failure must never fail the originating save.
 func (s *SQLiteStore) FindCandidates(savedID int64, opts CandidateOptions) ([]Candidate, error) {
+	// Apply defaults.
 	limit := opts.Limit
 	if limit <= 0 {
 		limit = 3
 	}
+	// BM25Floor uses pointer semantics: nil means "use the default (-2.0)".
+	// An explicit pointer value (including 0.0) is used as-is.
 	floor := -2.0
 	if opts.BM25Floor != nil {
 		floor = *opts.BM25Floor
 	}
 
+	// Get the saved observation to build the FTS query and for project/scope filtering.
 	var title, project, scope string
 	err := s.db.QueryRow(
 		`SELECT title, ifnull(project,''), scope FROM observations WHERE id = ?`, savedID,
@@ -314,6 +322,7 @@ func (s *SQLiteStore) FindCandidates(savedID int64, opts CandidateOptions) ([]Ca
 		return nil, fmt.Errorf("FindCandidates: get saved observation: %w", err)
 	}
 
+	// Use caller-supplied project/scope if provided (override from observation columns).
 	if opts.Project != "" {
 		project = opts.Project
 	}
@@ -326,6 +335,8 @@ func (s *SQLiteStore) FindCandidates(savedID int64, opts CandidateOptions) ([]Ca
 		return nil, nil
 	}
 
+	// FTS5 query: same project, same scope, exclude just-saved row, exclude soft-deleted.
+	// BM25 floor filtering is done in Go after scanning.
 	rows, err := s.db.Query(`
 		SELECT o.id, ifnull(o.sync_id,'') as sync_id, o.title, o.type, o.topic_key,
 		       fts.rank
@@ -338,7 +349,7 @@ func (s *SQLiteStore) FindCandidates(savedID int64, opts CandidateOptions) ([]Ca
 		  AND o.scope = ?
 		ORDER BY fts.rank
 		LIMIT ?
-	`, ftsQuery, savedID, project, scope, limit*3)
+	`, ftsQuery, savedID, project, scope, limit*3) // fetch extra rows to allow floor filtering
 	if err != nil {
 		return nil, fmt.Errorf("FindCandidates: FTS5 query: %w", err)
 	}
@@ -360,6 +371,8 @@ func (s *SQLiteStore) FindCandidates(savedID int64, opts CandidateOptions) ([]Ca
 			}
 			return nil, fmt.Errorf("FindCandidates: scan: %w", err)
 		}
+		// Apply BM25 floor filter. BM25 scores are negative; closer to 0 = better.
+		// We only include rows whose score >= floor (e.g., -1.5 >= -2.0).
 		if rc.score < floor {
 			continue
 		}
@@ -382,6 +395,7 @@ func (s *SQLiteStore) FindCandidates(savedID int64, opts CandidateOptions) ([]Ca
 		return nil, nil
 	}
 
+	// When SkipInsert=true, return candidates without writing any rows.
 	if opts.SkipInsert {
 		candidates := make([]Candidate, 0, len(raw))
 		for _, rc := range raw {
@@ -392,11 +406,13 @@ func (s *SQLiteStore) FindCandidates(savedID int64, opts CandidateOptions) ([]Ca
 				Type:     rc.obsType,
 				TopicKey: rc.topicKey,
 				Score:    rc.score,
+				// JudgmentID is empty — no row was inserted.
 			})
 		}
 		return candidates, nil
 	}
 
+	// Get the source observation's sync_id for the relation source_id.
 	var sourceSyncID string
 	if err := s.db.QueryRow(
 		`SELECT ifnull(sync_id,'') FROM observations WHERE id = ?`, savedID,
@@ -404,6 +420,7 @@ func (s *SQLiteStore) FindCandidates(savedID int64, opts CandidateOptions) ([]Ca
 		return nil, fmt.Errorf("FindCandidates: get source sync_id: %w", err)
 	}
 
+	// Insert a pending relation row for each candidate.
 	candidates := make([]Candidate, 0, len(raw))
 	for _, rc := range raw {
 		judgmentID := newSyncID("rel")
@@ -413,7 +430,7 @@ func (s *SQLiteStore) FindCandidates(savedID int64, opts CandidateOptions) ([]Ca
 			VALUES (?, ?, ?, 'pending', 'pending', datetime('now'), datetime('now'))
 		`, judgmentID, sourceSyncID, rc.syncID)
 		if err != nil {
-			log.Printf("[store] FindCandidates: insert pending relation: %v", err)
+			// Log and skip — don't fail the whole detection.
 			continue
 		}
 		candidates = append(candidates, Candidate{
@@ -478,6 +495,36 @@ func (s *SQLiteStore) GetRelation(syncID string) (*Relation, error) {
 	return &r, nil
 }
 
+// GetRelationByIntID retrieves a single relation enriched with source/target observation
+// titles by its integer primary key. Returns a *RelationListItem (same shape as
+// ListRelations rows) so HTTP handlers share one response type.
+// Returns an error wrapping "not found" when the id does not exist.
+func (s *SQLiteStore) GetRelationByIntID(id int64) (*RelationListItem, error) {
+	row := s.db.QueryRow(`
+		SELECT r.id, r.sync_id, r.relation, r.judgment_status,
+		       ifnull(r.source_id,''), ifnull(src.title,''),
+		       ifnull(r.target_id,''), ifnull(tgt.title,''),
+		       r.created_at, r.updated_at
+		FROM memory_relations r
+		LEFT JOIN observations src ON src.sync_id = r.source_id AND src.deleted_at IS NULL
+		LEFT JOIN observations tgt ON tgt.sync_id = r.target_id AND tgt.deleted_at IS NULL
+		WHERE r.id = ?
+	`, id)
+
+	var item RelationListItem
+	if err := row.Scan(
+		&item.ID, &item.SyncID, &item.Relation, &item.JudgmentStatus,
+		&item.SourceID, &item.SourceTitle,
+		&item.TargetID, &item.TargetTitle,
+		&item.CreatedAt, &item.UpdatedAt,
+	); err == sql.ErrNoRows {
+		return nil, fmt.Errorf("GetRelationByIntID: relation id %d not found", id)
+	} else if err != nil {
+		return nil, fmt.Errorf("GetRelationByIntID: %w", err)
+	}
+	return &item, nil
+}
+
 // getRelationTx is the transactional variant of GetRelation used within
 // JudgeRelation to read the freshly-updated row before commit.
 func (s *SQLiteStore) getRelationTx(tx *sql.Tx, syncID string) (*Relation, error) {
@@ -513,17 +560,20 @@ func (s *SQLiteStore) getRelationTx(tx *sql.Tx, syncID string) (*Relation, error
 
 // JudgeRelation records a verdict on an existing pending relation row.
 //
-// Re-judge policy: OVERWRITE the existing row (design decision). The updated
-// row is returned on success.
+// Re-judge policy: OVERWRITE the existing row (design decision). The updated row
+// is returned on success.
 //
-// Wraps the UPDATE in a transaction to atomically enqueue a sync mutation when
-// the source observation's project is enrolled for cloud sync.
+// Phase 2: wraps the UPDATE in a transaction to atomically enqueue a sync
+// mutation when the source observation's project is enrolled for cloud sync.
 // Returns ErrCrossProjectRelation if source and target belong to different projects.
+//
+// Returns an error if the judgment_id is unknown or the relation verb is invalid.
 func (s *SQLiteStore) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 	if !isValidRelationVerb(p.Relation) {
 		return nil, fmt.Errorf("JudgeRelation: invalid relation verb %q — must be one of: related, compatible, scoped, conflicts_with, supersedes, not_conflict", p.Relation)
 	}
 
+	// Verify the relation exists and fetch source/target IDs for project check.
 	var sourceID, targetID string
 	if err := s.db.QueryRow(
 		`SELECT ifnull(source_id,''), ifnull(target_id,'') FROM memory_relations WHERE sync_id = ?`,
@@ -535,6 +585,7 @@ func (s *SQLiteStore) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 		return nil, fmt.Errorf("JudgeRelation: check existence: %w", err)
 	}
 
+	// Build nullable model string.
 	var markedByModel *string
 	if p.MarkedByModel != "" {
 		markedByModel = &p.MarkedByModel
@@ -545,10 +596,32 @@ func (s *SQLiteStore) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 	}
 
 	if err := s.withTx(func(tx *sql.Tx) error {
+		// ── Cross-project guard (Phase 2, REQ-003) ─────────────────────────
+		// Derive source and target project for enrollment checks and the guard.
+		// Use the same session-fallback form as JudgeBySemantic so that enrolled
+		// projects whose observations have a blank project column (but whose session
+		// carries the project) are resolved correctly. Missing observation → empty
+		// string (REQ-011 edge) because the LEFT JOIN returns no row.
+		var srcProject, tgtProject string
+		_ = tx.QueryRow(
+			`SELECT coalesce(nullif(o.project,''), s.project, '')
+			   FROM observations o
+			   LEFT JOIN sessions s ON s.id = o.session_id
+			  WHERE o.sync_id = ?`, sourceID,
+		).Scan(&srcProject)
+		_ = tx.QueryRow(
+			`SELECT coalesce(nullif(o.project,''), s.project, '')
+			   FROM observations o
+			   LEFT JOIN sessions s ON s.id = o.session_id
+			  WHERE o.sync_id = ?`, targetID,
+		).Scan(&tgtProject)
+
+		// Delegate to shared helper; reject cross-project pairs.
 		if err := validateCrossProjectGuard(tx, sourceID, targetID); err != nil {
 			return err
 		}
 
+		// ── UPDATE memory_relations ────────────────────────────────────────
 		if _, err := s.execHook(tx, `
 			UPDATE memory_relations
 			SET relation        = ?,
@@ -576,16 +649,13 @@ func (s *SQLiteStore) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 			return fmt.Errorf("JudgeRelation: update: %w", err)
 		}
 
-		// Derive source project for sync mutation enqueue.
-		var srcProject string
-		_ = tx.QueryRow(
-			`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, sourceID,
-		).Scan(&srcProject)
-		var tgtProject string
-		_ = tx.QueryRow(
-			`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, targetID,
-		).Scan(&tgtProject)
-
+		// ── Enqueue sync mutation when project is enrolled (REQ-001) ───────
+		// Derive project from source observation; empty string if source missing.
+		// (REQ-011: loud failure is the server's job; we enqueue project='' and log.)
+		//
+		// Enrollment check: prefer srcProject; fall back to tgtProject when source
+		// is missing locally (race condition). This ensures enqueue happens with
+		// project='' when source is absent but target's project IS enrolled.
 		enrollCheckProject := srcProject
 		if enrollCheckProject == "" {
 			enrollCheckProject = tgtProject
@@ -597,13 +667,17 @@ func (s *SQLiteStore) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 			return fmt.Errorf("JudgeRelation: check enrollment: %w", err)
 		}
 		if enrolled == 0 {
-			return nil
+			return nil // not enrolled — no mutation enqueued
 		}
 
+		// REQ-011: log at WARNING level when source observation is missing locally
+		// (project='' race condition). The server will reject with 400; this log
+		// is the local breadcrumb so the gap is not silently swallowed.
 		if srcProject == "" {
 			log.Printf("[store] WARNING: JudgeRelation enqueueing relation %s with project='' (source observation missing locally); server will reject", p.JudgmentID)
 		}
 
+		// Read the full updated row to build the payload.
 		rel, err := s.getRelationTx(tx, p.JudgmentID)
 		if err != nil {
 			return fmt.Errorf("JudgeRelation: read updated relation: %w", err)
@@ -638,14 +712,21 @@ func (s *SQLiteStore) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 
 // validateCrossProjectGuard checks whether sourceID and targetID belong to the
 // same project. It returns ErrCrossProjectRelation when they are in different
-// projects. Both empty is allowed (observation may be missing locally).
+// projects. Both empty is allowed (observation may be missing locally — REQ-011).
+// This function is shared by JudgeRelation and JudgeBySemantic.
 func validateCrossProjectGuard(tx *sql.Tx, sourceID, targetID string) error {
 	var srcProject, tgtProject string
 	_ = tx.QueryRow(
-		`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, sourceID,
+		`SELECT coalesce(nullif(o.project,''), s.project, '')
+		   FROM observations o
+		   LEFT JOIN sessions s ON s.id = o.session_id
+		  WHERE o.sync_id = ?`, sourceID,
 	).Scan(&srcProject)
 	_ = tx.QueryRow(
-		`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, targetID,
+		`SELECT coalesce(nullif(o.project,''), s.project, '')
+		   FROM observations o
+		   LEFT JOIN sessions s ON s.id = o.session_id
+		  WHERE o.sync_id = ?`, targetID,
 	).Scan(&tgtProject)
 
 	if srcProject != "" && tgtProject != "" && srcProject != tgtProject {
@@ -656,7 +737,7 @@ func validateCrossProjectGuard(tx *sql.Tx, sourceID, targetID string) error {
 
 // ─── JudgeBySemantic ──────────────────────────────────────────────────────────
 
-// JudgeBySemantic persists a semantic verdict produced by an external agent into
+// JudgeBySemantic persists a semantic verdict produced by an AgentRunner into
 // the memory_relations table with system provenance (marked_by_kind="system",
 // marked_by_actor="engram", marked_by_model=params.Model).
 //
@@ -666,7 +747,12 @@ func validateCrossProjectGuard(tx *sql.Tx, sourceID, targetID string) error {
 // Idempotency: if a row already exists for (source_id, target_id) in either
 // direction, the existing row is updated (UPSERT). The returned sync_id is
 // always the canonical row's sync_id.
+//
+// Returns ErrCrossProjectRelation when source and target belong to different
+// projects. Returns a validation error when required fields are missing or
+// Confidence is out of [0.0, 1.0].
 func (s *SQLiteStore) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
+	// Validation.
 	if p.SourceID == "" {
 		return "", fmt.Errorf("JudgeBySemantic: SourceID is required")
 	}
@@ -680,6 +766,7 @@ func (s *SQLiteStore) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
 		return "", fmt.Errorf("JudgeBySemantic: confidence %v is out of range [0.0, 1.0]", p.Confidence)
 	}
 
+	// not_conflict is a no-op.
 	if p.Relation == RelationNotConflict {
 		return "", nil
 	}
@@ -687,10 +774,13 @@ func (s *SQLiteStore) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
 	var resultSyncID string
 
 	if err := s.withTx(func(tx *sql.Tx) error {
+		// Cross-project guard.
 		if err := validateCrossProjectGuard(tx, p.SourceID, p.TargetID); err != nil {
 			return err
 		}
 
+		// Check whether a row already exists for this (source_id, target_id) pair
+		// in either direction.
 		var existingSyncID string
 		err := tx.QueryRow(`
 			SELECT sync_id FROM memory_relations
@@ -708,6 +798,7 @@ func (s *SQLiteStore) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
 		kind := "system"
 
 		if err == sql.ErrNoRows {
+			// Insert new row.
 			existingSyncID = newSyncID("rel")
 			if _, execErr := tx.Exec(`
 				INSERT INTO memory_relations
@@ -725,6 +816,7 @@ func (s *SQLiteStore) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
 		} else if err != nil {
 			return fmt.Errorf("JudgeBySemantic: check existing: %w", err)
 		} else {
+			// Update existing row.
 			if _, execErr := tx.Exec(`
 				UPDATE memory_relations
 				SET relation        = ?,
@@ -745,7 +837,71 @@ func (s *SQLiteStore) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
 		}
 
 		resultSyncID = existingSyncID
-		return nil
+
+		// ── Enqueue sync mutation when project is enrolled ─────────────────────
+		// Derive source project using the same session-fallback as the backfill
+		// SELECT: coalesce(nullif(obs.project,''), session.project, '').
+		// This prevents an empty Project in the enqueued payload when the
+		// observation's own project column is blank but the session carries it.
+		var srcProject, tgtProject string
+		_ = tx.QueryRow(
+			`SELECT coalesce(nullif(o.project,''), s.project, '')
+			   FROM observations o
+			   LEFT JOIN sessions s ON s.id = o.session_id
+			  WHERE o.sync_id = ?`, p.SourceID,
+		).Scan(&srcProject)
+		_ = tx.QueryRow(
+			`SELECT coalesce(nullif(o.project,''), s.project, '')
+			   FROM observations o
+			   LEFT JOIN sessions s ON s.id = o.session_id
+			  WHERE o.sync_id = ?`, p.TargetID,
+		).Scan(&tgtProject)
+
+		enrollCheckProject := srcProject
+		if enrollCheckProject == "" {
+			enrollCheckProject = tgtProject
+		}
+
+		var enrolled int
+		if err := tx.QueryRow(
+			`SELECT 1 FROM sync_enrolled_projects WHERE project = ? LIMIT 1`, enrollCheckProject,
+		).Scan(&enrolled); err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("JudgeBySemantic: check enrollment: %w", err)
+		}
+		if enrolled == 0 {
+			return nil // not enrolled — backfill will cover it on enrollment
+		}
+
+		// REQ-011: log at WARNING level when source observation is missing locally
+		// (project='' race condition). The server will reject with 400; this log
+		// is the local breadcrumb so the gap is not silently swallowed.
+		if srcProject == "" {
+			log.Printf("[store] WARNING: JudgeBySemantic enqueueing relation %s with project='' (source observation missing locally); server will reject", existingSyncID)
+		}
+
+		// Build payload from the freshly-written row.
+		rel, err := s.getRelationTx(tx, existingSyncID)
+		if err != nil {
+			return fmt.Errorf("JudgeBySemantic: read relation for enqueue: %w", err)
+		}
+		payload := syncRelationPayload{
+			SyncID:         rel.SyncID,
+			SourceID:       rel.SourceID,
+			TargetID:       rel.TargetID,
+			Relation:       rel.Relation,
+			Reason:         rel.Reason,
+			Evidence:       rel.Evidence,
+			Confidence:     rel.Confidence,
+			JudgmentStatus: rel.JudgmentStatus,
+			MarkedByActor:  rel.MarkedByActor,
+			MarkedByKind:   rel.MarkedByKind,
+			MarkedByModel:  rel.MarkedByModel,
+			SessionID:      rel.SessionID,
+			Project:        srcProject,
+			CreatedAt:      rel.CreatedAt,
+			UpdatedAt:      rel.UpdatedAt,
+		}
+		return s.enqueueSyncMutationTx(tx, SyncEntityRelation, rel.SyncID, SyncOpUpsert, payload)
 	}); err != nil {
 		return "", err
 	}
@@ -753,16 +909,25 @@ func (s *SQLiteStore) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
 	return resultSyncID, nil
 }
 
+// getRelationTx is the transactional variant of GetRelation used within
+// JudgeRelation to read the freshly-updated row before commit.
+
 // ─── GetRelationsForObservations ──────────────────────────────────────────────
 
 // GetRelationsForObservations returns a map of observation sync_id →
 // ObservationRelations for all observations in syncIDs. Relations with
 // judgment_status='orphaned' are excluded.
+//
+// A single SQL query with IN/OR and LEFT JOINs avoids N+1 queries.
+// The returned Relation values are enriched with source/target integer IDs and
+// titles via LEFT JOIN, used by the MCP annotation builder (REQ-005, REQ-012).
+// Missing or soft-deleted observations set the corresponding *Missing flag to true.
 func (s *SQLiteStore) GetRelationsForObservations(syncIDs []string) (map[string]ObservationRelations, error) {
 	if len(syncIDs) == 0 {
 		return map[string]ObservationRelations{}, nil
 	}
 
+	// Build IN clause.
 	placeholders := make([]string, len(syncIDs))
 	args := make([]any, 0, len(syncIDs)*2)
 	for i, id := range syncIDs {
@@ -773,7 +938,9 @@ func (s *SQLiteStore) GetRelationsForObservations(syncIDs []string) (map[string]
 		args = append(args, id)
 	}
 
-	inClause := strings.Join(placeholders, ",")
+	inClause := joinStrings(placeholders, ",")
+	// LEFT JOIN to observations for title enrichment (REQ-005, Design §8).
+	// source_missing / target_missing: observation is absent (not found) or soft-deleted.
 	query := fmt.Sprintf(`
 		SELECT r.id, r.sync_id,
 		       ifnull(r.source_id,''), ifnull(r.target_id,''),
@@ -804,6 +971,7 @@ func (s *SQLiteStore) GetRelationsForObservations(syncIDs []string) (map[string]
 	for rows.Next() {
 		var r Relation
 		var sourceID, targetID string
+		// SQLite BOOLEAN → int; use int for missing flags.
 		var sourceMissingInt, targetMissingInt int
 		if err := rows.Scan(
 			&r.ID, &r.SyncID,
@@ -821,6 +989,7 @@ func (s *SQLiteStore) GetRelationsForObservations(syncIDs []string) (map[string]
 		r.SourceMissing = sourceMissingInt != 0
 		r.TargetMissing = targetMissingInt != 0
 
+		// Index by source_id.
 		for _, id := range syncIDs {
 			if r.SourceID == id {
 				entry := result[id]
@@ -841,10 +1010,11 @@ func (s *SQLiteStore) GetRelationsForObservations(syncIDs []string) (map[string]
 	return result, nil
 }
 
-// ─── sanitizeFTSCandidates ────────────────────────────────────────────────────
-
 // sanitizeFTSCandidates builds an OR-based FTS5 query from a title so that
 // FindCandidates returns documents with ANY term overlap (not all terms).
+// Using implicit AND (sanitizeFTS) is too strict for candidate detection:
+// the full saved title would require every word to appear in candidates.
+// OR semantics give broader recall; BM25 score still captures relevance.
 func sanitizeFTSCandidates(title string) string {
 	words := strings.Fields(title)
 	if len(words) == 0 {
@@ -860,9 +1030,23 @@ func sanitizeFTSCandidates(title string) string {
 	return strings.Join(quoted, " OR ")
 }
 
+// joinStrings joins a slice of strings with the given separator.
+func joinStrings(items []string, sep string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	result := items[0]
+	for _, item := range items[1:] {
+		result += sep + item
+	}
+	return result
+}
+
 // ─── Phase 3: ListRelations / CountRelations ──────────────────────────────────
 
-// ListRelations returns a paginated list of relation rows filtered by the given options.
+// ListRelations returns a paginated list of relation rows filtered by the given
+// options. Project filtering is done via LEFT JOIN to observations (no schema
+// change). Uses idx_memrel_status_created for efficient status+date ordering.
 func (s *SQLiteStore) ListRelations(opts ListRelationsOptions) ([]RelationListItem, error) {
 	query, args := buildRelationsQuery(opts, false)
 	rows, err := s.db.Query(query, args...)
@@ -893,6 +1077,7 @@ func (s *SQLiteStore) ListRelations(opts ListRelationsOptions) ([]RelationListIt
 }
 
 // CountRelations returns the total number of relation rows matching opts.
+// Uses the same WHERE conditions as ListRelations.
 func (s *SQLiteStore) CountRelations(opts ListRelationsOptions) (int, error) {
 	query, args := buildRelationsQuery(opts, true)
 	var total int
@@ -903,6 +1088,7 @@ func (s *SQLiteStore) CountRelations(opts ListRelationsOptions) (int, error) {
 }
 
 // buildRelationsQuery constructs the SQL for ListRelations and CountRelations.
+// When countOnly=true, generates SELECT count(*) instead of the full column list.
 func buildRelationsQuery(opts ListRelationsOptions, countOnly bool) (string, []any) {
 	var args []any
 
@@ -961,6 +1147,7 @@ func (s *SQLiteStore) GetRelationStats(project string) (RelationStats, error) {
 		ByJudgmentStatus: map[string]int{},
 	}
 
+	// Build query: when project is non-empty, filter via JOIN to observations.
 	var q string
 	var args []any
 	if project != "" {
@@ -1010,6 +1197,7 @@ func (s *SQLiteStore) GetRelationStats(project string) (RelationStats, error) {
 	return stats, nil
 }
 
+// ─── Phase 3: ScanProject ─────────────────────────────────────────────────────
 // ─── CountDeferredAndDead ─────────────────────────────────────────────────────
 
 // CountDeferredAndDead returns the count of rows in sync_apply_deferred grouped
@@ -1358,6 +1546,12 @@ func (s *SQLiteStore) ScanProject(opts ScanOptions) (ScanResult, error) {
 	// ── Phase 4: semantic worker pool ─────────────────────────────────────────
 	if !opts.Semantic || len(semanticPairs) == 0 {
 		return result, nil
+	}
+
+	type pairResult struct {
+		judged  int
+		skipped int
+		errors  int
 	}
 
 	pairCh := make(chan candidatePair, len(semanticPairs))

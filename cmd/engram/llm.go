@@ -12,14 +12,15 @@ import (
 // ─── agentRunnerFactory default ───────────────────────────────────────────────
 
 // agentRunnerFactory is the production implementation used by resolveAgentRunner.
-// It delegates to llm.NewRunner, which selects a runner based on the provided name
-// (typically read from ENGRAM_AGENT_CLI). The returned runner satisfies
-// store.SemanticRunner via the llmRunnerAdapter bridge.
 //
 // Tests may replace this package-level var to inject a fake runner without
 // spawning real CLI processes.
 var agentRunnerFactory = defaultAgentRunnerFactory
 
+// defaultAgentRunnerFactory is the production implementation of agentRunnerFactory.
+// It delegates to llm.NewRunner, which selects a runner based on the provided name
+// (typically read from ENGRAM_AGENT_CLI). The returned runner satisfies
+// store.SemanticRunner via the llmRunnerAdapter bridge.
 func defaultAgentRunnerFactory(name string) (store.SemanticRunner, error) {
 	runner, err := llm.NewRunner(name)
 	if err != nil {
@@ -52,6 +53,18 @@ func (a llmRunnerAdapter) Compare(ctx context.Context, prompt string) (store.Sem
 		Model:      v.Model,
 		DurationMS: v.DurationMS,
 	}, nil
+}
+
+// ─── llmBuildPrompt ───────────────────────────────────────────────────────────
+
+// llmBuildPrompt adapts store.ObservationSnippet to llm.ObservationSnippet and
+// delegates to llm.BuildPrompt. Used by both CLI and HTTP server codepaths to
+// ensure prompt generation is consistent.
+func llmBuildPrompt(a, b store.ObservationSnippet) string {
+	return llm.BuildPrompt(
+		llm.ObservationSnippet{ID: a.SyncID, Title: a.Title, Type: a.Type, Content: a.Content},
+		llm.ObservationSnippet{ID: b.SyncID, Title: b.Title, Type: b.Type, Content: b.Content},
+	)
 }
 
 // ─── resolveAgentRunner ───────────────────────────────────────────────────────

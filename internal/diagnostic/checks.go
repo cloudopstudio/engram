@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Gentleman-Programming/engram/internal/project"
+	projectpkg "github.com/Gentleman-Programming/engram/internal/project"
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
@@ -74,8 +74,8 @@ func detectSessionDirectoryProject(scope Scope, cache map[string]DetectedProject
 	if _, err := os.Stat(directory); err != nil {
 		return DetectedProject{}, false
 	}
-	res := project.DetectProjectFull(directory)
-	if res.Error != nil || (res.Source != "git_remote" && res.Source != "git_root") {
+	res := projectpkg.DetectProjectFull(directory)
+	if res.Error != nil || (res.Source != projectpkg.SourceGitRemote && res.Source != projectpkg.SourceGitRoot) {
 		return DetectedProject{}, false
 	}
 	detected := DetectedProject{Project: normalizeProjectName(res.Project), Source: res.Source, Path: res.Path}

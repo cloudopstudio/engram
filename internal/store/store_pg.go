@@ -3116,4 +3116,3 @@ func (s *PostgresStore) ReplayDeferred() (ReplayDeferredResult, error) {
 
 // Compile-time assertion that *PostgresStore satisfies the Store interface.
 var _ Store = (*PostgresStore)(nil)
-

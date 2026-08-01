@@ -2,10 +2,13 @@ package sync
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
+
+var ErrChunkNotFound = errors.New("sync: chunk not found")
 
 // Transport defines how chunks are read and written during sync.
 // This is the abstraction that allows the same Syncer to work with
@@ -87,5 +90,12 @@ func (ft *FileTransport) WriteChunk(chunkID string, data []byte, _ ChunkEntry) e
 func (ft *FileTransport) ReadChunk(chunkID string) ([]byte, error) {
 	chunksDir := filepath.Join(ft.syncDir, "chunks")
 	chunkPath := filepath.Join(chunksDir, chunkID+".jsonl.gz")
-	return readGzip(chunkPath)
+	data, err := readGzip(chunkPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrChunkNotFound
+		}
+		return nil, err
+	}
+	return data, nil
 }

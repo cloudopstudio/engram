@@ -126,6 +126,8 @@ func (s *fakeLocalStore) MarkSyncBlocked(_, reasonCode, message string) error {
 
 func (s *fakeLocalStore) MarkSyncHealthy(_ string) error { return nil }
 
+// Phase E: deferred replay stubs — base fakeLocalStore always returns zero counts
+// and no error. Tests that need real replay behavior use fakeLocalStoreWithDeferred.
 func (s *fakeLocalStore) ReplayDeferred() (store.ReplayDeferredResult, error) {
 	return store.ReplayDeferredResult{}, nil
 }
@@ -256,6 +258,9 @@ func TestManagerPushDoesNotAckWhenAcceptedSeqCountMismatchesBatch(t *testing.T) 
 			if !strings.Contains(err.Error(), tt.wantErrPiece) {
 				t.Fatalf("expected error to contain %q, got %q", tt.wantErrPiece, err.Error())
 			}
+			if got := atomic.LoadInt32(&tr.pushCalls); got != 1 {
+				t.Fatalf("expected one transport push, got %d", got)
+			}
 			ls.mu.Lock()
 			acked := append([]int64(nil), ls.ackedSeqs...)
 			ls.mu.Unlock()
@@ -279,6 +284,9 @@ func TestManagerPushDoesNotAckWhenTransportFails(t *testing.T) {
 		t.Fatal("expected push to fail")
 	}
 
+	if got := atomic.LoadInt32(&tr.pushCalls); got != 1 {
+		t.Fatalf("expected one transport push attempt, got %d", got)
+	}
 	ls.mu.Lock()
 	acked := append([]int64(nil), ls.ackedSeqs...)
 	ls.mu.Unlock()
@@ -385,11 +393,22 @@ func TestManagerRepairableFailureStoresUpgradeGuidance(t *testing.T) {
 	for _, want := range []string{
 		"Known repairable cloud sync failure detected.",
 		"engram cloud upgrade doctor --project proj-a",
+		"engram cloud upgrade repair --project proj-a --dry-run",
 		"engram cloud upgrade repair --project proj-a --apply",
+		"engram sync --cloud --project proj-a",
 	} {
 		if !strings.Contains(status.LastError, want) {
 			t.Fatalf("expected status.LastError to contain %q, got %q", want, status.LastError)
 		}
+		if !strings.Contains(ls.failureMessage, want) {
+			t.Fatalf("expected stored failure to contain %q, got %q", want, ls.failureMessage)
+		}
+	}
+	if strings.Contains(status.LastError, "--auto-repair") || strings.Contains(ls.failureMessage, "--auto-repair") {
+		t.Fatalf("guidance must not mention auto-repair, status=%q stored=%q", status.LastError, ls.failureMessage)
+	}
+	if atomic.LoadInt32(&tr.pushCalls) != 1 {
+		t.Fatalf("expected one push attempt and no repair execution path, got %d", tr.pushCalls)
 	}
 }
 
@@ -467,6 +486,10 @@ func TestManagerBackoffJitterBounds(t *testing.T) {
 	cfg.MaxBackoff = 5 * time.Minute
 	mgr := &Manager{cfg: cfg}
 
+	// BW1: ±25% jitter means range is [base*0.75, base*1.25] = [3s, 5s].
+	// Run many iterations and assert ALL samples fall in [3s,5s].
+	// ALSO assert that at least one sample falls BELOW base (4s) to prove
+	// negative jitter is actually applied (not just [0, +25%]).
 	sawBelowBase := false
 	for i := 0; i < 500; i++ {
 		d := mgr.computeBackoff(1)
@@ -669,6 +692,9 @@ func TestManagerSurfacesAuthRequiredOn401(t *testing.T) {
 		mgr.Status().Phase, mgr.Status().ReasonCode)
 }
 
+// TestManagerSurfacesPolicyForbiddenOn403 verifies BW5:
+// When the transport returns a 403-like error, Manager must surface
+// ReasonCode="policy_forbidden".
 func TestManagerSurfacesPolicyForbiddenOn403(t *testing.T) {
 	ls := newFakeLocalStore()
 	ls.mutations = []store.SyncMutation{{Seq: 1, Entity: "obs", EntityKey: "k1", Project: "proj-a"}}
@@ -715,6 +741,9 @@ func TestManagerBlocksWhenOnlyNonEnrolledPendingMutationsRemain(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&tr.pullCalls); got != 0 {
 		t.Fatalf("expected blocked cycle to skip pull, got %d", got)
+	}
+	if len(ls.ackedSeqs) != 0 {
+		t.Fatalf("expected no acked mutations, got %v", ls.ackedSeqs)
 	}
 	st := mgr.Status()
 	if st.Phase != PhasePushFailed {

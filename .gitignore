@@ -31,6 +31,5 @@ node_modules/
 .gemini/skills
 engram-pg
 engram-dev
-engram-pg
 .atl/
 .release-notes-beta.md

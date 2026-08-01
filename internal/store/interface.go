@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"time"
 )
 
@@ -118,4 +119,36 @@ type Store interface {
 	EstimateSessionProjectReclassification(actions []SessionProjectReclassification) (SessionProjectReclassificationCounts, error)
 	ApplySessionProjectReclassification(actions []SessionProjectReclassification) (SessionProjectReclassificationResult, error)
 	BackupSQLite() (string, error)
+
+	// ─── v1.20.0 parity ──────────────────────────────────────────────────────
+	PinnedObservations(project, scope string) ([]Observation, error)
+	ListObservationSyncPayloads() ([]any, error)
+	CountRelationSyncMutations() (int, error)
+	// DB exposes the underlying *sql.DB for test helpers and integration tests.
+	// PostgreSQL-backed stores return nil — they are not database/sql based.
+	DB() *sql.DB
+	ClearCloudUpgradeState(project string) error
+	DeleteProject(project string, hardDelete bool) (*DeleteProjectResult, error)
+	MarkSyncAuthRequired(targetKey, message string) error
+	HasPendingSyncMutationsForProject(project string) (bool, error)
+	MarkSyncPending(targetKey string) error
+	DiagnoseCloudUpgradeLegacyMutations(project string) (CloudUpgradeLegacyMutationReport, error)
+	RepairCloudUpgrade(project string, apply bool) (CloudUpgradeRepairReport, error)
+	SaveCloudUpgradeState(state CloudUpgradeState) error
+	GetRelationByIntID(id int64) (*RelationListItem, error)
+	AddPromptIfMissing(p AddPromptParams) (int64, bool, error)
+	ApplyPulledChunk(targetKey, chunkID string, mutations []SyncMutation) error
+	CanRollbackCloudUpgrade(project string) (bool, error)
+	ExportProject(project string) (*ExportData, error)
+	ExportRelationMutations(project string) ([]SyncMutation, error)
+	GetCloudUpgradeState(project string) (*CloudUpgradeState, error)
+	GetSyncedChunksForTarget(targetKey string) (map[string]bool, error)
+	ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int64, limit int) ([]SyncMutation, error)
+	MarkReviewed(id int64) error
+	MostRecentActiveSession(project string) (string, bool, error)
+	ObservationsNeedingReview(project string, limit int) ([]Observation, error)
+	PinObservation(id int64) error
+	RecordSyncedChunkForTarget(targetKey, chunkID string) error
+	RollbackCloudUpgrade(project string) (CloudUpgradeState, error)
+	UnpinObservation(id int64) error
 }

@@ -9,6 +9,9 @@ import (
 
 // ─── A.3 tests ────────────────────────────────────────────────────────────────
 
+// ObservationSnippet is used in tests to pass observation data to BuildPrompt.
+// The real type lives in the llm package.
+
 // TestBuildPrompt_HappyPath verifies the golden structure of a rendered prompt:
 // both observation titles and contents appear in the output.
 func TestBuildPrompt_HappyPath(t *testing.T) {
